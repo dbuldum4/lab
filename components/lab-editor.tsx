@@ -80,6 +80,7 @@ const EMPTY_HEALTH: StorageHealth = { copies: 0, labels: [], persistent: false }
 export function LabEditor() {
   const shellRef = useRef<HTMLDivElement>(null);
   const caretRef = useRef<HTMLDivElement>(null);
+  const caretStrokeRef = useRef<HTMLSpanElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadedRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -100,26 +101,52 @@ export function LabEditor() {
     setSelectedState(value);
   }, []);
 
+  const stopCaretBlink = useCallback(() => {
+    caretStrokeRef.current?.removeAttribute("data-blinking");
+  }, []);
+
+  const restartCaretBlink = useCallback(() => {
+    const stroke = caretStrokeRef.current;
+    if (!stroke) return;
+    stroke.removeAttribute("data-blinking");
+    void stroke.offsetWidth;
+    stroke.setAttribute("data-blinking", "true");
+  }, []);
+
+  const hideCaret = useCallback(() => {
+    caretRef.current?.removeAttribute("data-visible");
+    stopCaretBlink();
+  }, [stopCaretBlink]);
+
   const positionCaret = useCallback((instance: Editor) => {
     const shell = shellRef.current;
     const caret = caretRef.current;
     if (!shell || !caret || !instance.isFocused || !instance.state.selection.empty) {
-      caret?.removeAttribute("data-visible");
+      hideCaret();
       return;
     }
 
     try {
       const point = instance.view.coordsAtPos(instance.state.selection.from);
       const shellBox = shell.getBoundingClientRect();
+      const nextTransform = `translate3d(${point.left - shellBox.left}px, ${point.top - shellBox.top}px, 0)`;
+      const wasVisible = caret.hasAttribute("data-visible");
+      const moved = caret.style.transform !== nextTransform;
+
+      if (!wasVisible) caret.style.transition = "none";
       caret.style.height = `${Math.max(18, point.bottom - point.top)}px`;
-      caret.style.transform = `translate3d(${point.left - shellBox.left}px, ${point.top - shellBox.top}px, 0)`;
+      caret.style.transform = nextTransform;
       caret.setAttribute("data-visible", "true");
-      caret.getAnimations().forEach((animation) => animation.cancel());
-      caret.animate([{ opacity: 1 }, { opacity: 1 }], { duration: 80 });
+
+      if (!wasVisible) {
+        void caret.offsetWidth;
+        caret.style.removeProperty("transition");
+      }
+      if (moved || !wasVisible) restartCaretBlink();
     } catch {
-      caret.removeAttribute("data-visible");
+      hideCaret();
     }
-  }, []);
+  }, [hideCaret, restartCaretBlink]);
 
   const findSlash = useCallback((instance: Editor): PaletteState | null => {
     const { $from } = instance.state.selection;
@@ -201,7 +228,7 @@ export function LabEditor() {
     },
     onSelectionUpdate: ({ editor: instance }) => syncInterface(instance),
     onFocus: ({ editor: instance }) => syncInterface(instance),
-    onBlur: () => caretRef.current?.removeAttribute("data-visible"),
+    onBlur: hideCaret,
   });
 
   const filtered = useMemo(() => {
@@ -361,7 +388,9 @@ export function LabEditor() {
   return (
     <div className="lab-shell" ref={shellRef} onKeyDownCapture={onKeyDownCapture}>
       <EditorContent editor={editor} />
-      <div ref={caretRef} className="lab-caret" aria-hidden="true" />
+      <div ref={caretRef} className="lab-caret" aria-hidden="true">
+        <span ref={caretStrokeRef} className="lab-caret-stroke" data-blinking="true" />
+      </div>
       <input ref={fileInputRef} hidden type="file" accept=".md,.markdown,text/markdown,text/plain" tabIndex={-1} aria-hidden="true" onChange={onImport} />
 
       {palette ? (
