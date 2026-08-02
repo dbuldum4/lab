@@ -512,8 +512,11 @@ export function LabEditor() {
           const anchor = document.createElement("a");
           anchor.href = URL.createObjectURL(blob);
           anchor.download = "lab.md";
+          anchor.hidden = true;
+          document.body.append(anchor);
           anchor.click();
-          URL.revokeObjectURL(anchor.href);
+          anchor.remove();
+          globalThis.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
           break;
         }
       }
