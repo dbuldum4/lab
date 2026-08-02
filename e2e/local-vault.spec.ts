@@ -157,7 +157,7 @@ test("storage status reports the real redundant copies", async ({ page }) => {
   await expect(page.getByTestId("storage-status")).toContainText("IndexedDB");
 });
 
-test("a staged draft survives a renderer crash and a new session owner", async ({ context, page }) => {
+test("a staged draft survives abrupt page termination and a new session owner", async ({ context, page }) => {
   await context.addInitScript(() => {
     (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__ = 60_000;
   });
@@ -168,10 +168,10 @@ test("a staged draft survives a renderer crash and a new session owner", async (
     () => page.evaluate((prefix) => Object.keys(localStorage).some((key) => key.startsWith(prefix)), PENDING_PREFIX),
     { timeout: 5000 },
   ).toBe(true);
-  const beforeCrash = await backendState(page);
-  expect(beforeCrash.authority).toBeNull();
+  const beforeTermination = await backendState(page);
+  expect(beforeTermination.authority).toBeNull();
 
-  await page.goto("chrome://crash").catch(() => undefined);
+  await page.close({ runBeforeUnload: false });
   const reopened = await context.newPage();
   await openEditor(reopened);
   await expect.poll(() => editorText(reopened), { timeout: 10000 }).toBe(draft);
