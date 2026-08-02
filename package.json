@@ -2,12 +2,23 @@
   "name": "lab",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:fast": "node --experimental-strip-types --test lib/*.test.ts",
+    "test:model": "node --experimental-strip-types --test lib/local-vault.model.test.ts",
+    "test": "npm run test:fast",
+    "test:e2e": "playwright test --grep-invert @stress",
+    "test:stress": "playwright test e2e/local-vault.stress.spec.ts --grep @stress --workers=1",
+    "test:all": "npm run test:fast && npm run test:e2e",
+    "verify": "npm run test:all && npm run lint && npm run typecheck && npm run build"
   },
   "dependencies": {
     "@tiptap/extension-placeholder": "3.29.2",
@@ -24,6 +35,7 @@
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@playwright/test": "1.55.0",
     "@types/node": "^24.0.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",

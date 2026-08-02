@@ -1,0 +1,822 @@
+import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
+import test, { afterEach, beforeEach } from "node:test";
+import {
+  compareSnapshotOrder,
+  inspectLocalStorage,
+  loadLocalDocument,
+  resetLocalVaultStateForTests,
+  sameSnapshot,
+  saveLocalDocument,
+  selectCurrentSnapshot,
+  shouldAcceptSnapshot,
+  stageLocalDocument,
+  type LocalSnapshot,
+} from "./local-vault.ts";
+
+type FaultConfig = {
+  open: "error" | "blocked" | null;
+  readKeys: Set<IDBValidKey>;
+  putKeys: Set<IDBValidKey>;
+  quotaOnWrite: boolean;
+  abortOnWrite: boolean;
+};
+
+class MemoryStorage implements Storage {
+  readonly values = new Map<string, string>();
+  throwOnGet = false;
+  throwOnSet = false;
+  quotaOnSet = false;
+  throwOnRemove = false;
+  throwOnLength = false;
+  throwOnKey = false;
+
+  get length() {
+    if (this.throwOnLength) throw new Error("Storage enumeration failed");
+    return this.values.size;
+  }
+
+  clear() {
+    this.values.clear();
+  }
+
+  getItem(key: string) {
+    if (this.throwOnGet) throw new Error("Storage read failed");
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number) {
+    if (this.throwOnKey) throw new Error("Storage key lookup failed");
+    return [...this.values.keys()][index] ?? null;
+  }
+
+  removeItem(key: string) {
+    if (this.throwOnRemove) throw new Error("Storage remove failed");
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string) {
+    if (this.throwOnSet) {
+      throw (this.quotaOnSet
+        ? new DOMException("Storage quota exceeded", "QuotaExceededError")
+        : new Error("Storage write failed"));
+    }
+    this.values.set(key, value);
+  }
+}
+
+function cloneValue<T>(value: T): T {
+  if (value === undefined || value === null) return value;
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+type FakeIndexedDb = {
+  factory: IDBFactory;
+  faults: FaultConfig;
+  stores: Map<string, Map<IDBValidKey, unknown>>;
+  read: (key: IDBValidKey) => unknown;
+  write: (key: IDBValidKey, value: unknown) => void;
+  remove: (key: IDBValidKey) => void;
+};
+
+function createFakeIndexedDb(): FakeIndexedDb {
+  const stores = new Map<string, Map<IDBValidKey, unknown>>();
+  const faults: FaultConfig = {
+    open: null,
+    readKeys: new Set(),
+    putKeys: new Set(),
+    quotaOnWrite: false,
+    abortOnWrite: false,
+  };
+  let upgraded = false;
+
+  const database = {
+    get objectStoreNames() {
+      return { contains: (name: string) => stores.has(name) } as DOMStringList;
+    },
+    createObjectStore(name: string) {
+      const store = new Map<IDBValidKey, unknown>();
+      stores.set(name, store);
+      return { name } as unknown as IDBObjectStore;
+    },
+    transaction(name: string) {
+      const store = stores.get(name);
+      if (!store) throw new Error(`Missing fake store: ${name}`);
+      let pending = 0;
+      let completionQueued = false;
+      let settled = false;
+      const transactionState = {
+        error: null as DOMException | null,
+        oncomplete: null as ((event: Event) => void) | null,
+        onerror: null as ((event: Event) => void) | null,
+        onabort: null as ((event: Event) => void) | null,
+        objectStore: () => ({
+          get(key: IDBValidKey) {
+            pending += 1;
+            const requestState = {
+              result: undefined as unknown,
+              error: null as DOMException | null,
+              onsuccess: null as ((event: Event) => void) | null,
+              onerror: null as ((event: Event) => void) | null,
+            };
+            const request = requestState as unknown as IDBRequest;
+            setTimeout(() => {
+              if (settled) return;
+              pending -= 1;
+              if (faults.readKeys.has(key)) {
+                requestState.error = new DOMException("Fake request failure", "UnknownError");
+                requestState.onerror?.({} as Event);
+                settled = true;
+                transactionState.error = requestState.error;
+                queueMicrotask(() => transactionState.onerror?.({} as Event));
+                return;
+              }
+              requestState.result = cloneValue(store.get(key));
+              requestState.onsuccess?.({} as Event);
+              maybeComplete();
+            }, 0);
+            return request;
+          },
+          put(value: unknown, key: IDBValidKey) {
+            pending += 1;
+            const requestState = {
+              result: key,
+              error: null as DOMException | null,
+              onsuccess: null as ((event: Event) => void) | null,
+              onerror: null as ((event: Event) => void) | null,
+            };
+            const request = requestState as unknown as IDBRequest;
+            setTimeout(() => {
+              if (settled) return;
+              pending -= 1;
+              if (faults.abortOnWrite || faults.putKeys.has(key)) {
+                requestState.error = new DOMException(
+                  faults.quotaOnWrite ? "Fake quota exceeded" : "Fake put failure",
+                  faults.quotaOnWrite ? "QuotaExceededError" : "UnknownError",
+                );
+                requestState.onerror?.({} as Event);
+                settled = true;
+                transactionState.error = requestState.error;
+                queueMicrotask(() => transactionState.onabort?.({} as Event));
+                return;
+              }
+              store.set(key, cloneValue(value));
+              requestState.onsuccess?.({} as Event);
+              maybeComplete();
+            }, 0);
+            return request;
+          },
+        }),
+      };
+      const transaction = transactionState as unknown as IDBTransaction;
+
+      const maybeComplete = () => {
+        if (pending !== 0 || completionQueued || settled) return;
+        completionQueued = true;
+        queueMicrotask(() => {
+          if (settled) return;
+          settled = true;
+          transactionState.oncomplete?.({} as Event);
+        });
+      };
+      return transaction;
+    },
+    close() {},
+  } as unknown as IDBDatabase;
+
+  const factory = {
+    open() {
+      const requestState = {
+        result: database,
+        error: null as DOMException | null,
+        onupgradeneeded: null as ((event: IDBVersionChangeEvent) => void) | null,
+        onsuccess: null as ((event: Event) => void) | null,
+        onerror: null as ((event: Event) => void) | null,
+        onblocked: null as ((event: Event) => void) | null,
+      };
+      const request = requestState as unknown as IDBOpenDBRequest;
+      setTimeout(() => {
+        if (faults.open === "blocked") {
+          request.onblocked?.({} as IDBVersionChangeEvent);
+          return;
+        }
+        if (faults.open === "error") {
+          requestState.error = new DOMException("Fake open failure", "UnknownError");
+          request.onerror?.({} as Event);
+          return;
+        }
+        if (!upgraded) {
+          upgraded = true;
+          requestState.onupgradeneeded?.({} as IDBVersionChangeEvent);
+        }
+        request.onsuccess?.({} as Event);
+      }, 0);
+      return request;
+    },
+  } as unknown as IDBFactory;
+
+  const store = () => stores.get("documents") ?? new Map<IDBValidKey, unknown>();
+  return {
+    factory,
+    faults,
+    stores,
+    read: (key) => cloneValue(store().get(key)),
+    write: (key, value) => {
+      if (!stores.has("documents")) stores.set("documents", new Map());
+      stores.get("documents")?.set(key, cloneValue(value));
+    },
+    remove: (key) => stores.get("documents")?.delete(key),
+  };
+}
+
+type OpfsHarness = {
+  files: Map<string, string>;
+  faults: {
+    root: boolean;
+    read: boolean;
+    write: boolean;
+    close: boolean;
+    quotaWrite: boolean;
+    quotaClose: boolean;
+  };
+  storage: StorageManager;
+};
+
+function createOpfsHarness(persisted = true): OpfsHarness {
+  const files = new Map<string, string>();
+  const faults = {
+    root: false,
+    read: false,
+    write: false,
+    close: false,
+    quotaWrite: false,
+    quotaClose: false,
+  };
+  const root = {
+    getFileHandle: async (name: string, options?: { create?: boolean }) => {
+      if (!files.has(name) && !options?.create) throw new DOMException("Missing file", "NotFoundError");
+      if (!files.has(name)) files.set(name, "");
+      return {
+        getFile: async () => {
+          if (faults.read) throw new Error("OPFS read failed");
+          return { text: async () => files.get(name) ?? "" };
+        },
+        createWritable: async () => {
+          if (faults.write) {
+            throw (faults.quotaWrite
+              ? new DOMException("OPFS quota exceeded", "QuotaExceededError")
+              : new Error("OPFS write failed"));
+          }
+          let next = files.get(name) ?? "";
+          return {
+            write: async (value: string) => {
+              next = value;
+            },
+            close: async () => {
+              if (faults.close) {
+                throw (faults.quotaClose
+                  ? new DOMException("OPFS quota exceeded", "QuotaExceededError")
+                  : new Error("OPFS close failed"));
+              }
+              files.set(name, next);
+            },
+          };
+        },
+      } as unknown as FileSystemFileHandle;
+    },
+  } as unknown as FileSystemDirectoryHandle;
+  const storage = {
+    persisted: async () => persisted,
+    persist: async () => persisted,
+    getDirectory: async () => {
+      if (faults.root) throw new Error("OPFS root failed");
+      return root;
+    },
+  } as unknown as StorageManager;
+  return { files, faults, storage };
+}
+
+type TestEnvironment = {
+  local: MemoryStorage;
+  session: MemoryStorage;
+  idb: FakeIndexedDb | null;
+  opfs: OpfsHarness | null;
+  restore: () => void;
+};
+
+type EnvironmentOptions = {
+  browser?: boolean;
+  indexedDb?: boolean;
+  opfs?: boolean;
+  persisted?: boolean;
+  locks?: "success" | "reject" | null;
+  crypto?: "webcrypto" | "missing";
+};
+
+function installEnvironment(options: EnvironmentOptions = {}): TestEnvironment {
+  const names = ["localStorage", "sessionStorage", "indexedDB", "navigator", "window", "crypto"] as const;
+  const descriptors = new Map<string, PropertyDescriptor | undefined>();
+  for (const name of names) descriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+  const local = new MemoryStorage();
+  const session = new MemoryStorage();
+  const idb = options.indexedDb ? createFakeIndexedDb() : null;
+  const opfs = options.opfs ? createOpfsHarness(options.persisted ?? true) : null;
+  const locks = options.locks === "success"
+    ? { request: async (_name: string, _options: unknown, callback: () => Promise<unknown>) => callback() }
+    : options.locks === "reject"
+      ? { request: async () => { throw new Error("Web Locks rejected"); } }
+      : undefined;
+  const navigatorValue = (opfs || locks || options.browser)
+    ? { storage: opfs?.storage, locks }
+    : undefined;
+
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: local });
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: session });
+  if (idb) Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: idb.factory });
+  else Reflect.deleteProperty(globalThis, "indexedDB");
+  if (navigatorValue) Object.defineProperty(globalThis, "navigator", { configurable: true, value: navigatorValue });
+  else Reflect.deleteProperty(globalThis, "navigator");
+  if (options.browser) Object.defineProperty(globalThis, "window", { configurable: true, value: {} });
+  else Reflect.deleteProperty(globalThis, "window");
+  if (options.crypto === "missing") Object.defineProperty(globalThis, "crypto", { configurable: true, value: undefined });
+  else Object.defineProperty(globalThis, "crypto", { configurable: true, value: webcrypto });
+
+  return {
+    local,
+    session,
+    idb,
+    opfs,
+    restore() {
+      for (const name of names) {
+        const descriptor = descriptors.get(name);
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else Reflect.deleteProperty(globalThis, name);
+      }
+    },
+  };
+}
+
+let environment: TestEnvironment;
+
+beforeEach(() => {
+  resetLocalVaultStateForTests();
+  environment = installEnvironment();
+});
+
+afterEach(() => {
+  environment.restore();
+  resetLocalVaultStateForTests();
+});
+
+function snapshot(markdown: string, updatedAt: number, checksum = markdown): LocalSnapshot {
+  return { markdown, updatedAt, checksum, version: 1 };
+}
+
+async function legacyChecksum(markdown: string) {
+  const digest = await webcrypto.subtle.digest("SHA-256", new TextEncoder().encode(markdown));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function localSnapshot() {
+  const raw = environment.local.values.get("lab.document.v1");
+  return raw ? JSON.parse(raw) as LocalSnapshot : null;
+}
+
+function switchEnvironment(options: EnvironmentOptions) {
+  environment.restore();
+  resetLocalVaultStateForTests();
+  environment = installEnvironment(options);
+}
+
+test("snapshot ordering is total and deterministic", () => {
+  const cases: Array<[LocalSnapshot, LocalSnapshot, number]> = [
+    [snapshot("old", 1, "z"), snapshot("new", 2, "a"), -1],
+    [snapshot("alpha", 10, "aaa"), snapshot("beta", 10, "bbb"), -1],
+    [snapshot("same", 10, "same"), snapshot("same", 10, "same"), 0],
+    [snapshot("beta", 10, "bbb"), snapshot("alpha", 10, "aaa"), 1],
+  ];
+  for (const [left, right, expected] of cases) assert.equal(Math.sign(compareSnapshotOrder(left, right)), expected);
+  assert.equal(selectCurrentSnapshot([cases[0][0], cases[1][0], cases[3][0]]), cases[3][0]);
+});
+
+test("replica equality and acceptance require matching metadata", () => {
+  const current = snapshot("note", 20, "digest");
+  assert.equal(sameSnapshot(current, snapshot("note", 20, "digest")), true);
+  assert.equal(sameSnapshot(current, snapshot("changed", 20, "digest")), false);
+  assert.equal(sameSnapshot(current, snapshot("note", 19, "digest")), false);
+  assert.equal(shouldAcceptSnapshot(current, snapshot("older", 19, "older")), false);
+  assert.equal(shouldAcceptSnapshot(current, snapshot("newer", 21, "newer")), true);
+});
+
+test("v1 and v2 integrity cases reject shape and content/timestamp tampering", async () => {
+  const markdown = "legacy note";
+  const checksum = await legacyChecksum(markdown);
+  const cases: Array<{ name: string; value: unknown; expected: string }> = [
+    { name: "valid v1", value: { markdown, updatedAt: 10, checksum, version: 1 }, expected: markdown },
+    { name: "malformed v1 shape", value: { markdown, updatedAt: 10, checksum, version: 3 }, expected: "" },
+    { name: "malformed v2 shape", value: { markdown, updatedAt: 10, checksum: 42, version: 2 }, expected: "" },
+    { name: "v1 content tamper", value: { markdown: "tampered", updatedAt: 10, checksum, version: 1 }, expected: "" },
+  ];
+  for (const current of cases) {
+    environment.local.clear();
+    environment.local.setItem("lab.document.v1", JSON.stringify(current.value));
+    assert.equal(await loadLocalDocument(), current.expected, current.name);
+  }
+
+  environment.local.clear();
+  await saveLocalDocument("v2 note");
+  const valid = localSnapshot();
+  assert.ok(valid);
+  assert.equal(await loadLocalDocument(), "v2 note");
+
+  for (const tamper of [
+    { field: "markdown", value: "changed" },
+    { field: "updatedAt", value: (valid?.updatedAt ?? 0) + 100000 },
+  ] as const) {
+    environment.local.clear();
+    const corrupted = { ...valid, [tamper.field]: tamper.value };
+    environment.local.setItem("lab.document.v1", JSON.stringify(corrupted));
+    assert.equal(await loadLocalDocument(), "", `${tamper.field} tamper`);
+  }
+});
+
+test("timestamp issuance remains monotonic across equal and backwards clocks", () => {
+  const originalNow = Date.now;
+  try {
+    let now = 1000;
+    Date.now = () => now;
+    const timestamps: number[] = [];
+    for (const next of [1000, 1000, 900]) {
+      now = next;
+      assert.equal(stageLocalDocument(`note-${next}`), true);
+      timestamps.push(JSON.parse(environment.local.values.get("lab.document.pending.v1") ?? "null").updatedAt);
+    }
+    assert.deepEqual(timestamps, [1000, 1001, 1002]);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("invalid pending metadata cannot future-date a save, while valid and legacy pending records migrate", async () => {
+  assert.equal(stageLocalDocument("pending note"), true);
+  const pending = JSON.parse(environment.local.values.get("lab.document.pending.v1") ?? "null") as Record<string, unknown>;
+  const forgedTimestamp = Number(pending.updatedAt) + 1000000000;
+  pending.updatedAt = forgedTimestamp;
+  environment.local.setItem("lab.document.pending.v1", JSON.stringify(pending));
+
+  const health = await saveLocalDocument("pending note");
+  assert.equal(health.saved, true);
+  assert.ok((localSnapshot()?.updatedAt ?? 0) < forgedTimestamp);
+
+  environment.local.clear();
+  environment.local.setItem("lab.document.pending.v1", JSON.stringify({ markdown: "legacy draft", updatedAt: 1, version: 1 }));
+  assert.equal(await loadLocalDocument(), "legacy draft");
+});
+
+test("missing, stale, and corrupt replicas self-heal to three agreeing copies", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: null });
+  await saveLocalDocument("repaired note");
+  assert.ok(environment.idb && environment.opfs);
+
+  environment.local.removeItem("lab.document.v1");
+  environment.opfs.files.delete("lab.md.snapshot");
+  const current = environment.idb?.read("current") as LocalSnapshot;
+  environment.idb?.write("current", { ...current, updatedAt: current.updatedAt + 999999 });
+
+  assert.equal(await loadLocalDocument(), "repaired note");
+  const health = await inspectLocalStorage();
+  assert.equal(health.copies, 3);
+  assert.deepEqual(new Set(health.labels), new Set(["localStorage", "IndexedDB", "browser file system"]));
+  assert.equal(JSON.parse(environment.local.values.get("lab.document.v1") ?? "null").markdown, "repaired note");
+  assert.equal(JSON.parse(environment.opfs.files.get("lab.md.snapshot") ?? "null").markdown, "repaired note");
+});
+
+test("each individual replica missing, stale, or corrupt is repaired", async () => {
+  const targets = ["localStorage", "IndexedDB", "browser file system"] as const;
+  const states = ["missing", "stale", "corrupt"] as const;
+  for (const target of targets) {
+    for (const state of states) {
+      switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: null });
+      await saveLocalDocument("old replica");
+      await loadLocalDocument();
+      const oldLocal = localSnapshot();
+      const oldAuthority = environment.idb?.read("authority");
+      const oldCurrent = environment.idb?.read("current");
+      const oldOpfs = environment.opfs?.files.get("lab.md.snapshot") ?? null;
+      await saveLocalDocument("new replica");
+      await loadLocalDocument();
+      const newLocal = localSnapshot();
+      const newAuthority = environment.idb?.read("authority") as { snapshot: LocalSnapshot };
+      const newCurrent = environment.idb?.read("current") as LocalSnapshot;
+      const newOpfs = environment.opfs?.files.get("lab.md.snapshot") ?? null;
+      assert.ok(oldLocal && oldAuthority && oldCurrent && oldOpfs && newLocal && newAuthority && newCurrent && newOpfs);
+
+      if (target === "localStorage") {
+        if (state === "missing") environment.local.removeItem("lab.document.v1");
+        if (state === "stale") environment.local.setItem("lab.document.v1", JSON.stringify(oldLocal));
+        if (state === "corrupt") environment.local.setItem("lab.document.v1", JSON.stringify({ ...newLocal, updatedAt: newLocal.updatedAt + 999999 }));
+      }
+      if (target === "IndexedDB") {
+        if (state === "missing") {
+          environment.idb?.remove("authority");
+          environment.idb?.remove("current");
+        }
+        if (state === "stale") {
+          environment.idb?.write("authority", oldAuthority);
+          environment.idb?.write("current", oldCurrent);
+        }
+        if (state === "corrupt") {
+          environment.idb?.write("authority", { ...newAuthority, snapshot: { ...newAuthority.snapshot, updatedAt: newAuthority.snapshot.updatedAt + 999999 } });
+          environment.idb?.write("current", { ...newCurrent, updatedAt: newCurrent.updatedAt + 999999 });
+        }
+      }
+      if (target === "browser file system") {
+        if (state === "missing") environment.opfs?.files.delete("lab.md.snapshot");
+        if (state === "stale") environment.opfs?.files.set("lab.md.snapshot", oldOpfs);
+        if (state === "corrupt") environment.opfs?.files.set("lab.md.snapshot", "corrupt payload");
+      }
+
+      assert.equal(await loadLocalDocument(), "new replica", `${target} ${state}`);
+      const health = await inspectLocalStorage();
+      assert.equal(health.copies, 3, `${target} ${state}`);
+      assert.equal(health.errors.some((error) => error.includes("out of sync")), false, `${target} ${state}`);
+    }
+  }
+});
+
+test("orphaned namespaced drafts are discoverable without deleting another pending record", async () => {
+  switchEnvironment({ browser: true, locks: "success" });
+  environment.session.setItem("lab.document.pending.owner.v1", "base-tab");
+  await saveLocalDocument("durable base");
+  const base = localSnapshot();
+  assert.ok(base);
+
+  const liveSession = new MemoryStorage();
+  liveSession.setItem("lab.document.pending.owner.v1", "live-tab");
+  environment.restore();
+  environment = installEnvironment({ browser: true, locks: "success" });
+  // Reuse the durable state from the prior context, then stage a live draft.
+  environment.local.setItem("lab.document.v1", JSON.stringify(base));
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: liveSession });
+  assert.equal(stageLocalDocument("live draft"), true);
+  const liveRecord = environment.local.values.get("lab.document.pending.v2.live-tab");
+  assert.ok(liveRecord);
+
+  const orphanSession = new MemoryStorage();
+  orphanSession.setItem("lab.document.pending.owner.v1", "orphan-tab");
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: orphanSession });
+  assert.equal(stageLocalDocument("orphan winner"), true);
+  const orphanKey = "lab.document.pending.v2.orphan-tab";
+  assert.ok(environment.local.values.has(orphanKey));
+
+  const reopenedSession = new MemoryStorage();
+  reopenedSession.setItem("lab.document.pending.owner.v1", "reopened-tab");
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: reopenedSession });
+  assert.equal(await loadLocalDocument(), "orphan winner");
+  assert.equal(environment.local.values.has(orphanKey), false);
+  assert.equal(environment.local.values.get("lab.document.pending.v2.live-tab"), liveRecord);
+});
+
+test("corrupt IndexedDB authority or current data cannot block a later save", async () => {
+  switchEnvironment({ indexedDb: true });
+  await saveLocalDocument("initial");
+  const authority = environment.idb?.read("authority") as Record<string, unknown>;
+  environment.idb?.write("authority", {
+    ...authority,
+    snapshot: { ...(authority.snapshot as object), updatedAt: 9999999999999 },
+  });
+  assert.equal((await saveLocalDocument("newer")).saved, true);
+  assert.equal(await loadLocalDocument(), "newer");
+
+  environment.idb?.remove("authority");
+  const current = environment.idb?.read("current") as LocalSnapshot;
+  environment.idb?.write("current", { ...current, updatedAt: 9999999999999 });
+  assert.equal((await saveLocalDocument("recovered")).saved, true);
+  assert.equal(await loadLocalDocument(), "recovered");
+});
+
+test("a verified newer IndexedDB current record outranks an older authority record", async () => {
+  switchEnvironment({ indexedDb: true });
+  await saveLocalDocument("authority revision");
+  const olderAuthority = environment.idb?.read("authority");
+  await saveLocalDocument("current revision");
+  const newerCurrent = environment.idb?.read("current");
+  assert.ok(olderAuthority && newerCurrent);
+
+  environment.idb?.write("authority", olderAuthority);
+  environment.local.clear();
+  assert.equal(await loadLocalDocument(), "current revision");
+  assert.deepEqual(environment.idb?.read("current"), newerCurrent);
+});
+
+test("partial replica failure preserves authority success and reports degradation", async () => {
+  switchEnvironment({ indexedDb: true, opfs: true });
+  assert.equal(stageLocalDocument("partial write"), true);
+  assert.ok(environment.opfs);
+  environment.opfs.faults.write = true;
+  const health = await saveLocalDocument("partial write");
+  assert.equal(health.saved, true);
+  assert.ok(health.errors.some((error) => error.includes("browser file system")));
+  assert.equal(await loadLocalDocument(), "partial write");
+  assert.equal(environment.local.values.has("lab.document.pending.v1"), false);
+});
+
+test("authority success with both replica writes failed retains pending until recovery", async () => {
+  switchEnvironment({ indexedDb: true, opfs: true });
+  assert.equal(stageLocalDocument("both replicas fail"), true);
+  assert.ok(environment.opfs);
+  environment.local.throwOnSet = true;
+  environment.opfs.faults.write = true;
+  const health = await saveLocalDocument("both replicas fail");
+  assert.equal(health.saved, true);
+  assert.ok(health.errors.some((error) => error.includes("localStorage")));
+  assert.ok(health.errors.some((error) => error.includes("browser file system")));
+  assert.equal(environment.local.values.has("lab.document.pending.v1"), true);
+
+  environment.local.throwOnSet = false;
+  environment.opfs.faults.write = false;
+  assert.equal(await loadLocalDocument(), "both replicas fail");
+  assert.equal(environment.local.values.has("lab.document.pending.v1"), false);
+});
+
+test("standards-shaped quota failures preserve target-specific save and recovery semantics", async () => {
+  const cases: Array<{
+    name: string;
+    configure: (current: TestEnvironment) => void;
+    expectedSaved: boolean;
+    errorLabel: string;
+  }> = [
+    {
+      name: "localStorage quota",
+      configure: (current) => {
+        current.local.throwOnSet = true;
+        current.local.quotaOnSet = true;
+      },
+      expectedSaved: true,
+      errorLabel: "localStorage",
+    },
+    {
+      name: "IndexedDB transaction quota",
+      configure: (current) => {
+        current.idb?.faults.putKeys.add("current");
+        if (current.idb) current.idb.faults.quotaOnWrite = true;
+      },
+      expectedSaved: false,
+      errorLabel: "IndexedDB authority",
+    },
+    {
+      name: "OPFS write quota",
+      configure: (current) => {
+        if (current.opfs) {
+          current.opfs.faults.write = true;
+          current.opfs.faults.quotaWrite = true;
+        }
+      },
+      expectedSaved: true,
+      errorLabel: "browser file system",
+    },
+    {
+      name: "OPFS close quota",
+      configure: (current) => {
+        if (current.opfs) {
+          current.opfs.faults.close = true;
+          current.opfs.faults.quotaClose = true;
+        }
+      },
+      expectedSaved: true,
+      errorLabel: "browser file system",
+    },
+  ];
+
+  for (const currentCase of cases) {
+    switchEnvironment({ indexedDb: true, opfs: true });
+    assert.equal(stageLocalDocument(currentCase.name), true);
+    currentCase.configure(environment);
+    const health = await saveLocalDocument(currentCase.name);
+    assert.equal(health.saved, currentCase.expectedSaved, currentCase.name);
+    assert.ok(health.errors.some((error) => error.includes(currentCase.errorLabel)), currentCase.name);
+    assert.equal(environment.local.values.has("lab.document.pending.v1"), true, currentCase.name);
+
+    environment.local.throwOnSet = false;
+    environment.local.quotaOnSet = false;
+    if (environment.idb) {
+      environment.idb.faults.putKeys.clear();
+      environment.idb.faults.quotaOnWrite = false;
+    }
+    if (environment.opfs) {
+      environment.opfs.faults.write = false;
+      environment.opfs.faults.close = false;
+      environment.opfs.faults.quotaWrite = false;
+      environment.opfs.faults.quotaClose = false;
+    }
+
+    assert.equal(await loadLocalDocument(), currentCase.name, currentCase.name);
+    assert.equal(environment.local.values.has("lab.document.pending.v1"), false, currentCase.name);
+    assert.equal((await inspectLocalStorage()).copies, 3, currentCase.name);
+  }
+});
+
+test("localStorage property and method failures remain isolated from readable fallbacks", async () => {
+  switchEnvironment({ indexedDb: true, opfs: true });
+  await saveLocalDocument("fallback note");
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    get() {
+      throw new DOMException("Access denied", "SecurityError");
+    },
+  });
+  try {
+    assert.equal(await loadLocalDocument(), "fallback note");
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, "localStorage", descriptor);
+  }
+
+  environment.local.throwOnSet = true;
+  const health = await saveLocalDocument("method failure");
+  assert.equal(health.saved, true);
+  assert.ok(health.errors.some((error) => error.includes("localStorage")));
+});
+
+test("sessionStorage failure falls back to the shared legacy staging slot", () => {
+  switchEnvironment({ browser: true, locks: "success" });
+  environment.session.throwOnGet = true;
+  environment.session.throwOnSet = true;
+  assert.equal(stageLocalDocument("session fallback"), true);
+  assert.ok(environment.local.values.has("lab.document.pending.v1"));
+});
+
+test("missing crypto preserves a verified staged recovery draft but cannot create a durable snapshot", async () => {
+  assert.equal(stageLocalDocument("crypto recovery"), true);
+  Object.defineProperty(globalThis, "crypto", { configurable: true, value: undefined });
+  assert.equal(await loadLocalDocument(), "crypto recovery");
+  await assert.rejects(saveLocalDocument("crypto recovery"), /hashing|crypto|Secure/i);
+  assert.ok(environment.local.values.has("lab.document.pending.v1"));
+});
+
+test("Web Locks absence rejects browser fallback writes while request rejection retries safely", async () => {
+  switchEnvironment({ browser: true, locks: null });
+  assert.equal((await saveLocalDocument("no lock")).saved, false);
+
+  switchEnvironment({ browser: true, locks: "reject" });
+  assert.equal((await saveLocalDocument("rejected lock")).saved, true);
+  assert.equal(await loadLocalDocument(), "rejected lock");
+});
+
+test("OPFS handles not-found, corruption, and write failures independently", async () => {
+  switchEnvironment({ opfs: true });
+  assert.equal((await saveLocalDocument("opfs note")).saved, true);
+  assert.ok(environment.opfs);
+  environment.opfs.files.delete("lab.md.snapshot");
+  assert.equal(await loadLocalDocument(), "opfs note");
+  environment.opfs.files.set("lab.md.snapshot", "not-json");
+  assert.equal(await loadLocalDocument(), "opfs note");
+  environment.opfs.faults.write = true;
+  const health = await saveLocalDocument("opfs degraded");
+  assert.equal(health.saved, true);
+  assert.ok(health.errors.some((error) => error.includes("browser file system")));
+});
+
+test("IndexedDB open, request, abort, and put failures retain the recovery draft", async () => {
+  const cases: Array<{ name: string; configure: (faults: FaultConfig) => void }> = [
+    { name: "open error", configure: (faults) => { faults.open = "error"; } },
+    { name: "blocked open", configure: (faults) => { faults.open = "blocked"; } },
+    { name: "request error", configure: (faults) => { faults.readKeys.add("authority"); } },
+    { name: "transaction abort", configure: (faults) => { faults.abortOnWrite = true; } },
+    { name: "put failure", configure: (faults) => { faults.putKeys.add("current"); } },
+  ];
+  for (const current of cases) {
+    switchEnvironment({ indexedDb: true });
+    current.configure(environment.idb?.faults as FaultConfig);
+    assert.equal(stageLocalDocument(current.name), true);
+    const health = await saveLocalDocument(current.name);
+    assert.equal(health.saved, false, current.name);
+    assert.ok(environment.local.values.has("lab.document.pending.v1"), current.name);
+  }
+});
+
+test("a newer staged edit cannot be cleared by an older save in flight", async () => {
+  let started = false;
+  let release: (() => void) | undefined;
+  const originalCrypto = globalThis.crypto;
+  const digest = async (...args: Parameters<SubtleCrypto["digest"]>) => {
+    if (!started) {
+      started = true;
+      await new Promise<void>((resolve) => { release = resolve; });
+    }
+    return webcrypto.subtle.digest(...args);
+  };
+  Object.defineProperty(globalThis, "crypto", { configurable: true, value: { subtle: { digest } } });
+  try {
+    assert.equal(stageLocalDocument("older"), true);
+    const save = saveLocalDocument("older");
+    while (!started) await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(stageLocalDocument("newer"), true);
+    release?.();
+    const health = await save;
+    assert.equal(health.saved, false);
+    assert.equal(await loadLocalDocument(), "newer");
+  } finally {
+    Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
+  }
+});
