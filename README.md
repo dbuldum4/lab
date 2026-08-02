@@ -13,6 +13,11 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+## Deploy
+
+Pushes to `main` deploy a static export to GitHub Pages at
+`https://dbuldum4.github.io/lab/`.
+
 ## Testing
 
 Fast unit, storage-contract, and editor-persistence tests run with Node's built-in test runner:

@@ -156,9 +156,6 @@ export function LabEditor() {
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
-  const [cspNonce] = useState<string | undefined>(() => (
-    typeof document === "undefined" ? undefined : document.body.dataset.cspNonce
-  ));
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -663,8 +660,14 @@ export function LabEditor() {
 
       {palette ? (
         <>
-          <style nonce={cspNonce}>{`#${PALETTE_ID} { left: ${Math.round(palette.left)}px; top: ${Math.round(palette.top)}px; }`}</style>
-          <div ref={paletteElementRef} id={PALETTE_ID} className="command-palette" role={palette.mode === "commands" ? "listbox" : "status"} aria-label="Slash commands">
+          <div
+            ref={paletteElementRef}
+            id={PALETTE_ID}
+            className="command-palette"
+            role={palette.mode === "commands" ? "listbox" : "status"}
+            aria-label="Slash commands"
+            style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
+          >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
               <div className="command-list">
