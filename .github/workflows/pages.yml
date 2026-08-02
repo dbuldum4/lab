@@ -37,8 +37,19 @@ jobs:
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
 
-      - name: Verify
-        run: npm run verify
+      - name: Test
+        run: npm run test:all
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+        env:
+          LAB_GITHUB_PAGES_BUILD: "true"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
