@@ -16,7 +16,7 @@ Open `http://localhost:3000`.
 ## Deploy
 
 Pushes to `main` deploy a static export to GitHub Pages at
-`https://dbuldum4.github.io/lab/`.
+`https://denizbuldum.org/lab/`.
 
 ## Testing
 
