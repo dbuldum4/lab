@@ -1,13 +1,13 @@
 const LOCAL_KEY = "lab.document.v1";
 const PENDING_KEY = "lab.document.pending.v1";
 const PENDING_KEY_PREFIX = "lab.document.pending.v2.";
-const PENDING_OWNER_KEY = "lab.document.pending.owner.v1";
 const DB_NAME = "lab-private-vault";
 const STORE_NAME = "documents";
 const OPFS_FILE = "lab.md.snapshot";
 const DB_VERSION = 2;
 const AUTHORITY_KEY = "authority";
 const CURRENT_KEY = "current";
+const MAX_RECOVERY_DRAFTS = 8;
 
 export type LocalSnapshot = {
   markdown: string;
@@ -25,8 +25,15 @@ export type StorageHealth = {
   labels: string[];
   persistent: boolean;
   errors: string[];
+  /** Number of distinct, verified cross-tab drafts available for export. */
+  conflicts: number;
   /** Present on save results. False means this tab's candidate lost an authority conflict. */
   saved?: boolean;
+};
+
+export type LocalRecoveryDraft = {
+  markdown: string;
+  updatedAt: number;
 };
 
 type StorageTarget = {
@@ -71,6 +78,8 @@ const VAULT_LOCK = "lab-private-vault";
 
 let vaultQueue: Promise<void> = Promise.resolve();
 let lastIssuedTimestamp = 0;
+let pendingOwner: string | null = null;
+let webLocksUnavailable = false;
 
 function getLocalStorage(): Storage | null {
   // Accessing the global property itself can throw SecurityError in privacy
@@ -82,30 +91,14 @@ function getLocalStorage(): Storage | null {
   }
 }
 
-function getSessionStorage(): Storage | null {
-  try {
-    return globalThis.sessionStorage;
-  } catch {
-    return null;
-  }
-}
-
 function pendingStorageKey() {
-  // sessionStorage survives reloads but is isolated per tab, so each tab keeps
-  // its own crash-recovery draft through a cross-tab authority conflict.
+  // A module-scoped owner is unique to this page realm. sessionStorage cannot
+  // provide that guarantee because auxiliary and duplicated tabs can inherit a
+  // copy of the opener's values. Reload recovery still works because load scans
+  // every namespaced pending record before this page creates its next draft.
   if (!isBrowserContext()) return PENDING_KEY;
-  const session = getSessionStorage();
-  if (!session) return PENDING_KEY;
-  try {
-    let owner = session.getItem(PENDING_OWNER_KEY);
-    if (!owner) {
-      owner = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-      session.setItem(PENDING_OWNER_KEY, owner);
-    }
-    return `${PENDING_KEY_PREFIX}${owner}`;
-  } catch {
-    return PENDING_KEY;
-  }
+  pendingOwner ??= globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+  return `${PENDING_KEY_PREFIX}${pendingOwner}`;
 }
 
 function hasIndexedDb() {
@@ -117,6 +110,7 @@ function hasIndexedDb() {
 }
 
 function hasWebLocks() {
+  if (webLocksUnavailable) return false;
   try {
     const browserNavigator = typeof navigator === "undefined" ? undefined : navigator;
     return typeof browserNavigator?.locks?.request === "function";
@@ -141,9 +135,12 @@ async function withVaultLock<T>(operation: () => Promise<T>) {
       return operation();
     });
   } catch (error) {
-    // Some contexts expose Web Locks but reject requests. If the callback did
-    // not start, retrying preserves local persistence; never retry a started op.
-    if (!operationStarted) return operation();
+    // Reads can continue without a lock, but remember that the exposed API is
+    // unusable so saveLocalDocument will not authorize replica-only writes.
+    if (!operationStarted) {
+      webLocksUnavailable = true;
+      return operation();
+    }
     throw error;
   }
 }
@@ -699,6 +696,10 @@ type PendingCandidate = {
   snapshot: CanonicalSnapshot;
 };
 
+function comparePendingCandidates(left: PendingCandidate, right: PendingCandidate) {
+  return compareSnapshotOrder(right.snapshot, left.snapshot);
+}
+
 function selectPendingCandidate(candidates: readonly PendingCandidate[]) {
   return candidates.reduce<PendingCandidate | null>((winner, candidate) => (
     !winner || shouldAcceptSnapshot(winner.snapshot, candidate.snapshot) ? candidate : winner
@@ -718,6 +719,94 @@ function selectPendingFallback(
     }
     return (document.checksum ?? "").localeCompare(winner.checksum ?? "") >= 0 ? document : winner;
   }, null);
+}
+
+function recoveryCandidates(
+  candidates: readonly PendingCandidate[],
+  durableWinner: CanonicalSnapshot | null,
+  currentPending: PendingDocument | null,
+) {
+  if (!durableWinner) return [];
+  const markdownSeen = new Set<string>();
+  return [...candidates]
+    .sort(comparePendingCandidates)
+    .filter((candidate) => candidate.document.storageKey !== currentPending?.storageKey)
+    .filter((candidate) => candidate.snapshot.markdown !== durableWinner.markdown)
+    .filter((candidate) => {
+      if (markdownSeen.has(candidate.snapshot.markdown)) return false;
+      markdownSeen.add(candidate.snapshot.markdown);
+      return true;
+    });
+}
+
+function prunePendingDocuments(
+  candidates: readonly PendingCandidate[],
+  durableWinner: CanonicalSnapshot,
+  currentPending: PendingDocument | null,
+) {
+  const retainedMarkdown = new Set<string>();
+  let retained = 0;
+  for (const candidate of [...candidates].sort(comparePendingCandidates)) {
+    if (candidate.snapshot.markdown === durableWinner.markdown) {
+      clearPendingDocument(candidate.document);
+      continue;
+    }
+    if (candidate.document.storageKey === currentPending?.storageKey) continue;
+    if (retainedMarkdown.has(candidate.snapshot.markdown) || retained >= MAX_RECOVERY_DRAFTS) {
+      clearPendingDocument(candidate.document);
+      continue;
+    }
+    retainedMarkdown.add(candidate.snapshot.markdown);
+    retained += 1;
+  }
+}
+
+/**
+ * Keep recovery storage bounded even when no durable replica exists yet. Only
+ * v2 records whose synchronous checksum verified are eligible; legacy or
+ * otherwise unverifiable records remain available for manual recovery.
+ */
+function prunePendingDocumentsWithoutDurable(
+  documents: readonly PendingDocument[],
+  reads: readonly PendingSnapshotRead[],
+  currentPending: PendingDocument | null,
+) {
+  const currentKey = currentPending?.storageKey;
+  const retainedKeys = new Set<string>();
+  const retainedMarkdown = new Set<string>();
+  const currentIndex = currentPending
+    ? documents.findIndex((document) => document.storageKey === currentKey)
+    : -1;
+  const currentRead = currentIndex >= 0 ? reads[currentIndex] : undefined;
+  if (currentPending && (currentRead?.snapshot || currentRead?.verificationUnavailable)) {
+    retainedKeys.add(currentPending.storageKey ?? "");
+    retainedMarkdown.add(currentPending.markdown);
+  }
+
+  const eligible = documents.flatMap((document, index) => {
+    const read = reads[index];
+    return read?.snapshot || read?.verificationUnavailable ? [{ document, read }] : [];
+  }).sort((left, right) => {
+    if (left.document.updatedAt !== right.document.updatedAt) {
+      return right.document.updatedAt - left.document.updatedAt;
+    }
+    return (right.document.checksum ?? "").localeCompare(left.document.checksum ?? "");
+  });
+  let remaining = Math.max(0, MAX_RECOVERY_DRAFTS - retainedKeys.size);
+
+  for (const candidate of eligible) {
+    if (candidate.document.storageKey === currentKey) continue;
+    if (
+      retainedMarkdown.has(candidate.document.markdown)
+      || remaining === 0
+    ) {
+      clearPendingDocument(candidate.document);
+      continue;
+    }
+    retainedKeys.add(candidate.document.storageKey ?? "");
+    retainedMarkdown.add(candidate.document.markdown);
+    remaining -= 1;
+  }
 }
 
 const LOCAL_STORAGE_TARGET: StorageTarget = {
@@ -872,10 +961,18 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
   const authorityErrors = isBrowserContext() && !hasIndexedDb() && !hasWebLocks()
     ? ["Cross-tab persistence requires IndexedDB or Web Locks."]
     : [];
+  const pendingDocuments = readPendingDocuments();
+  const currentPending = currentPendingDocument(pendingDocuments);
+  const pendingReads = await Promise.all(pendingDocuments.map(readPendingSnapshot));
+  const pendingCandidates = pendingDocuments.flatMap((document, index) => {
+    const read = pendingReads[index];
+    return read.snapshot ? [{ document, read, snapshot: read.snapshot }] : [];
+  });
   return {
     copies: labels.length,
     labels,
     persistent: await persistentStorageGranted(),
+    conflicts: recoveryCandidates(pendingCandidates, winner as CanonicalSnapshot | null, currentPending).length,
     errors: [...new Set([
       ...extraErrors,
       ...authorityErrors,
@@ -908,6 +1005,7 @@ export function loadLocalDocument() {
     if (!winner) {
       // Hashing may be unavailable while a staged draft is still perfectly
       // readable. Return it and leave the recovery key untouched.
+      prunePendingDocumentsWithoutDurable(pendingDocuments, pendingReads, pendingDocument);
       const pendingFallback = selectPendingFallback(pendingDocuments, pendingReads);
       if (pendingFallback) return pendingFallback.markdown;
       if (pendingDocument) {
@@ -921,16 +1019,41 @@ export function loadLocalDocument() {
     const reconciliation = await reconcileSnapshots(winner as CanonicalSnapshot, reads);
     const actualWinner = reconciliation.winner;
 
-    if (pendingWinner) {
-      // Never erase a losing tab's staged draft. Only clear it when the exact
-      // draft is now known to have a durable replica.
-      if (sameSnapshot(pendingWinner.snapshot, actualWinner)
-        && (reconciliation.promoted || reads.some((read) => read.valid && sameSnapshot(read.snapshot, actualWinner)))) {
-        clearPendingDocument(pendingWinner.document);
-      }
+    const winnerIsDurable = reconciliation.promoted
+      || reads.some((read) => read.valid && sameSnapshot(read.snapshot, actualWinner));
+    if (winnerIsDurable) {
+      prunePendingDocuments(pendingCandidates, actualWinner, pendingDocument);
+    } else {
+      prunePendingDocumentsWithoutDurable(pendingDocuments, pendingReads, pendingDocument);
     }
     // If verification was unavailable, deliberately do not clear its pending record.
     return actualWinner.markdown;
+  });
+}
+
+export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
+  return serializeVaultOperation(async () => {
+    const reads = await readSnapshots();
+    const durableWinner = selectCurrentSnapshot(
+      reads.filter((read) => read.valid && read.snapshot).map((read) => read.snapshot as CanonicalSnapshot),
+    ) as CanonicalSnapshot | null;
+    const pendingDocuments = readPendingDocuments();
+    const currentPending = currentPendingDocument(pendingDocuments);
+    const pendingReads = await Promise.all(pendingDocuments.map(readPendingSnapshot));
+    const candidates = pendingDocuments.flatMap((document, index) => {
+      const read = pendingReads[index];
+      return read.snapshot ? [{ document, read, snapshot: read.snapshot }] : [];
+    });
+    const recoveries = recoveryCandidates(candidates, durableWinner, currentPending);
+    if (durableWinner) {
+      prunePendingDocuments(candidates, durableWinner, currentPending);
+    } else {
+      prunePendingDocumentsWithoutDurable(pendingDocuments, pendingReads, currentPending);
+    }
+    return recoveries.slice(0, MAX_RECOVERY_DRAFTS).map(({ snapshot }) => ({
+      markdown: snapshot.markdown,
+      updatedAt: snapshot.updatedAt,
+    }));
   });
 }
 
@@ -1025,4 +1148,6 @@ export function inspectLocalStorage(): Promise<StorageHealth> {
 export function resetLocalVaultStateForTests() {
   vaultQueue = Promise.resolve();
   lastIssuedTimestamp = 0;
+  pendingOwner = null;
+  webLocksUnavailable = false;
 }

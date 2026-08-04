@@ -45,6 +45,15 @@ function isAuthorityFailure(health: StorageHealth) {
   ));
 }
 
+function savedHealthNotice(health: StorageHealth) {
+  const notices: string[] = [];
+  if (health.errors.length > 0) notices.push("Saved, but one or more local copies could not be updated.");
+  if (health.conflicts > 0) {
+    notices.push(`${health.conflicts} conflicting local ${health.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`);
+  }
+  return notices.length > 0 ? notices.join(" ") : null;
+}
+
 /**
  * Owns only editor persistence timing and revision semantics. Storage policy
  * remains in local-vault; the injected boundary makes lifecycle behavior
@@ -79,9 +88,7 @@ export function createEditorPersistenceController(
     if (revision !== editRevision) return;
     dependencies.onHealth?.(health);
     if (health.saved === true) {
-      dependencies.onNotice?.(health.errors.length > 0
-        ? "Saved, but one or more local copies could not be updated."
-        : null);
+      dependencies.onNotice?.(savedHealthNotice(health));
       return;
     }
     dependencies.onNotice?.(isAuthorityFailure(health)

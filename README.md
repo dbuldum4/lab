@@ -54,3 +54,9 @@ Stress failures print the seed, iteration, and schedule; replay the same seed wi
 `lab` has no accounts, analytics, API routes, or remote assets. GitHub Pages cannot set custom response headers, so the static export supplies a meta-delivered Content Security Policy that limits connections and application assets to the same origin. Notes stay local to the browser and are written redundantly to localStorage, IndexedDB, and the browser's origin-private file system when available. Integrity checks detect accidental or corrupted snapshots; they are not encryption, so this app does not promise encrypted at-rest storage.
 
 Use `/export` for a portable Markdown copy and `/import` to restore one.
+
+## Math
+
+Type `$$...$$` to turn an inline expression into KaTeX-rendered math. Use
+`/math` (or `/latex`) for a centered block equation. Equations remain local,
+editable, and round-trip through Markdown import/export.

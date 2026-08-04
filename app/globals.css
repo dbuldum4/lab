@@ -259,6 +259,77 @@ img.ProseMirror-separator {
   line-height: 1.65;
 }
 
+.lab-document .tiptap-mathematics-render {
+  color: var(--ink);
+}
+
+.lab-document .tiptap-mathematics-render[data-type="inline-math"] {
+  display: inline-block;
+  max-width: 100%;
+  border-radius: 5px;
+  cursor: text;
+  vertical-align: -0.08em;
+}
+
+.lab-document .tiptap-mathematics-render[data-type="inline-math"].ProseMirror-selectednode,
+.lab-document .tiptap-mathematics-render[data-type="inline-math"]:focus-visible {
+  outline: 1px solid #777771;
+  outline-offset: 3px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.lab-document .tiptap-mathematics-render[data-type="block-math"] {
+  display: block;
+  max-width: 100%;
+  margin: 1.05em 0 1.2em;
+  border-radius: 8px;
+  cursor: text;
+  text-align: center;
+}
+
+.lab-document .tiptap-mathematics-render[data-type="block-math"].ProseMirror-selectednode,
+.lab-document .tiptap-mathematics-render[data-type="block-math"]:focus-visible {
+  outline: 1px solid #777771;
+  outline-offset: 5px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.lab-document .block-math-inner {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.12em 0.5em;
+  scrollbar-width: thin;
+}
+
+.lab-document .tiptap-mathematics-render .katex {
+  color: var(--ink);
+  font-size: 1.04em;
+}
+
+.lab-document .tiptap-mathematics-render[data-type="block-math"] .katex {
+  font-size: 1.14em;
+}
+
+.lab-document .inline-math-error,
+.lab-document .block-math-error {
+  border: 1px dashed #695f50;
+  border-radius: 5px;
+  background: rgba(117, 91, 55, 0.12);
+  color: #e5c994;
+  font-family: var(--font-geist-mono), "Geist Mono", monospace;
+  font-size: 0.78em;
+  white-space: pre-wrap;
+}
+
+.lab-document .block-math-error {
+  display: block;
+  margin: 1em auto;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.6em 0.8em;
+  text-align: left;
+}
+
 .lab-document a {
   color: #f0f0ed;
   text-decoration-color: #666663;
@@ -294,6 +365,7 @@ img.ProseMirror-separator {
 
 .lab-document th,
 .lab-document td {
+  position: relative;
   min-width: 100px;
   border: 1px solid #30302e;
   padding: 0.56em 0.7em;
@@ -378,6 +450,91 @@ img.ProseMirror-separator {
   font-family: var(--font-geist-sans), Geist, system-ui, sans-serif;
   -webkit-backdrop-filter: blur(18px);
   backdrop-filter: blur(18px);
+}
+
+.math-editor-popover {
+  position: absolute;
+  z-index: 35;
+  width: min(420px, calc(100vw - 32px));
+  border: 1px solid #343430;
+  border-radius: 12px;
+  background: rgba(12, 12, 12, 0.985);
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.72), 0 1px 0 rgba(255, 255, 255, 0.06) inset;
+  padding: 12px;
+  color: #f0f0ed;
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+.math-editor-popover[data-kind="block"] {
+  width: min(480px, calc(100vw - 32px));
+}
+
+.math-editor-popover label {
+  display: block;
+  margin: 0 0 7px;
+  color: #d7d7d2;
+  font-size: 12px;
+  font-weight: 530;
+  letter-spacing: -0.01em;
+}
+
+.math-editor-popover input,
+.math-editor-popover textarea {
+  display: block;
+  width: 100%;
+  border: 1px solid #3a3a36;
+  border-radius: 7px;
+  outline: none;
+  background: #070707;
+  padding: 9px 10px;
+  color: #f0f0ed;
+  font-family: var(--font-geist-mono), "Geist Mono", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.math-editor-popover input:focus,
+.math-editor-popover textarea:focus {
+  border-color: #85857f;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
+}
+
+.math-editor-hint {
+  min-height: 17px;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.math-editor-preview {
+  max-width: 100%;
+  margin: 10px 2px 0;
+  overflow-x: auto;
+  border-top: 1px solid #242421;
+  padding-top: 10px;
+  color: var(--ink);
+  text-align: center;
+}
+
+.math-editor-preview .katex {
+  font-size: 1.05em;
+}
+
+.math-editor-preview .katex-display {
+  margin: 0;
+}
+
+.math-editor-popover input[aria-invalid="true"],
+.math-editor-popover textarea[aria-invalid="true"] {
+  border-color: #7b6240;
+}
+
+.math-editor-popover input[aria-invalid="true"] + .math-editor-hint,
+.math-editor-popover textarea[aria-invalid="true"] + .math-editor-hint {
+  color: #d7b473;
 }
 
 .command-list {

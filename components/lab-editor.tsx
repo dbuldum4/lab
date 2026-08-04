@@ -5,9 +5,14 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { TableKit } from "@tiptap/extension-table";
 import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
+import { BlockMath, InlineMath } from "@tiptap/extension-mathematics";
 import { Markdown } from "@tiptap/markdown";
+import { closeHistory } from "@tiptap/pm/history";
+import { type Node as PMNode } from "@tiptap/pm/model";
+import { NodeSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import katex from "katex";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   createEditorPersistenceController,
@@ -15,7 +20,9 @@ import {
 } from "@/lib/editor-persistence";
 import {
   inspectLocalStorage,
+  listLocalRecoveryDrafts,
   requestPersistentStorage,
+  type LocalRecoveryDraft,
   type StorageHealth,
 } from "@/lib/local-vault";
 
@@ -38,6 +45,17 @@ type Command = {
   terms: string;
 };
 
+type MathKind = "inline" | "block";
+type MathEditorState = {
+  kind: MathKind;
+  pos: number;
+  latex: string;
+  initialLatex: string;
+  isNew: boolean;
+  left: number;
+  top: number;
+};
+
 const COMMANDS: Command[] = [
   { id: "text", label: "Text", detail: "Plain paragraph", terms: "paragraph normal" },
   { id: "h1", label: "Heading 1", detail: "Large section title", terms: "title h1" },
@@ -50,11 +68,14 @@ const COMMANDS: Command[] = [
   { id: "code", label: "Code block", detail: "Write preformatted code", terms: "pre snippet" },
   { id: "divider", label: "Divider", detail: "Separate sections", terms: "rule hr line" },
   { id: "table", label: "Table", detail: "Insert a 3 × 3 Markdown table", terms: "grid rows columns" },
+  { id: "inline-math", label: "Inline equation", detail: "Write LaTeX within a line", terms: "math latex formula inline equation" },
+  { id: "math", label: "Block equation", detail: "Write a centered LaTeX equation", terms: "math latex formula display equation" },
   { id: "link", label: "Link", detail: "Type a URL, then close with )", terms: "url href markdown" },
   { id: "undo", label: "Undo", detail: "Undo the last change", terms: "back history" },
   { id: "redo", label: "Redo", detail: "Redo the last change", terms: "forward history" },
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
   { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
+  { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
 ];
@@ -80,16 +101,145 @@ const MarkdownLinkInput = Extension.create({
   },
 });
 
-const EMPTY_HEALTH: StorageHealth = { copies: 0, labels: [], persistent: false, errors: [] };
+/**
+ * Keep the persisted syntax close to Notion's keyboard syntax: inline math is
+ * delimited by two dollar signs. The upstream Tiptap extension serializes
+ * inline nodes with single-dollar delimiters, so its Markdown handlers are
+ * intentionally narrowed here to avoid confusing `$$x$$` with a block node.
+ */
+const InlineMathMarkdown = InlineMath.extend({
+  renderMarkdown: (node) => `$$${String(node.attrs?.latex ?? "")}$$`,
+  markdownTokenizer: {
+    name: "inlineMath",
+    level: "inline",
+    start: (source: string) => source.indexOf("$$"),
+    tokenize: (source: string) => {
+      const match = source.match(/^\$\$((?:\\\$|[^$\n])+?)\$\$(?!\$)/);
+      if (!match) return undefined;
+      return { type: "inlineMath", raw: match[0], latex: match[1].trim() };
+    },
+  },
+  addInputRules() {
+    // Delimiter conversion is handled from the transaction update below. The
+    // upstream input rule assumes a synchronous DOM range and can throw when
+    // an IME or browser automation reports the range before reconciliation.
+    return [];
+  },
+});
+
+function findBlockMathStart(source: string) {
+  let offset = 0;
+  while (offset < source.length) {
+    const index = source.indexOf("$$\n", offset);
+    if (index < 0) return -1;
+    if (index === 0 || source[index - 1] === "\n") return index;
+    offset = index + 2;
+  }
+  return -1;
+}
+
+/** Block math is only recognized when the delimiters occupy their own lines. */
+const BlockMathMarkdown = BlockMath.extend({
+  markdownTokenizer: {
+    name: "blockMath",
+    level: "block",
+    start: findBlockMathStart,
+    tokenize: (source: string) => {
+      const match = source.match(/^\$\$\n([\s\S]*?)\n\$\$(?:\n|$)/);
+      if (!match) return undefined;
+      return { type: "blockMath", raw: match[0], latex: match[1].trim() };
+    },
+  },
+});
+
+const EMPTY_HEALTH: StorageHealth = { copies: 0, labels: [], persistent: false, errors: [], conflicts: 0 };
 const PALETTE_ID = "slash-command-palette";
+const MATH_EDITOR_ID = "math-editor-popover";
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
+const INLINE_MATH_PATTERN = /^\$\$((?:\\\$|[^$\n])+?)\$\$$/;
+const BLOCK_MATH_PATTERN = /^\$\$\n([\s\S]*?)\n\$\$(?:\n)?$/;
 
 function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
 }
 
+function migrateInlineMath(instance: Editor) {
+  const matches: Array<{ from: number; to: number; latex: string }> = [];
+  instance.state.doc.descendants((node, pos) => {
+    if (!node.isText || !node.text?.includes("$$")) return;
+    const parent = instance.state.doc.resolve(pos).parent;
+    if (isCodeBlock(parent)) return;
+    const pattern = /\$\$((?:\\\$|[^$\n])+?)\$\$/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(node.text)) !== null) {
+      matches.push({ from: pos + match.index, to: pos + match.index + match[0].length, latex: match[1] });
+    }
+  });
+  if (matches.length === 0) return false;
+
+  const tr = instance.state.tr;
+  for (const match of matches.reverse()) {
+    tr.replaceWith(match.from, match.to, instance.schema.nodes.inlineMath.create({ latex: match.latex }));
+  }
+  instance.view.dispatch(tr.setMeta("addToHistory", false));
+  return true;
+}
+
+function mathNodeType(kind: MathKind) {
+  return kind === "inline" ? "inlineMath" : "blockMath";
+}
+
+function sameMathEditor(left: MathEditorState | null, right: MathEditorState | null) {
+  return Boolean(left && right && left.kind === right.kind && left.pos === right.pos);
+}
+
+function updateMathNode(instance: Editor, current: MathEditorState, latex: string, addToHistory = true) {
+  const node = instance.state.doc.nodeAt(current.pos);
+  if (!node || node.type.name !== mathNodeType(current.kind)) return false;
+
+  const transaction = instance.state.tr
+    .setNodeMarkup(current.pos, node.type, { ...node.attrs, latex })
+    .scrollIntoView()
+    .setMeta("addToHistory", addToHistory);
+  instance.view.dispatch(transaction);
+  return true;
+}
+
+function deleteMathNode(instance: Editor, current: MathEditorState) {
+  const node = instance.state.doc.nodeAt(current.pos);
+  if (!node || node.type.name !== mathNodeType(current.kind)) return false;
+  instance.view.dispatch(
+    instance.state.tr
+      .delete(current.pos, current.pos + node.nodeSize)
+      .scrollIntoView()
+      .setMeta("addToHistory", false),
+  );
+  return true;
+}
+
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+}
+
+function downloadMarkdown(filename: string, markdown: string) {
+  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+  const anchor = document.createElement("a");
+  anchor.href = URL.createObjectURL(blob);
+  anchor.download = filename;
+  anchor.hidden = true;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  globalThis.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
+}
+
+function recoveryBundle(drafts: readonly LocalRecoveryDraft[]) {
+  if (drafts.length === 1) return drafts[0].markdown;
+  return drafts.map((draft, index) => {
+    const date = new Date(draft.updatedAt);
+    const stagedAt = Number.isNaN(date.getTime()) ? String(draft.updatedAt) : date.toISOString();
+    return `<!-- lab recovery draft ${index + 1}; staged ${stagedAt} -->\n\n${draft.markdown}`;
+  }).join("\n\n---\n\n");
 }
 
 const PlainUrlInput = Extension.create({
@@ -147,11 +297,16 @@ export function LabEditor() {
   const caretRef = useRef<HTMLDivElement>(null);
   const caretStrokeRef = useRef<HTMLSpanElement>(null);
   const paletteElementRef = useRef<HTMLDivElement>(null);
+  const mathEditorElementRef = useRef<HTMLDivElement>(null);
+  const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<Editor | null>(null);
   const paletteRef = useRef<PaletteState | null>(null);
+  const mathEditorRef = useRef<MathEditorState | null>(null);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
+  const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [selected, setSelectedState] = useState(0);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
@@ -179,6 +334,155 @@ export function LabEditor() {
     selectedRef.current = value;
     setSelectedState(value);
   }, []);
+
+  const setMathEditor = useCallback((value: MathEditorState | null) => {
+    mathEditorRef.current = value;
+    setMathEditorState(value);
+  }, []);
+
+  const mathAnchor = useCallback((instance: Editor, pos: number, kind: MathKind) => {
+    const shell = shellRef.current;
+    const dom = instance.view.nodeDOM(pos);
+    if (!shell || !(dom instanceof HTMLElement)) return null;
+
+    const shellBox = shell.getBoundingClientRect();
+    const nodeBox = dom.getBoundingClientRect();
+    const viewport = window.visualViewport;
+    const viewportLeft = viewport?.offsetLeft ?? 0;
+    const viewportTop = viewport?.offsetTop ?? 0;
+    const viewportWidth = viewport?.width ?? window.innerWidth;
+    const viewportBottom = viewportTop + (viewport?.height ?? window.innerHeight);
+    const width = Math.min(kind === "block" ? 480 : 420, Math.max(1, shellBox.width - 16));
+    const height = kind === "block" ? 150 : 108;
+    const leftViewport = clamp(
+      nodeBox.left,
+      viewportLeft + 8,
+      viewportLeft + viewportWidth - width - 8,
+    );
+    const below = nodeBox.bottom + 10;
+    const above = nodeBox.top - height - 10;
+    const topViewport = below + height <= viewportBottom - 8 ? below : above;
+    const top = clamp(topViewport, viewportTop + 8, viewportBottom - height - 8);
+    return {
+      left: leftViewport - shellBox.left,
+      top: top - shellBox.top,
+    };
+  }, []);
+
+  const repositionMathEditor = useCallback(() => {
+    const current = mathEditorRef.current;
+    const instance = editorRef.current;
+    if (!current || !instance) return;
+    const anchor = mathAnchor(instance, current.pos, current.kind);
+    if (!anchor) return;
+    if (Math.abs(current.left - anchor.left) < 0.5 && Math.abs(current.top - anchor.top) < 0.5) return;
+    setMathEditor({ ...current, ...anchor });
+  }, [mathAnchor, setMathEditor]);
+
+  const updateMathLatex = useCallback((latex: string) => {
+    const current = mathEditorRef.current;
+    if (!current) return;
+    // Keep the draft in React while the popover is open. The document is only
+    // mutated on commit, so Escape is genuinely history- and persistence-neutral.
+    setMathEditor({ ...current, latex });
+  }, [setMathEditor]);
+
+  const closeMathEditor = useCallback((
+    restore: boolean,
+    target: MathEditorState | null = null,
+    focus = true,
+  ) => {
+    const current = target ?? mathEditorRef.current;
+    const instance = editorRef.current;
+    if (!current || !instance) {
+      if (!target) setMathEditor(null);
+      return 0;
+    }
+
+    const node = instance.state.doc.nodeAt(current.pos);
+    let removedNodeSize = 0;
+    if (restore) {
+      if (current.isNew && !current.initialLatex && deleteMathNode(instance, current)) {
+        removedNodeSize = node?.nodeSize ?? 0;
+      }
+    } else if (current.isNew && !current.latex.trim()) {
+      if (deleteMathNode(instance, current)) removedNodeSize = node?.nodeSize ?? 0;
+    } else if (current.latex !== current.initialLatex) {
+      updateMathNode(instance, current, current.latex);
+    }
+
+    if (sameMathEditor(mathEditorRef.current, current)) {
+      setMathEditor(null);
+      if (focus) {
+        if (!restore && current.kind === "inline" && removedNodeSize === 0) {
+          const committedNode = instance.state.doc.nodeAt(current.pos);
+          const after = current.pos + (committedNode?.nodeSize ?? 1);
+          instance.chain().setTextSelection(after).focus().run();
+        } else {
+          instance.commands.focus();
+        }
+      }
+    }
+    return removedNodeSize;
+  }, [setMathEditor]);
+
+  const commitMathEditor = useCallback(() => closeMathEditor(false), [closeMathEditor]);
+  const cancelMathEditor = useCallback(() => closeMathEditor(true), [closeMathEditor]);
+
+  const openMathEditor = useCallback((kind: MathKind, node: PMNode, pos: number, isNew = false) => {
+    const instance = editorRef.current;
+    if (!instance) return;
+
+    const previous = mathEditorRef.current;
+    if (previous?.kind === kind && previous.pos === pos) return;
+
+    let nextPos = pos;
+    if (previous) {
+      const removedNodeSize = closeMathEditor(false, previous, false);
+      if (removedNodeSize > 0 && previous.pos < nextPos) nextPos -= removedNodeSize;
+    }
+
+    const nextNode = instance.state.doc.nodeAt(nextPos);
+    if (!nextNode || nextNode.type.name !== mathNodeType(kind)) return;
+    instance.commands.setNodeSelection(nextPos);
+    const anchor = mathAnchor(instance, nextPos, kind) ?? { left: 8, top: 88 };
+    const latex = String(nextNode.attrs.latex ?? node.attrs.latex ?? "");
+    setMathEditor({
+      kind,
+      pos: nextPos,
+      latex,
+      initialLatex: latex,
+      isNew,
+      ...anchor,
+    });
+  }, [closeMathEditor, mathAnchor, setMathEditor]);
+
+  // These callbacks are invoked by Tiptap's NodeViews after render. The
+  // extension factory is intentionally kept outside React's render lifecycle.
+  /* eslint-disable react-hooks/refs */
+  const mathExtensions = useMemo(() => [
+    BlockMathMarkdown.configure({
+      onClick: (node, pos) => openMathEditor("block", node, pos),
+      katexOptions: {
+        displayMode: true,
+        throwOnError: false,
+        strict: "warn",
+        trust: false,
+        output: "htmlAndMathml",
+      },
+    }),
+    InlineMathMarkdown.configure({
+      onClick: (node, pos) => openMathEditor("inline", node, pos),
+      katexOptions: {
+        displayMode: false,
+        throwOnError: false,
+        strict: "warn",
+        trust: false,
+        output: "htmlAndMathml",
+      },
+    }),
+  ], [openMathEditor]);
+  /* eslint-enable react-hooks/refs */
 
   const stopCaretBlink = useCallback(() => {
     caretStrokeRef.current?.removeAttribute("data-blinking");
@@ -318,6 +622,7 @@ export function LabEditor() {
       TaskItem.configure({ nested: true }),
       TableKit.configure({ table: { resizable: false } }),
       Placeholder.configure({ placeholder: "" }),
+      ...mathExtensions,
       Markdown.configure({ markedOptions: { gfm: true } }),
       MarkdownLinkInput,
       PlainUrlInput,
@@ -337,6 +642,27 @@ export function LabEditor() {
           const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
           if (/(?:^|\s)\/[a-z0-9-]*$/i.test(before + text)) {
             view.dispatch(view.state.tr.insertText(text).setMeta("addToHistory", false).scrollIntoView());
+            return true;
+          }
+        }
+
+        if ($from.parent.isTextblock && !isCodeBlock($from.parent)) {
+          const inlineMatch = text.match(INLINE_MATH_PATTERN);
+          if (inlineMatch) {
+            view.dispatch(
+              view.state.tr
+                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({ latex: inlineMatch[1] }))
+                .scrollIntoView(),
+            );
+            return true;
+          }
+          const blockMatch = text.match(BLOCK_MATH_PATTERN);
+          if (blockMatch) {
+            view.dispatch(
+              view.state.tr
+                .replaceSelectionWith(view.state.schema.nodes.blockMath.create({ latex: blockMatch[1] }))
+                .scrollIntoView(),
+            );
             return true;
           }
         }
@@ -362,6 +688,38 @@ export function LabEditor() {
         return false;
       },
       handleKeyDown: (view, event) => {
+        if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e") {
+          if (isCodeBlock(view.state.selection.$from.parent)) return false;
+          event.preventDefault();
+          const { from, to } = view.state.selection;
+          const selectedText = from !== to && view.state.selection.$from.parent === view.state.selection.$to.parent
+            ? view.state.doc.textBetween(from, to, "\n", " ")
+            : "";
+          const node = view.state.schema.nodes.inlineMath.create({ latex: selectedText });
+          const tr = view.state.tr.replaceSelectionWith(node).scrollIntoView();
+          view.dispatch(tr);
+          const pos = Math.min(from, view.state.doc.content.size);
+          const inserted = view.state.doc.nodeAt(pos);
+          if (inserted?.type.name === "inlineMath") {
+            openMathEditor("inline", inserted, pos, !selectedText);
+          }
+          return true;
+        }
+
+        if (view.state.selection instanceof NodeSelection) {
+          const selectedNode = view.state.selection.node;
+          const kind = selectedNode.type.name === "inlineMath"
+            ? "inline"
+            : selectedNode.type.name === "blockMath"
+              ? "block"
+              : null;
+          if (kind && (event.key === "Enter" || event.key === " ")) {
+            event.preventDefault();
+            openMathEditor(kind, selectedNode, view.state.selection.from);
+            return true;
+          }
+        }
+
         if (event.key === ")") {
           const { $from } = view.state.selection;
           if ($from.parent.isTextblock && !isCodeBlock($from.parent)) {
@@ -381,25 +739,25 @@ export function LabEditor() {
             }
           }
         }
-        if (
-          paletteRef.current?.mode !== "commands"
-          || (event.key !== "Backspace" && event.key !== "Delete")
-        ) return false;
-
-        const { from, to } = view.state.selection;
-        let deleteFrom = from;
-        let deleteTo = to;
-        if (from === to) {
-          const { $from } = view.state.selection;
-          if (event.key === "Backspace" && $from.parentOffset > 0) {
-            deleteFrom = from - 1;
-          } else if (event.key === "Delete" && $from.parentOffset < $from.parent.content.size) {
-            deleteTo = from + 1;
-          }
+        const { from, empty, $from } = view.state.selection;
+        if (paletteRef.current?.mode !== "commands" || !empty) return false;
+        if (event.key === "Delete" && $from.parentOffset < $from.parent.content.size) {
+          // Keep forward deletion in its own history event instead of merging
+          // it with the slash token's input-rule transactions.
+          view.dispatch(closeHistory(view.state.tr.delete(from, from + 1)));
+          return true;
         }
-        if (deleteFrom === deleteTo) return false;
-        view.dispatch(view.state.tr.delete(deleteFrom, deleteTo).setMeta("addToHistory", false));
-        return true;
+        if (event.key === "Backspace" && (event.metaKey || event.altKey)) {
+          // Preserve the platform's native Command/Option + Delete semantics.
+          // ProseMirror handles the resulting contenteditable deletion and the
+          // next transaction update keeps the palette query in sync.
+          return false;
+        }
+        if (event.key === "Backspace" && $from.parentOffset > 0) {
+          view.dispatch(view.state.tr.delete(from - 1, from).setMeta("addToHistory", false));
+          return true;
+        }
+        return false;
       },
       attributes: {
         class: "lab-document",
@@ -413,7 +771,11 @@ export function LabEditor() {
         spellcheck: "true",
       },
     },
+    onCreate: ({ editor: instance }) => {
+      editorRef.current = instance;
+    },
     onUpdate: ({ editor: instance }) => {
+      if (migrateInlineMath(instance)) return;
       syncInterface(instance);
       persistence.onEdit(instance.getMarkdown());
     },
@@ -427,6 +789,57 @@ export function LabEditor() {
     const query = palette.query.toLowerCase();
     return COMMANDS.filter((command) => `${command.label} ${command.terms}`.toLowerCase().includes(query));
   }, [palette]);
+
+  const mathError = useMemo(() => {
+    if (!mathEditorState) return null;
+    if (!mathEditorState.latex.trim()) return "Enter a LaTeX expression.";
+    try {
+      katex.renderToString(mathEditorState.latex, {
+        displayMode: mathEditorState.kind === "block",
+        throwOnError: true,
+        strict: "warn",
+        trust: false,
+        output: "htmlAndMathml",
+      });
+      return null;
+    } catch {
+      return "This expression could not be parsed yet.";
+    }
+  }, [mathEditorState]);
+
+  const mathPreview = useMemo(() => {
+    if (!mathEditorState?.latex.trim() || mathError) return null;
+    try {
+      return katex.renderToString(mathEditorState.latex, {
+        displayMode: mathEditorState.kind === "block",
+        throwOnError: false,
+        strict: "warn",
+        trust: false,
+        output: "htmlAndMathml",
+      });
+    } catch {
+      return null;
+    }
+  }, [mathEditorState, mathError]);
+
+  const mathEditorIdentity = mathEditorState
+    ? `${mathEditorState.kind}:${mathEditorState.pos}`
+    : null;
+
+  useEffect(() => {
+    if (!mathEditorIdentity) return;
+    const frame = window.requestAnimationFrame(() => {
+      const input = mathInputRef.current;
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [mathEditorIdentity]);
+
+  useLayoutEffect(() => {
+    repositionMathEditor();
+  }, [mathEditorState, repositionMathEditor]);
 
   useEffect(() => {
     if (!editor) return;
@@ -484,6 +897,24 @@ export function LabEditor() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-clear" });
         return;
       }
+      if (command.id === "recover") {
+        const revisionAtRequest = persistence.getState().editRevision;
+        void listLocalRecoveryDrafts()
+          .then((drafts) => {
+            if (revisionAtRequest !== persistence.getState().editRevision) {
+              setNotice("The note changed while recovery drafts were loading. Export was cancelled.");
+              return;
+            }
+            if (drafts.length === 0) {
+              setNotice("No conflicting local drafts are available.");
+              return;
+            }
+            downloadMarkdown(drafts.length === 1 ? "lab-recovery.md" : "lab-recovery-bundle.md", recoveryBundle(drafts));
+            setNotice(`Exported ${drafts.length} recovery ${drafts.length === 1 ? "draft" : "drafts"}.`);
+          })
+          .catch(() => setNotice("Could not export the local recovery drafts."));
+        return;
+      }
       if (command.id === "undo") {
         editor.commands.undo();
         return;
@@ -505,23 +936,45 @@ export function LabEditor() {
         case "code": chain.toggleCodeBlock().run(); break;
         case "divider": chain.setHorizontalRule().run(); break;
         case "table": chain.insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run(); break;
+        case "inline-math": {
+          const pos = editor.state.selection.from;
+          const node = editor.schema.nodes.inlineMath.create({ latex: "" });
+          editor.view.dispatch(editor.state.tr.replaceSelectionWith(node).scrollIntoView());
+          const inserted = editor.state.doc.nodeAt(pos);
+          if (inserted?.type.name === "inlineMath") {
+            openMathEditor("inline", inserted, pos, true);
+          }
+          break;
+        }
+        case "math": {
+          const preferred = editor.state.selection.from;
+          const node = editor.schema.nodes.blockMath.create({ latex: "" });
+          editor.view.dispatch(editor.state.tr.replaceSelectionWith(node).scrollIntoView());
+          let blockPos: number | null = null;
+          let closestDistance = Number.POSITIVE_INFINITY;
+          editor.state.doc.descendants((candidate, pos) => {
+            if (candidate.type.name !== "blockMath" || String(candidate.attrs.latex ?? "") !== "") return;
+            const distance = Math.abs(pos - preferred);
+            if (distance < closestDistance) {
+              closestDistance = distance;
+              blockPos = pos;
+            }
+          });
+          if (blockPos !== null) {
+            const inserted = editor.state.doc.nodeAt(blockPos);
+            if (inserted) openMathEditor("block", inserted, blockPos, true);
+          }
+          break;
+        }
         case "link": chain.insertContent("[label](https://").run(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
-          const blob = new Blob([editor.getMarkdown()], { type: "text/markdown;charset=utf-8" });
-          const anchor = document.createElement("a");
-          anchor.href = URL.createObjectURL(blob);
-          anchor.download = "lab.md";
-          anchor.hidden = true;
-          document.body.append(anchor);
-          anchor.click();
-          anchor.remove();
-          globalThis.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
+          downloadMarkdown("lab.md", editor.getMarkdown());
           break;
         }
       }
     },
-    [editor, setPalette],
+    [editor, openMathEditor, persistence, setPalette],
   );
 
   useEffect(() => {
@@ -537,7 +990,11 @@ export function LabEditor() {
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);
-        setNotice(nextHealth.errors.length > 0 ? "Some local storage locations are unavailable." : null);
+        setNotice(nextHealth.errors.length > 0
+          ? "Some local storage locations are unavailable."
+          : nextHealth.conflicts > 0
+            ? `${nextHealth.conflicts} conflicting local ${nextHealth.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`
+            : null);
       } catch {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       } finally {
@@ -559,6 +1016,7 @@ export function LabEditor() {
     const onResize = () => {
       positionCaret(editor);
       repositionPalette();
+      repositionMathEditor();
     };
     window.addEventListener("resize", onResize, { passive: true });
     window.addEventListener("scroll", onResize, { passive: true });
@@ -570,7 +1028,7 @@ export function LabEditor() {
       window.visualViewport?.removeEventListener("resize", onResize);
       window.visualViewport?.removeEventListener("scroll", onResize);
     };
-  }, [editor, positionCaret, repositionPalette]);
+  }, [editor, positionCaret, repositionMathEditor, repositionPalette]);
 
   useLayoutEffect(() => {
     repositionPalette();
@@ -653,9 +1111,94 @@ export function LabEditor() {
     event.target.value = "";
   };
 
+  const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelMathEditor();
+      return;
+    }
+    if (event.key === "Tab" || (event.key === "Enter" && (mathEditorState?.kind === "inline" || event.metaKey || event.ctrlKey))) {
+      event.preventDefault();
+      commitMathEditor();
+    }
+  };
+
+  const onMathEditorBlur = () => {
+    const stateAtBlur = mathEditorRef.current;
+    window.setTimeout(() => {
+      if (
+        stateAtBlur
+        && sameMathEditor(mathEditorRef.current, stateAtBlur)
+        && !mathEditorElementRef.current?.contains(document.activeElement)
+      ) {
+        commitMathEditor();
+      }
+    }, 0);
+  };
+
   return (
     <div className="lab-shell" ref={shellRef} onKeyDownCapture={onKeyDownCapture}>
       <EditorContent editor={editor} aria-busy={hydrating} />
+      {mathEditorState ? (
+        <div
+          ref={mathEditorElementRef}
+          id={MATH_EDITOR_ID}
+          className="math-editor-popover"
+          data-kind={mathEditorState.kind}
+          role="dialog"
+          aria-label={mathEditorState.kind === "block" ? "Edit block equation" : "Edit inline equation"}
+          style={{ left: Math.round(mathEditorState.left), top: Math.round(mathEditorState.top) }}
+          onBlur={onMathEditorBlur}
+        >
+          <label htmlFor={`${MATH_EDITOR_ID}-input`}>
+            {mathEditorState.kind === "block" ? "Block equation" : "Inline equation"}
+          </label>
+          {mathEditorState.kind === "block" ? (
+            <textarea
+              ref={(element) => { mathInputRef.current = element; }}
+              id={`${MATH_EDITOR_ID}-input`}
+              value={mathEditorState.latex}
+              rows={3}
+              spellCheck={false}
+              aria-describedby={`${MATH_EDITOR_ID}-hint`}
+              aria-invalid={Boolean(mathError && mathEditorState.latex.trim())}
+              onChange={(event) => updateMathLatex(event.target.value)}
+              onKeyDown={onMathEditorKeyDown}
+            />
+          ) : (
+            <input
+              ref={(element) => { mathInputRef.current = element; }}
+              id={`${MATH_EDITOR_ID}-input`}
+              value={mathEditorState.latex}
+              spellCheck={false}
+              aria-describedby={`${MATH_EDITOR_ID}-hint`}
+              aria-invalid={Boolean(mathError && mathEditorState.latex.trim())}
+              onChange={(event) => updateMathLatex(event.target.value)}
+              onKeyDown={onMathEditorKeyDown}
+            />
+          )}
+          {mathPreview ? (
+            <div
+              className="math-editor-preview"
+              aria-hidden="true"
+              // KaTeX owns this generated markup; trust:false above prevents
+              // user LaTeX from turning it into links or raw HTML.
+              dangerouslySetInnerHTML={{ __html: mathPreview }}
+            />
+          ) : null}
+          <div
+            id={`${MATH_EDITOR_ID}-hint`}
+            className="math-editor-hint"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-testid="math-editor-status"
+            data-error={mathError ? "true" : "false"}
+          >
+            {mathError ?? (mathEditorState.kind === "block" ? "Cmd/Ctrl + Enter to finish" : "Enter to finish")}
+          </div>
+        </div>
+      ) : null}
       <div ref={caretRef} className="lab-caret" aria-hidden="true">
         <span ref={caretStrokeRef} className="lab-caret-stroke" data-blinking="true" />
       </div>
@@ -705,6 +1248,7 @@ export function LabEditor() {
             <div className="palette-message storage-message" data-testid="storage-status">
               <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>
               <small>{health.labels.join(" · ") || "Storage is unavailable"}</small>
+              {health.conflicts > 0 ? <small>{health.conflicts} recoverable {health.conflicts === 1 ? "draft" : "drafts"} · /recover to export</small> : null}
               <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"} · no network access</small>
             </div>
           )}

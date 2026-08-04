@@ -6,8 +6,8 @@ import {
 } from "./editor-persistence.ts";
 import type { StorageHealth } from "./local-vault.ts";
 
-function health(saved: boolean, errors: string[] = []): StorageHealth {
-  return { copies: saved ? 1 : 0, labels: saved ? ["localStorage"] : [], persistent: false, errors, saved };
+function health(saved: boolean, errors: string[] = [], conflicts = 0): StorageHealth {
+  return { copies: saved ? 1 : 0, labels: saved ? ["localStorage"] : [], persistent: false, errors, conflicts, saved };
 }
 
 class ManualScheduler {
@@ -147,7 +147,7 @@ test("a stale save result cannot mark a newer revision persisted", async () => {
   assert.equal(controller.getState().persistedRevision, 2);
 });
 
-test("save outcomes distinguish conflict, degraded replicas, and authority failure", async () => {
+test("save outcomes distinguish conflict, degraded replicas, recovery drafts, and authority failure", async () => {
   const notices: string[] = [];
   let result: StorageHealth = health(false);
   const state = dependencies({
@@ -168,8 +168,13 @@ test("save outcomes distinguish conflict, degraded replicas, and authority failu
   controller.onEdit("degraded");
   state.scheduler.fireNext();
   await Promise.resolve();
+  result = health(true, [], 2);
+  controller.onEdit("recoverable conflicts");
+  state.scheduler.fireNext();
+  await Promise.resolve();
 
   assert.equal(notices[0], "A newer local revision is already stored in another tab.");
   assert.equal(notices[1], "This change could not be saved locally. Please export a copy before closing the page.");
   assert.equal(notices[2], "Saved, but one or more local copies could not be updated.");
+  assert.equal(notices[3], "2 conflicting local drafts are available. Use /recover to export.");
 });

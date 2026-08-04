@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
 const LOCAL_KEY = "lab.document.v1";
 const PENDING_PREFIX = "lab.document.pending.v2.";
@@ -178,6 +179,22 @@ test("a staged draft survives abrupt page termination and a new session owner", 
   await reopened.close();
 });
 
+test("pages with a copied session owner stage independent recovery drafts", async ({ context, page }) => {
+  await context.addInitScript(() => {
+    sessionStorage.setItem("lab.document.pending.owner.v1", "copied-owner");
+    (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__ = 60_000;
+  });
+  const pageA = page;
+  const pageB = await context.newPage();
+  const [editorA, editorB] = await Promise.all([openEditor(pageA), openEditor(pageB)]);
+  await Promise.all([editorA.fill("copied owner A"), editorB.fill("copied owner B")]);
+
+  const records = await pendingRecords(pageA);
+  expect(records.some((record) => record.markdown === "copied owner A")).toBe(true);
+  expect(records.some((record) => record.markdown === "copied owner B")).toBe(true);
+  expect(new Set(records.map((record) => record.storageKey)).size).toBeGreaterThanOrEqual(2);
+});
+
 test("two pages converge on the deterministic authority winner and retain the loser draft", async ({ context, page }) => {
   await context.addInitScript(() => {
     const fixedNow = 1_730_000_000_000;
@@ -208,6 +225,264 @@ test("two pages converge on the deterministic authority winner and retain the lo
   await expect.poll(() => editorText(pageB), { timeout: 10000 }).toBe(winner.markdown);
   const pendingAfterReload = await pendingRecords(pageA);
   expect(pendingAfterReload.some((candidate) => candidate.markdown !== winner.markdown)).toBe(true);
+
+  const hydratedEditor = pageA.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await hydratedEditor.press("End");
+  await hydratedEditor.press("Enter");
+  await hydratedEditor.type("/recover");
+  await expect(pageA.locator("#slash-command-palette")).toBeVisible();
+  const downloadPromise = pageA.waitForEvent("download");
+  await pageA.keyboard.press("Enter");
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("lab-recovery.md");
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  expect(await readFile(downloadPath as string, "utf8")).toBe(loser?.markdown);
+});
+
+test("forward deletion next to a slash query remains undoable", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("/abc");
+  await editor.evaluate((element) => {
+    const text = element.querySelector("p")?.firstChild;
+    if (!text) throw new Error("Expected an editor text node.");
+    const range = document.createRange();
+    range.setStart(text, 1);
+    range.collapse(true);
+    const selection = getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    (element as HTMLElement).focus();
+    document.dispatchEvent(new Event("selectionchange"));
+  });
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+
+  await editor.press("Delete");
+  await expect(editor).toHaveText("/bc");
+  await editor.press("ControlOrMeta+z");
+  await expect(editor).toHaveText("/abc");
+});
+
+test("modified backward deletion keeps native behavior while typing a slash command", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("/inline-math");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+
+  await editor.press("Alt+Backspace");
+  await expect(editor).toHaveText("/inline-");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+
+  await editor.press("Meta+Backspace");
+  await expect(editor).toHaveText("");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+});
+
+test("table cell selection overlays are anchored to their cells", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.fill("/table");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+  await page.keyboard.press("Enter");
+
+  const firstCell = editor.locator("th, td").first();
+  await expect(firstCell).toBeVisible();
+  expect(await firstCell.evaluate((cell) => getComputedStyle(cell).position)).toBe("relative");
+});
+
+test("equation shortcut leaves code blocks unchanged", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.fill("/code");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+  await page.keyboard.press("Enter");
+  await editor.type("const value = 1;");
+
+  await editor.press("ControlOrMeta+Shift+e");
+
+  await expect(editor.locator("pre code")).toHaveText("const value = 1;");
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveCount(0);
+});
+
+test("inline and block equations render, edit, and survive reload", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("Euler: $$e^{i\\pi}+1=0$$");
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveCount(1);
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "e^{i\\pi}+1=0");
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/math");
+  await expect(page.locator("#slash-command-palette")).toContainText("Block equation");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#math-editor-popover")).toBeVisible();
+  const mathInput = page.locator("#math-editor-popover-input");
+  await mathInput.fill("\\frac{a}{b}");
+  await page.keyboard.press("ControlOrMeta+Enter");
+  await expect(editor.locator('[data-type="block-math"]')).toHaveCount(1);
+  await expect(editor.locator('[data-type="block-math"]')).toHaveAttribute("data-latex", "\\frac{a}{b}");
+
+  await expect.poll(async () => (await backendState(page)).authority?.snapshot.markdown ?? "", { timeout: 15000 }).toContain("$$");
+  await page.reload();
+  await openEditor(page);
+  await expect(page.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "e^{i\\pi}+1=0");
+  await expect(page.locator('[data-type="block-math"]')).toHaveAttribute("data-latex", "\\frac{a}{b}");
+});
+
+test("the inline equation slash command inserts an editable inline formula", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("Value: /inline");
+  await expect(page.locator("#slash-command-palette")).toContainText("Inline equation");
+  await page.keyboard.press("Enter");
+
+  const input = page.locator("#math-editor-popover-input");
+  await expect(input).toBeVisible();
+  await input.fill("x^2");
+  await input.press("Enter");
+
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "x^2");
+  await expect(editor).toContainText("Value:");
+  await editor.type(" units");
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "x^2");
+  await expect(editor).toContainText("units");
+});
+
+test("switching equations commits the previous draft", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("A $$x^2$$ B $$y^2$$");
+
+  const math = editor.locator('[data-type="inline-math"]');
+  await math.nth(0).click();
+  await page.locator("#math-editor-popover-input").fill("a^2");
+  await math.nth(1).click();
+
+  await expect(math.nth(0)).toHaveAttribute("data-latex", "a^2");
+  await expect(page.locator("#math-editor-popover-input")).toHaveValue("y^2");
+  await page.locator("#math-editor-popover-input").press("Escape");
+});
+
+test("pasted math delimiters become editable math nodes", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await page.evaluate(() => {
+    const transfer = new DataTransfer();
+    transfer.setData("text/plain", "$$x^2 + y^2$$");
+    document.querySelector('[contenteditable="true"]')?.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: transfer,
+    }));
+  });
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "x^2 + y^2");
+});
+
+test("escaped-dollar LaTeX survives persistence and reload", async ({ page }) => {
+  const editor = await openEditor(page);
+  const markdown = "Price: $$\\$5$$";
+  await editor.click();
+  await editor.type(markdown);
+
+  const math = editor.locator('[data-type="inline-math"]');
+  await expect(math).toHaveAttribute("data-latex", "\\$5");
+  await waitForAuthority(page, markdown);
+
+  await page.reload();
+  await openEditor(page);
+  await expect(page.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "\\$5");
+});
+
+test("Markdown import restores inline and block equations", async ({ page }) => {
+  const editor = await openEditor(page);
+  const markdown = "Price: $$\\$5$$\n\n$$\n\\int_0^1 x\\,dx\n$$";
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "equations.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(markdown),
+  });
+
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "\\$5");
+  await expect(editor.locator('[data-type="block-math"]')).toHaveAttribute("data-latex", "\\int_0^1 x\\,dx");
+  await expect.poll(
+    async () => (await backendState(page)).authority?.snapshot.markdown ?? "",
+    { timeout: 15000, intervals: [50, 100, 250, 500] },
+  ).toContain(markdown);
+});
+
+test("cancelled equation drafts stay out of undo history and reopen from the keyboard", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("Result: $$x^2$$");
+  await editor.press("End");
+  await page.waitForTimeout(600);
+  await editor.type("!");
+
+  const math = editor.locator('[data-type="inline-math"]');
+  await math.click();
+  const input = page.locator("#math-editor-popover-input");
+  await input.fill("y^2");
+  await input.press("Escape");
+  await expect(math).toHaveAttribute("data-latex", "x^2");
+
+  await editor.press("Enter");
+  await expect(page.locator("#math-editor-popover")).toBeVisible();
+  await page.locator("#math-editor-popover-input").press("Escape");
+
+  await editor.press("ControlOrMeta+z");
+  await expect(math).toHaveAttribute("data-latex", "x^2");
+  await expect(editor).not.toContainText("!");
+  await expect(editor.locator('[data-type="inline-math"][data-latex="y^2"]')).toHaveCount(0);
+});
+
+test("cancelling a new block equation does not leave an undoable placeholder", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("/math");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#math-editor-popover")).toBeVisible();
+
+  await page.locator("#math-editor-popover-input").press("Escape");
+  await expect(editor.locator('[data-type="block-math"]')).toHaveCount(0);
+  await editor.press("ControlOrMeta+z");
+  await expect(editor.locator('[data-type="block-math"]')).toHaveCount(0);
+});
+
+test("editing the middle of a formula keeps the caret position", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("Value: $$x^2$$");
+  await editor.locator('[data-type="inline-math"]').click();
+
+  const input = page.locator("#math-editor-popover-input");
+  await expect(input).toBeFocused();
+  await page.waitForTimeout(100);
+  await input.evaluate((element) => {
+    const field = element as HTMLInputElement;
+    field.focus();
+    field.setSelectionRange(1, 1);
+  });
+  await input.press("a");
+  await page.waitForTimeout(100);
+  await input.press("b");
+  await expect(input).toHaveValue("xab^2");
+  await input.press("Escape");
+});
+
+test("invalid LaTeX is exposed through the math editor live status", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("A $$x^2$$");
+  await editor.locator('[data-type="inline-math"]').click();
+
+  const input = page.locator("#math-editor-popover-input");
+  await input.fill("\\notacommand");
+  await expect(input).toHaveAttribute("aria-invalid", "true");
+
+  const status = page.getByTestId("math-editor-status");
+  await expect(status).toHaveAttribute("role", "status");
+  await expect(status).toHaveAttribute("aria-live", "polite");
+  await expect(status).toHaveAttribute("data-error", "true");
+  await expect(status).toContainText("could not be parsed");
+  await input.press("Escape");
 });
 
 test("the app remains durable when OPFS is unavailable at the browser boundary", async ({ context, page }) => {

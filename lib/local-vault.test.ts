@@ -4,6 +4,7 @@ import test, { afterEach, beforeEach } from "node:test";
 import {
   compareSnapshotOrder,
   inspectLocalStorage,
+  listLocalRecoveryDrafts,
   loadLocalDocument,
   resetLocalVaultStateForTests,
   sameSnapshot,
@@ -377,6 +378,16 @@ async function legacyChecksum(markdown: string) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function pendingChecksum(markdown: string, updatedAt: number) {
+  const value = JSON.stringify(["lab.pending.v2", updatedAt, markdown]);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fnv1a:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
 function localSnapshot() {
   const raw = environment.local.values.get("lab.document.v1");
   return raw ? JSON.parse(raw) as LocalSnapshot : null;
@@ -546,35 +557,119 @@ test("each individual replica missing, stale, or corrupt is repaired", async () 
 
 test("orphaned namespaced drafts are discoverable without deleting another pending record", async () => {
   switchEnvironment({ browser: true, locks: "success" });
-  environment.session.setItem("lab.document.pending.owner.v1", "base-tab");
-  await saveLocalDocument("durable base");
-  const base = localSnapshot();
-  assert.ok(base);
+  const originalNow = Date.now;
+  try {
+    Date.now = () => 1_000;
+    await saveLocalDocument("durable base");
 
-  const liveSession = new MemoryStorage();
-  liveSession.setItem("lab.document.pending.owner.v1", "live-tab");
-  environment.restore();
-  environment = installEnvironment({ browser: true, locks: "success" });
-  // Reuse the durable state from the prior context, then stage a live draft.
-  environment.local.setItem("lab.document.v1", JSON.stringify(base));
-  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: liveSession });
-  assert.equal(stageLocalDocument("live draft"), true);
-  const liveRecord = environment.local.values.get("lab.document.pending.v2.live-tab");
-  assert.ok(liveRecord);
+    Date.now = () => 2_000;
+    resetLocalVaultStateForTests();
+    assert.equal(stageLocalDocument("live draft"), true);
+    const liveKey = [...environment.local.values.keys()].find((key) => key.startsWith("lab.document.pending.v2."));
+    const liveRecord = liveKey ? environment.local.values.get(liveKey) : null;
+    assert.ok(liveKey && liveRecord);
 
-  const orphanSession = new MemoryStorage();
-  orphanSession.setItem("lab.document.pending.owner.v1", "orphan-tab");
-  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: orphanSession });
-  assert.equal(stageLocalDocument("orphan winner"), true);
-  const orphanKey = "lab.document.pending.v2.orphan-tab";
-  assert.ok(environment.local.values.has(orphanKey));
+    Date.now = () => 3_000;
+    resetLocalVaultStateForTests();
+    assert.equal(stageLocalDocument("orphan winner"), true);
+    const orphanKey = [...environment.local.values.entries()]
+      .find(([, value]) => JSON.parse(value).markdown === "orphan winner")?.[0];
+    assert.ok(orphanKey);
 
-  const reopenedSession = new MemoryStorage();
-  reopenedSession.setItem("lab.document.pending.owner.v1", "reopened-tab");
-  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: reopenedSession });
-  assert.equal(await loadLocalDocument(), "orphan winner");
-  assert.equal(environment.local.values.has(orphanKey), false);
-  assert.equal(environment.local.values.get("lab.document.pending.v2.live-tab"), liveRecord);
+    resetLocalVaultStateForTests();
+    assert.equal(await loadLocalDocument(), "orphan winner");
+    assert.equal(environment.local.values.has(orphanKey), false);
+    assert.equal(environment.local.values.get(liveKey), liveRecord);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("copied session owners cannot make two page realms overwrite the same recovery slot", () => {
+  switchEnvironment({ browser: true, locks: "success" });
+  environment.session.setItem("lab.document.pending.owner.v1", "copied-owner");
+  assert.equal(stageLocalDocument("first tab"), true);
+
+  // Each browser page has its own module realm. Resetting module-local state
+  // models the second realm while retaining copied sessionStorage contents.
+  resetLocalVaultStateForTests();
+  assert.equal(stageLocalDocument("second tab"), true);
+
+  const keys = [...environment.local.values.keys()].filter((key) => key.startsWith("lab.document.pending.v2."));
+  assert.equal(keys.length, 2);
+  assert.deepEqual(
+    new Set(keys.map((key) => JSON.parse(environment.local.values.get(key) ?? "null").markdown)),
+    new Set(["first tab", "second tab"]),
+  );
+});
+
+test("failed durable recovery does not accumulate one pending slot per reload", async () => {
+  switchEnvironment({ browser: true, locks: null });
+  const originalNow = Date.now;
+  try {
+    for (let index = 0; index < 12; index += 1) {
+      Date.now = () => 10_000 + index;
+      resetLocalVaultStateForTests();
+      assert.equal(stageLocalDocument(`reload draft ${index}`), true);
+      assert.equal(await loadLocalDocument(), `reload draft ${index}`);
+    }
+
+    const pending = [...environment.local.values.entries()]
+      .filter(([key]) => key.startsWith("lab.document.pending.v2."));
+    assert.ok(pending.length <= 8);
+    assert.ok(pending.some(([, value]) => JSON.parse(value).markdown === "reload draft 11"));
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("verified conflict drafts are recoverable, deduplicated, and bounded", async () => {
+  switchEnvironment({ browser: true, indexedDb: true });
+  const originalNow = Date.now;
+  try {
+    Date.now = () => 10_000;
+    assert.equal((await saveLocalDocument("durable winner")).saved, true);
+    for (let index = 1; index <= 12; index += 1) {
+      const markdown = `conflict-${index}`;
+      environment.local.setItem(`lab.document.pending.v2.conflict-${index}`, JSON.stringify({
+        markdown,
+        updatedAt: index,
+        checksum: pendingChecksum(markdown, index),
+        version: 2,
+      }));
+    }
+    environment.local.setItem("lab.document.pending.v2.duplicate", JSON.stringify({
+      markdown: "conflict-12",
+      updatedAt: 13,
+      checksum: pendingChecksum("conflict-12", 13),
+      version: 2,
+    }));
+    environment.local.setItem("lab.document.pending.v2.represented", JSON.stringify({
+      markdown: "durable winner",
+      updatedAt: 14,
+      checksum: pendingChecksum("durable winner", 14),
+      version: 2,
+    }));
+
+    assert.equal(await loadLocalDocument(), "durable winner");
+    const drafts = await listLocalRecoveryDrafts();
+    assert.equal(drafts.length, 8);
+    assert.deepEqual(drafts.map((draft) => draft.markdown), [
+      "conflict-12",
+      "conflict-11",
+      "conflict-10",
+      "conflict-9",
+      "conflict-8",
+      "conflict-7",
+      "conflict-6",
+      "conflict-5",
+    ]);
+    assert.equal((await inspectLocalStorage()).conflicts, 8);
+    const remaining = [...environment.local.values.keys()].filter((key) => key.startsWith("lab.document.pending.v2."));
+    assert.equal(remaining.length, 8);
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test("corrupt IndexedDB authority or current data cannot block a later save", async () => {
@@ -738,12 +833,12 @@ test("localStorage property and method failures remain isolated from readable fa
   assert.ok(health.errors.some((error) => error.includes("localStorage")));
 });
 
-test("sessionStorage failure falls back to the shared legacy staging slot", () => {
+test("recovery staging does not depend on sessionStorage availability", () => {
   switchEnvironment({ browser: true, locks: "success" });
   environment.session.throwOnGet = true;
   environment.session.throwOnSet = true;
   assert.equal(stageLocalDocument("session fallback"), true);
-  assert.ok(environment.local.values.has("lab.document.pending.v1"));
+  assert.ok([...environment.local.values.keys()].some((key) => key.startsWith("lab.document.pending.v2.")));
 });
 
 test("missing crypto preserves a verified staged recovery draft but cannot create a durable snapshot", async () => {
@@ -754,13 +849,18 @@ test("missing crypto preserves a verified staged recovery draft but cannot creat
   assert.ok(environment.local.values.has("lab.document.pending.v1"));
 });
 
-test("Web Locks absence rejects browser fallback writes while request rejection retries safely", async () => {
+test("Web Locks absence or rejection fails replica-only browser writes closed", async () => {
   switchEnvironment({ browser: true, locks: null });
   assert.equal((await saveLocalDocument("no lock")).saved, false);
 
   switchEnvironment({ browser: true, locks: "reject" });
-  assert.equal((await saveLocalDocument("rejected lock")).saved, true);
-  assert.equal(await loadLocalDocument(), "rejected lock");
+  const rejected = await saveLocalDocument("rejected lock");
+  assert.equal(rejected.saved, false);
+  assert.equal(localSnapshot(), null);
+
+  switchEnvironment({ browser: true, indexedDb: true, locks: "reject" });
+  assert.equal((await saveLocalDocument("IndexedDB authority")).saved, true);
+  assert.equal(await loadLocalDocument(), "IndexedDB authority");
 });
 
 test("OPFS handles not-found, corruption, and write failures independently", async () => {
