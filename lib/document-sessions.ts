@@ -1,6 +1,7 @@
 import { DEFAULT_DOCUMENT_ID } from "./local-vault.ts";
 
 const SESSION_KEY_PREFIX = "lab.session.v1.";
+const SESSION_ACTIVITY_KEY_PREFIX = "lab.session.activity.v1.";
 const SESSION_LOCK_PREFIX = "lab-session-metadata";
 const SESSION_HASH_PREFIX = "#session=";
 
@@ -31,6 +32,10 @@ function sessionKey(id: string) {
   return `${SESSION_KEY_PREFIX}${id}`;
 }
 
+function activityKey(id: string) {
+  return `${SESSION_ACTIVITY_KEY_PREFIX}${id}`;
+}
+
 function parseSession(value: string | null): DocumentSession | null {
   if (!value) return null;
   try {
@@ -53,11 +58,30 @@ function parseSession(value: string | null): DocumentSession | null {
   }
 }
 
+function latestActivity(storage: Storage, id: string) {
+  try {
+    const raw = storage.getItem(activityKey(id));
+    if (raw === null) return null;
+    const updatedAt = Number(raw);
+    return Number.isFinite(updatedAt) ? updatedAt : null;
+  } catch {
+    return null;
+  }
+}
+
+function mergeActivity(storage: Storage, session: DocumentSession) {
+  const updatedAt = latestActivity(storage, session.id);
+  return updatedAt !== null && updatedAt > session.updatedAt
+    ? { ...session, updatedAt }
+    : session;
+}
+
 function readSession(id: string) {
   const local = storage();
   if (!local) return null;
   try {
-    return parseSession(local.getItem(sessionKey(id)));
+    const session = parseSession(local.getItem(sessionKey(id)));
+    return session ? mergeActivity(local, session) : null;
   } catch {
     return null;
   }
@@ -82,7 +106,8 @@ async function withSessionLock<T>(id: string, operation: () => T | Promise<T>) {
     }
   } catch (error) {
     if (operationStarted) throw error;
-    // Per-session localStorage writes remain atomic when Web Locks are unavailable.
+    // Activity timestamps use a separate key, so an unlocked touch cannot
+    // overwrite a concurrent rename's session name.
   }
   return operation();
 }
@@ -143,18 +168,25 @@ export async function renameDocumentSession(id: string, name: string) {
   });
 }
 
-/** Advance activity metadata after a document has been durably saved. */
+/** Advance activity metadata without rewriting the session name record. */
 export async function touchDocumentSession(id: string) {
   const normalized = normalizeId(id);
   return withSessionLock(normalized, () => {
     const existing = readSession(normalized);
     const now = Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1);
-    return writeSession({
+    const local = storage();
+    if (!local) throw new Error("Session metadata storage is unavailable.");
+    try {
+      local.setItem(activityKey(normalized), String(now));
+    } catch {
+      throw new Error("Session activity storage is unavailable.");
+    }
+    return {
       id: normalized,
       name: existing?.name ?? "Untitled",
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
-    });
+    };
   });
 }
 
@@ -167,7 +199,7 @@ export function listDocumentSessions(): DocumentSession[] {
         const key = local.key(index);
         if (!key?.startsWith(SESSION_KEY_PREFIX)) continue;
         const session = parseSession(local.getItem(key));
-        if (session) sessions.push(session);
+        if (session) sessions.push(mergeActivity(local, session));
       }
     } catch {
       // Return any metadata that was readable before enumeration failed.

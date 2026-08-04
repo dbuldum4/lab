@@ -341,6 +341,7 @@ export function LabEditor() {
   const [notice, setNotice] = useState<string | null>(null);
   const [documentId] = useState(() => activeDocumentIdFromLocation());
   const [sessionName, setSessionName] = useState("Untitled");
+  const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
 
   const [persistence] = useState<EditorPersistenceController>(() => {
@@ -956,6 +957,7 @@ export function LabEditor() {
     void renameDocumentSession(documentId, nextName)
       .then((session) => {
         setSessionName(session.name);
+        setSavedSessionName(session.name);
         setNotice(`Named this session “${session.name}”.`);
         setPalette(null);
         editor?.commands.focus();
@@ -1029,6 +1031,7 @@ export function LabEditor() {
         return;
       }
       if (command.id === "name") {
+        setSessionName(savedSessionName);
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "name" });
         return;
       }
@@ -1099,7 +1102,7 @@ export function LabEditor() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, navigateToSession, openMathEditor, persistence, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
   );
 
   useEffect(() => {
@@ -1110,7 +1113,10 @@ export function LabEditor() {
         await requestPersistentStorage();
         try {
           const activeSession = await ensureDocumentSession(documentId);
-          if (active) setSessionName(activeSession.name);
+          if (active) {
+            setSessionName(activeSession.name);
+            setSavedSessionName(activeSession.name);
+          }
         } catch {
           if (active) setNotice("Session names are unavailable, but this note can still be loaded.");
         }
@@ -1188,6 +1194,7 @@ export function LabEditor() {
 
     if (event.key === "Escape") {
       event.preventDefault();
+      if (current.mode === "name") setSessionName(savedSessionName);
       setPalette(null);
       editor?.commands.focus();
       return;
