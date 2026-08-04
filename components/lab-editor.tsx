@@ -33,6 +33,7 @@ import {
   ensureDocumentSession,
   listDocumentSessions,
   renameDocumentSession,
+  touchDocumentSession,
   type DocumentSession,
 } from "@/lib/document-sessions";
 
@@ -174,6 +175,19 @@ const BLOCK_MATH_PATTERN = /^\$\$\n([\s\S]*?)\n\$\$(?:\n)?$/;
 
 function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
+}
+
+function backwardWordStart(text: string) {
+  let start = text.length;
+  while (start > 0 && /\s/.test(text[start - 1])) start -= 1;
+
+  if (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) {
+    while (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) start -= 1;
+  } else if (start > 0) {
+    start -= 1;
+  }
+
+  return start;
 }
 
 function migrateInlineMath(instance: Editor) {
@@ -336,7 +350,10 @@ export function LabEditor() {
       : (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__;
     return createEditorPersistenceController({
       delayMs: Number.isFinite(e2eDelay) ? e2eDelay : undefined,
-      onHealth: setHealth,
+      onHealth: (nextHealth) => {
+        setHealth(nextHealth);
+        if (nextHealth.saved === true) void touchDocumentSession(documentId).catch(() => undefined);
+      },
       onNotice: setNotice,
       onStageFailure: () => setNotice("This edit could not be staged locally. Please export a copy before closing the page."),
     });
@@ -766,10 +783,18 @@ export function LabEditor() {
           return true;
         }
         if (event.key === "Backspace" && (event.metaKey || event.altKey)) {
-          // Preserve the platform's native Command/Option + Delete semantics.
-          // ProseMirror handles the resulting contenteditable deletion and the
-          // next transaction update keeps the palette query in sync.
-          return false;
+          // Native modified deletion differs between browsers and operating
+          // systems. Keep slash-command editing deterministic while the
+          // palette is open: Meta deletes to the start of the text block and
+          // Alt deletes the preceding word.
+          event.preventDefault();
+          const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
+          const start = event.metaKey
+            ? $from.start()
+            : from - (before.length - backwardWordStart(before));
+          if (start >= from) return true;
+          view.dispatch(closeHistory(view.state.tr.delete(start, from)));
+          return true;
         }
         if (event.key === "Backspace" && $from.parentOffset > 0) {
           view.dispatch(view.state.tr.delete(from - 1, from).setMeta("addToHistory", false));
@@ -898,16 +923,29 @@ export function LabEditor() {
     documentElement.removeAttribute("aria-activedescendant");
   }, [editor, filtered, palette, selected]);
 
-  const resumeSession = useCallback(async (session: DocumentSession) => {
+  const flushBeforeSessionSwitch = useCallback(async () => {
     try {
-      await persistence.flush();
-      const target = `${window.location.pathname}${window.location.search}${documentSessionHash(session.id)}`;
-      window.history.replaceState(null, "", target);
-      window.location.reload();
+      if (await persistence.flush()) return true;
     } catch {
-      setNotice("This note could not be saved before switching sessions.");
+      // The controller normally converts save errors into a false result, but
+      // session switching must remain safe if a custom persistence boundary
+      // rejects unexpectedly.
     }
+    setNotice("This note could not be saved before switching sessions.");
+    return false;
   }, [persistence]);
+
+  const navigateToSession = useCallback((session: DocumentSession) => {
+    const target = `${window.location.pathname}${window.location.search}${documentSessionHash(session.id)}`;
+    window.history.replaceState(null, "", target);
+    window.location.reload();
+  }, []);
+
+  const resumeSession = useCallback(async (session: DocumentSession) => {
+    if (!(await flushBeforeSessionSwitch())) return false;
+    navigateToSession(session);
+    return true;
+  }, [flushBeforeSessionSwitch, navigateToSession]);
 
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
@@ -979,10 +1017,15 @@ export function LabEditor() {
         return;
       }
       if (command.id === "new") {
-        void persistence.flush()
-          .then(() => createDocumentSession())
-          .then(resumeSession)
-          .catch(() => setNotice("A new session could not be created locally."));
+        void (async () => {
+          if (!(await flushBeforeSessionSwitch())) return;
+          try {
+            const session = await createDocumentSession();
+            navigateToSession(session);
+          } catch {
+            setNotice("A new session could not be created locally.");
+          }
+        })();
         return;
       }
       if (command.id === "name") {
@@ -1056,7 +1099,7 @@ export function LabEditor() {
         }
       }
     },
-    [documentId, editor, openMathEditor, persistence, resumeSession, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, navigateToSession, openMathEditor, persistence, setPalette, setSelected],
   );
 
   useEffect(() => {

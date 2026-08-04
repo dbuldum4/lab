@@ -114,6 +114,18 @@ test("flush cancels debounce and persists the latest content", async () => {
   assert.equal(state.scheduler.pending, 0);
 });
 
+test("flush reports failed persistence so destructive navigation can be blocked", async () => {
+  const state = dependencies({
+    save: async () => health(false, ["IndexedDB authority is unavailable; the candidate was not written."]),
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("must not be lost");
+
+  assert.equal(await controller.flush(), false);
+  assert.equal(controller.getState().persistedRevision, 0);
+});
+
 test("a stale save result cannot mark a newer revision persisted", async () => {
   let resolveFirst: ((result: StorageHealth) => void) | undefined;
   let resolveSecond: ((result: StorageHealth) => void) | undefined;

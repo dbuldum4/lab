@@ -8,6 +8,7 @@ import {
   ensureDocumentSession,
   listDocumentSessions,
   renameDocumentSession,
+  touchDocumentSession,
 } from "./document-sessions.ts";
 
 class MemoryStorage implements Storage {
@@ -55,10 +56,14 @@ test("sessions are independent, resumable, and rename atomically per id", async 
   const alpha = await createDocumentSession("Alpha");
   const beta = await createDocumentSession("Beta");
   await renameDocumentSession(alpha.id, "  Research   notes  ");
+  const beforeTouch = listDocumentSessions().find((session) => session.id === alpha.id)?.updatedAt ?? 0;
+  const touched = await touchDocumentSession(alpha.id);
 
   const sessions = listDocumentSessions();
   assert.equal(original.id, "default");
   assert.equal(sessions.length, 3);
   assert.equal(sessions.find((session) => session.id === alpha.id)?.name, "Research notes");
   assert.equal(sessions.find((session) => session.id === beta.id)?.name, "Beta");
+  assert.ok(touched.updatedAt > beforeTouch);
+  assert.equal(sessions.find((session) => session.id === alpha.id)?.updatedAt, touched.updatedAt);
 });

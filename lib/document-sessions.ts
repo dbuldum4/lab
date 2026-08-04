@@ -143,6 +143,21 @@ export async function renameDocumentSession(id: string, name: string) {
   });
 }
 
+/** Advance activity metadata after a document has been durably saved. */
+export async function touchDocumentSession(id: string) {
+  const normalized = normalizeId(id);
+  return withSessionLock(normalized, () => {
+    const existing = readSession(normalized);
+    const now = Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1);
+    return writeSession({
+      id: normalized,
+      name: existing?.name ?? "Untitled",
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    });
+  });
+}
+
 export function listDocumentSessions(): DocumentSession[] {
   const local = storage();
   const sessions: DocumentSession[] = [];

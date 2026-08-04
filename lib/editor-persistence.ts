@@ -25,7 +25,8 @@ export type EditorPersistenceController = {
   hydrate: () => Promise<string>;
   markLoaded: (markdown: string) => void;
   onEdit: (markdown: string) => number;
-  flush: () => Promise<void>;
+  /** Persist the latest edit; false means a session switch would lose data. */
+  flush: () => Promise<boolean>;
   dispose: () => Promise<void>;
   inspect: () => Promise<StorageHealth>;
   getState: () => {
@@ -76,7 +77,7 @@ export function createEditorPersistenceController(
   let persistedRevision = 0;
   let latestMarkdown = "";
   let timer: TimerHandle | null = null;
-  let saveInFlight: { revision: number; promise: Promise<void> } | null = null;
+  let saveInFlight: { revision: number; promise: Promise<boolean> } | null = null;
 
   const clearTimer = () => {
     if (timer === null) return;
@@ -96,8 +97,8 @@ export function createEditorPersistenceController(
       : "A newer local revision is already stored in another tab.");
   };
 
-  const saveRevision = async (markdown: string, revision: number) => {
-    if (!loaded || revision !== editRevision || revision <= persistedRevision) return;
+  const saveRevision = async (markdown: string, revision: number): Promise<boolean> => {
+    if (!loaded || revision !== editRevision || revision <= persistedRevision) return true;
     if (saveInFlight?.revision === revision) return saveInFlight.promise;
 
     const promise = (async () => {
@@ -105,25 +106,36 @@ export function createEditorPersistenceController(
         const health = await save(markdown);
         reportHealth(health, revision);
         if (health.saved === true && revision === editRevision) persistedRevision = revision;
+        return health.saved === true;
       } catch {
         if (revision === editRevision) {
           dependencies.onNotice?.("This change could not be saved locally. Please export a copy before closing the page.");
         }
+        return false;
       }
     })();
     saveInFlight = { revision, promise };
     try {
-      await promise;
+      return await promise;
     } finally {
       if (saveInFlight?.promise === promise) saveInFlight = null;
     }
   };
 
-  const flush = () => {
+  const flush = async () => {
     clearTimer();
-    if (!loaded || editRevision <= persistedRevision) return Promise.resolve();
-    if (saveInFlight?.revision === editRevision) return saveInFlight.promise;
-    return saveRevision(latestMarkdown, editRevision);
+    if (!loaded) return true;
+
+    // An edit can arrive while an async save is in flight. Keep flushing until
+    // the revision observed at the end is the revision that was persisted.
+    while (editRevision > persistedRevision) {
+      const revision = editRevision;
+      const saved = saveInFlight?.revision === revision
+        ? await saveInFlight.promise
+        : await saveRevision(latestMarkdown, revision);
+      if (!saved) return false;
+    }
+    return true;
   };
 
   const markLoaded = (markdown: string) => {
