@@ -55,6 +55,12 @@ Stress failures print the seed, iteration, and schedule; replay the same seed wi
 
 Use `/export` for a portable Markdown copy and `/import` to restore one.
 
+## Sessions
+
+The original note remains the default, so existing users do not need to manage documents. Use `/new` to start a separate local document, `/name` to give the current document a recognizable name, and `/sessions` to resume another document.
+
+Each session has its own URL hash and isolated redundant storage. Different sessions can stay open and save independently in different tabs. Two tabs opened to the same session still use atomic conflict resolution, with the losing edit retained for `/recover` rather than silently discarded.
+
 ## Math
 
 Type `$$...$$` to turn an inline expression into KaTeX-rendered math. Use

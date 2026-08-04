@@ -10,6 +10,7 @@ import {
   sameSnapshot,
   saveLocalDocument,
   selectCurrentSnapshot,
+  setLocalDocumentScope,
   shouldAcceptSnapshot,
   stageLocalDocument,
   type LocalSnapshot,
@@ -919,4 +920,32 @@ test("a newer staged edit cannot be cleared by an older save in flight", async (
   } finally {
     Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
   }
+});
+
+test("document scopes isolate durable snapshots and pending recovery drafts", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  assert.equal(stageLocalDocument("original note"), true);
+  assert.equal((await saveLocalDocument("original note")).saved, true);
+
+  setLocalDocumentScope("alpha");
+  assert.equal(await loadLocalDocument(), "");
+  assert.equal(stageLocalDocument("alpha note"), true);
+  assert.equal((await saveLocalDocument("alpha note")).saved, true);
+
+  setLocalDocumentScope("beta");
+  assert.equal(stageLocalDocument("beta draft"), true);
+  assert.ok([...environment.local.values.keys()].some((key) => key.startsWith("lab.document.pending.scoped.v2.beta.")));
+  setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument(), "original note");
+  setLocalDocumentScope("beta");
+  assert.equal(await loadLocalDocument(), "beta draft");
+
+  setLocalDocumentScope("alpha");
+  assert.equal(await loadLocalDocument(), "alpha note");
+  setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument(), "original note");
+
+  assert.ok(environment.local.values.has("lab.document.v1"));
+  assert.ok(environment.local.values.has("lab.document.v2.alpha"));
 });

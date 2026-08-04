@@ -565,6 +565,12 @@ img.ProseMirror-separator {
   background: #1d1d1b;
 }
 
+.command-item[data-current="true"] span::after {
+  margin-left: 7px;
+  color: var(--muted);
+  content: "•";
+}
+
 .command-item span,
 .palette-message span {
   font-size: 13px;
@@ -601,6 +607,40 @@ img.ProseMirror-separator {
 
 .storage-message {
   gap: 5px;
+}
+
+.session-name-panel {
+  display: grid;
+  gap: 7px;
+  padding: 13px 15px;
+}
+
+.session-name-panel label {
+  color: #d7d7d2;
+  font-size: 12px;
+  font-weight: 530;
+}
+
+.session-name-panel input {
+  width: 100%;
+  border: 1px solid #3a3a36;
+  border-radius: 7px;
+  outline: none;
+  background: #070707;
+  padding: 9px 10px;
+  color: #f0f0ed;
+  font: inherit;
+  font-size: 13px;
+}
+
+.session-name-panel input:focus {
+  border-color: #85857f;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
+}
+
+.session-name-panel small {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .editor-notice {

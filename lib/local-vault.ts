@@ -1,12 +1,13 @@
-const LOCAL_KEY = "lab.document.v1";
-const PENDING_KEY = "lab.document.pending.v1";
-const PENDING_KEY_PREFIX = "lab.document.pending.v2.";
+export const DEFAULT_DOCUMENT_ID = "default";
+const LEGACY_LOCAL_KEY = "lab.document.v1";
+const LEGACY_PENDING_KEY = "lab.document.pending.v1";
+const LEGACY_PENDING_KEY_PREFIX = "lab.document.pending.v2.";
 const DB_NAME = "lab-private-vault";
 const STORE_NAME = "documents";
-const OPFS_FILE = "lab.md.snapshot";
+const LEGACY_OPFS_FILE = "lab.md.snapshot";
 const DB_VERSION = 2;
-const AUTHORITY_KEY = "authority";
-const CURRENT_KEY = "current";
+const LEGACY_AUTHORITY_KEY = "authority";
+const LEGACY_CURRENT_KEY = "current";
 const MAX_RECOVERY_DRAFTS = 8;
 
 export type LocalSnapshot = {
@@ -74,12 +75,56 @@ type AuthorityCommitResult = {
   rawSnapshot: LocalSnapshot | null;
 };
 
-const VAULT_LOCK = "lab-private-vault";
+const VAULT_LOCK_PREFIX = "lab-private-vault";
 
 let vaultQueue: Promise<void> = Promise.resolve();
 let lastIssuedTimestamp = 0;
 let pendingOwner: string | null = null;
 let webLocksUnavailable = false;
+let activeDocumentId = DEFAULT_DOCUMENT_ID;
+
+function normalizedDocumentId(documentId: string) {
+  return /^[a-zA-Z0-9_-]{1,96}$/.test(documentId) ? documentId : DEFAULT_DOCUMENT_ID;
+}
+
+/** Select the document namespace for this page realm before loading or saving. */
+export function setLocalDocumentScope(documentId: string) {
+  const next = normalizedDocumentId(documentId);
+  if (next === activeDocumentId) return;
+  activeDocumentId = next;
+  vaultQueue = Promise.resolve();
+  lastIssuedTimestamp = 0;
+  pendingOwner = null;
+  webLocksUnavailable = false;
+}
+
+function isDefaultDocument() {
+  return activeDocumentId === DEFAULT_DOCUMENT_ID;
+}
+
+function localSnapshotKey() {
+  return isDefaultDocument() ? LEGACY_LOCAL_KEY : `lab.document.v2.${activeDocumentId}`;
+}
+
+function legacyPendingKey() {
+  return isDefaultDocument() ? LEGACY_PENDING_KEY : `lab.document.pending.v1.${activeDocumentId}`;
+}
+
+function pendingKeyPrefix() {
+  return isDefaultDocument() ? LEGACY_PENDING_KEY_PREFIX : `lab.document.pending.scoped.v2.${activeDocumentId}.`;
+}
+
+function authorityKey() {
+  return isDefaultDocument() ? LEGACY_AUTHORITY_KEY : `authority:${activeDocumentId}`;
+}
+
+function currentKey() {
+  return isDefaultDocument() ? LEGACY_CURRENT_KEY : `current:${activeDocumentId}`;
+}
+
+function opfsFile() {
+  return isDefaultDocument() ? LEGACY_OPFS_FILE : `lab.${activeDocumentId}.md.snapshot`;
+}
 
 function getLocalStorage(): Storage | null {
   // Accessing the global property itself can throw SecurityError in privacy
@@ -96,9 +141,9 @@ function pendingStorageKey() {
   // provide that guarantee because auxiliary and duplicated tabs can inherit a
   // copy of the opener's values. Reload recovery still works because load scans
   // every namespaced pending record before this page creates its next draft.
-  if (!isBrowserContext()) return PENDING_KEY;
+  if (!isBrowserContext()) return legacyPendingKey();
   pendingOwner ??= globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-  return `${PENDING_KEY_PREFIX}${pendingOwner}`;
+  return `${pendingKeyPrefix()}${pendingOwner}`;
 }
 
 function hasIndexedDb() {
@@ -130,7 +175,7 @@ async function withVaultLock<T>(operation: () => Promise<T>) {
 
   let operationStarted = false;
   try {
-    return await locks.request(VAULT_LOCK, { mode: "exclusive" }, () => {
+    return await locks.request(`${VAULT_LOCK_PREFIX}:${activeDocumentId}`, { mode: "exclusive" }, () => {
       operationStarted = true;
       return operation();
     });
@@ -301,12 +346,12 @@ async function readIndexedDbRawState(): Promise<IndexedDbRawState> {
       const store = transaction.objectStore(STORE_NAME);
       let authority: unknown;
       let current: unknown;
-      const authorityRequest = store.get(AUTHORITY_KEY);
+      const authorityRequest = store.get(authorityKey());
       authorityRequest.onsuccess = () => {
         authority = authorityRequest.result;
       };
       authorityRequest.onerror = () => reject(authorityRequest.error ?? new Error("Could not read IndexedDB."));
-      const currentRequest = store.get(CURRENT_KEY);
+      const currentRequest = store.get(currentKey());
       currentRequest.onsuccess = () => {
         current = currentRequest.result;
       };
@@ -364,14 +409,14 @@ async function repairCorruptIndexedDbAuthority(fallback: CanonicalSnapshot) {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction(STORE_NAME, "readwrite");
       const store = transaction.objectStore(STORE_NAME);
-      const request = store.get(AUTHORITY_KEY);
+      const request = store.get(authorityKey());
       request.onsuccess = () => {
         const latest = authorityRecord(request.result);
         if (latest
           && latest.revision === authority.revision
           && sameSnapshot(latest.snapshot, authority.snapshot)) {
-          store.put({ recordVersion: 1, revision: latest.revision + 1, snapshot: replacement } satisfies AuthorityRecord, AUTHORITY_KEY);
-          store.put(replacement, CURRENT_KEY);
+          store.put({ recordVersion: 1, revision: latest.revision + 1, snapshot: replacement } satisfies AuthorityRecord, authorityKey());
+          store.put(replacement, currentKey());
         }
       };
       request.onerror = () => reject(request.error ?? new Error("Could not read IndexedDB authority."));
@@ -433,18 +478,18 @@ async function commitIndexedDbOnce(
           return;
         }
         const nextRevision = revision + 1;
-        store.put({ recordVersion: 1, revision: nextRevision, snapshot: candidate } satisfies AuthorityRecord, AUTHORITY_KEY);
-        store.put(candidate, CURRENT_KEY);
+        store.put({ recordVersion: 1, revision: nextRevision, snapshot: candidate } satisfies AuthorityRecord, authorityKey());
+        store.put(candidate, currentKey());
         result = { accepted: true, changed: true, revision: nextRevision, rawSnapshot: candidate };
       };
-      const authorityRequest = store.get(AUTHORITY_KEY);
+      const authorityRequest = store.get(authorityKey());
       authorityRequest.onsuccess = () => {
         authorityRaw = authorityRequest.result;
         authorityDone = true;
         finish();
       };
       authorityRequest.onerror = () => reject(authorityRequest.error ?? new Error("Could not read IndexedDB authority."));
-      const currentRequest = store.get(CURRENT_KEY);
+      const currentRequest = store.get(currentKey());
       currentRequest.onsuccess = () => {
         currentRaw = currentRequest.result;
         currentDone = true;
@@ -514,7 +559,7 @@ async function readOpfs(): Promise<LocalSnapshot | null> {
   const root = await opfsRoot();
   if (!root) return null;
   try {
-    const handle = await root.getFileHandle(OPFS_FILE);
+    const handle = await root.getFileHandle(opfsFile());
     const file = await handle.getFile();
     return JSON.parse(await file.text()) as LocalSnapshot;
   } catch (error) {
@@ -526,7 +571,7 @@ async function readOpfs(): Promise<LocalSnapshot | null> {
 async function writeOpfs(snapshot: CanonicalSnapshot) {
   const root = await opfsRoot();
   if (!root) throw new Error("The browser file system is unavailable.");
-  const handle = await root.getFileHandle(OPFS_FILE, { create: true });
+  const handle = await root.getFileHandle(opfsFile(), { create: true });
   const writer = await handle.createWritable();
   try {
     await writer.write(JSON.stringify(snapshot));
@@ -540,7 +585,7 @@ function readLocalStorage(): LocalSnapshot | null {
   if (!storage) throw new Error("localStorage is unavailable.");
   let value: string | null;
   try {
-    value = storage.getItem(LOCAL_KEY);
+    value = storage.getItem(localSnapshotKey());
   } catch {
     throw new Error("localStorage is unavailable.");
   }
@@ -557,18 +602,18 @@ async function writeLocalStorage(snapshot: CanonicalSnapshot) {
   const storage = getLocalStorage();
   if (!storage) throw new Error("localStorage is unavailable.");
   try {
-    storage.setItem(LOCAL_KEY, JSON.stringify(snapshot));
+    storage.setItem(localSnapshotKey(), JSON.stringify(snapshot));
   } catch {
     throw new Error("Could not write localStorage.");
   }
 }
 
 function pendingDocumentsFromStorage(storage: Storage, currentKey: string) {
-  const keys = new Set<string>([currentKey, PENDING_KEY]);
+  const keys = new Set<string>([currentKey, legacyPendingKey()]);
   try {
     for (let index = 0; index < storage.length; index += 1) {
       const key = storage.key(index);
-      if (key === PENDING_KEY || key?.startsWith(PENDING_KEY_PREFIX)) keys.add(key);
+      if (key === legacyPendingKey() || key?.startsWith(pendingKeyPrefix())) keys.add(key);
     }
   } catch {
     // A storage implementation may expose neither enumeration nor all keys.
@@ -610,7 +655,7 @@ function readPendingDocuments(): PendingDocument[] {
 function currentPendingDocument(documents: readonly PendingDocument[]) {
   const currentKey = pendingStorageKey();
   return documents.find((document) => document.storageKey === currentKey)
-    ?? documents.find((document) => document.storageKey === PENDING_KEY)
+    ?? documents.find((document) => document.storageKey === legacyPendingKey())
     ?? null;
 }
 
@@ -1150,4 +1195,5 @@ export function resetLocalVaultStateForTests() {
   lastIssuedTimestamp = 0;
   pendingOwner = null;
   webLocksUnavailable = false;
+  activeDocumentId = DEFAULT_DOCUMENT_ID;
 }

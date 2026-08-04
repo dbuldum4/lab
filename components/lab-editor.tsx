@@ -22,12 +22,22 @@ import {
   inspectLocalStorage,
   listLocalRecoveryDrafts,
   requestPersistentStorage,
+  setLocalDocumentScope,
   type LocalRecoveryDraft,
   type StorageHealth,
 } from "@/lib/local-vault";
+import {
+  activeDocumentIdFromLocation,
+  createDocumentSession,
+  documentSessionHash,
+  ensureDocumentSession,
+  listDocumentSessions,
+  renameDocumentSession,
+  type DocumentSession,
+} from "@/lib/document-sessions";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "name" | "sessions";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -76,6 +86,9 @@ const COMMANDS: Command[] = [
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
   { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
   { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
+  { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
+  { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
+  { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
 ];
@@ -299,6 +312,7 @@ export function LabEditor() {
   const paletteElementRef = useRef<HTMLDivElement>(null);
   const mathEditorElementRef = useRef<HTMLDivElement>(null);
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
   const paletteRef = useRef<PaletteState | null>(null);
@@ -311,8 +325,12 @@ export function LabEditor() {
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+  const [documentId] = useState(() => activeDocumentIdFromLocation());
+  const [sessionName, setSessionName] = useState("Untitled");
+  const [sessions, setSessions] = useState<DocumentSession[]>([]);
 
   const [persistence] = useState<EditorPersistenceController>(() => {
+    setLocalDocumentScope(documentId);
     const e2eDelay = typeof window === "undefined"
       ? undefined
       : (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__;
@@ -787,7 +805,16 @@ export function LabEditor() {
   const filtered = useMemo(() => {
     if (!palette || palette.mode !== "commands") return [];
     const query = palette.query.toLowerCase();
-    return COMMANDS.filter((command) => `${command.label} ${command.terms}`.toLowerCase().includes(query));
+    return COMMANDS
+      .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
+      .sort((left, right) => {
+        const score = (command: Command) => command.id === query
+          ? 0
+          : command.label.toLowerCase().startsWith(query)
+            ? 1
+            : 2;
+        return score(left) - score(right);
+      });
   }, [palette]);
 
   const mathError = useMemo(() => {
@@ -837,6 +864,15 @@ export function LabEditor() {
     return () => window.cancelAnimationFrame(frame);
   }, [mathEditorIdentity]);
 
+  useEffect(() => {
+    if (palette?.mode !== "name") return;
+    const frame = window.requestAnimationFrame(() => {
+      sessionNameInputRef.current?.focus();
+      sessionNameInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
   useLayoutEffect(() => {
     repositionMathEditor();
   }, [mathEditorState, repositionMathEditor]);
@@ -861,6 +897,33 @@ export function LabEditor() {
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
   }, [editor, filtered, palette, selected]);
+
+  const resumeSession = useCallback(async (session: DocumentSession) => {
+    try {
+      await persistence.flush();
+      const target = `${window.location.pathname}${window.location.search}${documentSessionHash(session.id)}`;
+      window.history.replaceState(null, "", target);
+      window.location.reload();
+    } catch {
+      setNotice("This note could not be saved before switching sessions.");
+    }
+  }, [persistence]);
+
+  const submitSessionName = useCallback(() => {
+    const nextName = sessionName.trim();
+    if (!nextName) {
+      setNotice("Enter a name for this session.");
+      return;
+    }
+    void renameDocumentSession(documentId, nextName)
+      .then((session) => {
+        setSessionName(session.name);
+        setNotice(`Named this session “${session.name}”.`);
+        setPalette(null);
+        editor?.commands.focus();
+      })
+      .catch(() => setNotice("This session name could not be saved locally."));
+  }, [documentId, editor, sessionName, setPalette]);
 
   const runCommand = useCallback(
     (command: Command) => {
@@ -913,6 +976,25 @@ export function LabEditor() {
             setNotice(`Exported ${drafts.length} recovery ${drafts.length === 1 ? "draft" : "drafts"}.`);
           })
           .catch(() => setNotice("Could not export the local recovery drafts."));
+        return;
+      }
+      if (command.id === "new") {
+        void persistence.flush()
+          .then(() => createDocumentSession())
+          .then(resumeSession)
+          .catch(() => setNotice("A new session could not be created locally."));
+        return;
+      }
+      if (command.id === "name") {
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "name" });
+        return;
+      }
+      if (command.id === "sessions") {
+        const available = listDocumentSessions();
+        setSessions(available);
+        const activeIndex = available.findIndex((session) => session.id === documentId);
+        setSelected(Math.max(0, activeIndex));
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
         return;
       }
       if (command.id === "undo") {
@@ -974,7 +1056,7 @@ export function LabEditor() {
         }
       }
     },
-    [editor, openMathEditor, persistence, setPalette],
+    [documentId, editor, openMathEditor, persistence, resumeSession, setPalette, setSelected],
   );
 
   useEffect(() => {
@@ -983,6 +1065,12 @@ export function LabEditor() {
     void (async () => {
       try {
         await requestPersistentStorage();
+        try {
+          const activeSession = await ensureDocumentSession(documentId);
+          if (active) setSessionName(activeSession.name);
+        } catch {
+          if (active) setNotice("Session names are unavailable, but this note can still be loaded.");
+        }
         const markdown = await persistence.hydrate();
         if (!active) return;
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
@@ -1009,7 +1097,7 @@ export function LabEditor() {
     return () => {
       active = false;
     };
-  }, [editor, persistence, syncInterface]);
+  }, [documentId, editor, persistence, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -1058,6 +1146,28 @@ export function LabEditor() {
     if (event.key === "Escape") {
       event.preventDefault();
       setPalette(null);
+      editor?.commands.focus();
+      return;
+    }
+
+    if (current.mode === "name") return;
+
+    if (current.mode === "sessions") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, sessions.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && sessions.length > 0) {
+        event.preventDefault();
+        const session = sessions[selectedRef.current] ?? sessions[0];
+        if (session.id === documentId) {
+          setPalette(null);
+          editor?.commands.focus();
+        } else {
+          void resumeSession(session);
+        }
+      }
       return;
     }
 
@@ -1210,7 +1320,7 @@ export function LabEditor() {
             ref={paletteElementRef}
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" ? "listbox" : "status"}
+            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
             aria-label="Slash commands"
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
@@ -1239,6 +1349,52 @@ export function LabEditor() {
             ) : (
               <div className="palette-message">No command</div>
             )
+          ) : palette.mode === "name" ? (
+            <div className="session-name-panel">
+              <label htmlFor="session-name-input">Session name</label>
+              <input
+                ref={sessionNameInputRef}
+                id="session-name-input"
+                value={sessionName}
+                maxLength={80}
+                autoComplete="off"
+                onChange={(event) => setSessionName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    submitSessionName();
+                  }
+                }}
+              />
+              <small>Enter to save · Esc to cancel</small>
+            </div>
+          ) : palette.mode === "sessions" ? (
+            <div className="command-list session-list" data-testid="session-list">
+              {sessions.map((session, index) => (
+                <div
+                  className="command-item"
+                  data-selected={index === selected}
+                  data-current={session.id === documentId}
+                  id={`${PALETTE_ID}-session-${session.id}`}
+                  key={session.id}
+                  role="option"
+                  aria-selected={index === selected}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    if (session.id === documentId) {
+                      setPalette(null);
+                      editor?.commands.focus();
+                    } else {
+                      void resumeSession(session);
+                    }
+                  }}
+                  onMouseEnter={() => setSelected(index)}
+                >
+                  <span>{session.name}</span>
+                  <small>{session.id === documentId ? "Current session" : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}</small>
+                </div>
+              ))}
+            </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
               <span>Clear the note?</span>

@@ -240,6 +240,81 @@ test("two pages converge on the deterministic authority winner and retain the lo
   expect(await readFile(downloadPath as string, "utf8")).toBe(loser?.markdown);
 });
 
+test("new, name, and sessions keep independent documents resumable across tabs", async ({ context, page }) => {
+  const editor = await openEditor(page);
+  await editor.fill("original session note");
+  await waitForAuthority(page, "original session note");
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/new");
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const sessionUrl = page.url();
+  const newEditor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(newEditor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  await expect(newEditor).toHaveText("");
+  await newEditor.fill("separate session note");
+  const scopedId = new URL(sessionUrl).hash.replace("#session=", "");
+  await expect.poll(() => page.evaluate(({ localKey, scopedKey }) => ({
+    original: JSON.parse(localStorage.getItem(localKey) ?? "null")?.markdown?.trim() ?? null,
+    scoped: JSON.parse(localStorage.getItem(scopedKey) ?? "null")?.markdown?.trim() ?? null,
+  }), { localKey: LOCAL_KEY, scopedKey: `lab.document.v2.${scopedId}` }), { timeout: 15000 }).toEqual({
+    original: "original session note",
+    scoped: "separate session note",
+  });
+  await expect.poll(() => page.evaluate(async ({ scopedAuthority }) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("lab-private-vault");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      return await new Promise<{ original: string | null; scoped: string | null }>((resolve, reject) => {
+        const transaction = database.transaction("documents", "readonly");
+        const store = transaction.objectStore("documents");
+        const originalRequest = store.get("authority");
+        const scopedRequest = store.get(scopedAuthority);
+        transaction.oncomplete = () => resolve({
+          original: originalRequest.result?.snapshot?.markdown?.trim() ?? null,
+          scoped: scopedRequest.result?.snapshot?.markdown?.trim() ?? null,
+        });
+        transaction.onerror = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
+  }, { scopedAuthority: `authority:${scopedId}` }), { timeout: 15000 }).toEqual({
+    original: "original session note",
+    scoped: "separate session note",
+  });
+
+  await newEditor.press("End");
+  await newEditor.press("Enter");
+  await newEditor.type("/name");
+  await page.keyboard.press("Enter");
+  const nameInput = page.getByLabel("Session name");
+  await expect(nameInput).toBeFocused();
+  await nameInput.fill("Research");
+  await nameInput.press("Enter");
+  await expect(nameInput).toBeHidden();
+
+  await newEditor.press("End");
+  await newEditor.press("Enter");
+  await newEditor.type("/sessions");
+  await page.keyboard.press("Enter");
+  const sessionList = page.getByTestId("session-list");
+  await expect(sessionList).toContainText("Research");
+  await expect(sessionList).toContainText("Untitled");
+
+  const originalTab = await context.newPage();
+  const originalEditor = await openEditor(originalTab);
+  await expect(originalTab).not.toHaveURL(/#session=/);
+  await expect(originalEditor).toContainText("original session note");
+  await expect(page).toHaveURL(sessionUrl);
+  await expect(newEditor).toContainText("separate session note");
+});
+
 test("forward deletion next to a slash query remains undoable", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.type("/abc");
