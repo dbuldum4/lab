@@ -163,6 +163,19 @@ function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
 }
 
+function backwardWordStart(text: string) {
+  let start = text.length;
+  while (start > 0 && /\s/.test(text[start - 1])) start -= 1;
+
+  if (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) {
+    while (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) start -= 1;
+  } else if (start > 0) {
+    start -= 1;
+  }
+
+  return start;
+}
+
 function migrateInlineMath(instance: Editor) {
   const matches: Array<{ from: number; to: number; latex: string }> = [];
   instance.state.doc.descendants((node, pos) => {
@@ -748,10 +761,18 @@ export function LabEditor() {
           return true;
         }
         if (event.key === "Backspace" && (event.metaKey || event.altKey)) {
-          // Preserve the platform's native Command/Option + Delete semantics.
-          // ProseMirror handles the resulting contenteditable deletion and the
-          // next transaction update keeps the palette query in sync.
-          return false;
+          // Native modified deletion differs between browsers and operating
+          // systems. Keep slash-command editing deterministic while the
+          // palette is open: Meta deletes to the start of the text block and
+          // Alt deletes the preceding word.
+          event.preventDefault();
+          const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
+          const start = event.metaKey
+            ? $from.start()
+            : from - (before.length - backwardWordStart(before));
+          if (start >= from) return true;
+          view.dispatch(closeHistory(view.state.tr.delete(start, from)));
+          return true;
         }
         if (event.key === "Backspace" && $from.parentOffset > 0) {
           view.dispatch(view.state.tr.delete(from - 1, from).setMeta("addToHistory", false));
@@ -787,7 +808,16 @@ export function LabEditor() {
   const filtered = useMemo(() => {
     if (!palette || palette.mode !== "commands") return [];
     const query = palette.query.toLowerCase();
-    return COMMANDS.filter((command) => `${command.label} ${command.terms}`.toLowerCase().includes(query));
+    return COMMANDS
+      .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
+      .sort((left, right) => {
+        const score = (command: Command) => command.id === query
+          ? 0
+          : command.label.toLowerCase().startsWith(query)
+            ? 1
+            : 2;
+        return score(left) - score(right);
+      });
   }, [palette]);
 
   const mathError = useMemo(() => {
