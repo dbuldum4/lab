@@ -19,6 +19,7 @@ import {
   type EditorPersistenceController,
 } from "@/lib/editor-persistence";
 import {
+  DEFAULT_DOCUMENT_ID,
   inspectLocalStorage,
   listLocalRecoveryDrafts,
   requestPersistentStorage,
@@ -32,13 +33,14 @@ import {
   documentSessionHash,
   ensureDocumentSession,
   listDocumentSessions,
+  purgeDocumentSession,
   renameDocumentSession,
   touchDocumentSession,
   type DocumentSession,
 } from "@/lib/document-sessions";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -90,6 +92,7 @@ const COMMANDS: Command[] = [
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
+  { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
 ];
@@ -948,6 +951,26 @@ export function LabEditor() {
     return true;
   }, [flushBeforeSessionSwitch, navigateToSession]);
 
+  const deleteActiveSession = useCallback(async () => {
+    if (documentId === DEFAULT_DOCUMENT_ID) {
+      setNotice("The original session cannot be deleted. Use /clear to empty it.");
+      return false;
+    }
+    // Drop debounced writes before purge so a late save cannot revive the session.
+    await persistence.abandon();
+    try {
+      await purgeDocumentSession(documentId);
+    } catch {
+      setNotice("This session could not be deleted locally.");
+      editor?.commands.focus();
+      return false;
+    }
+    const target = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState(null, "", target);
+    window.location.reload();
+    return true;
+  }, [documentId, editor, persistence]);
+
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
     if (!nextName) {
@@ -998,6 +1021,14 @@ export function LabEditor() {
       }
       if (command.id === "clear") {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-clear" });
+        return;
+      }
+      if (command.id === "delete") {
+        if (documentId === DEFAULT_DOCUMENT_ID) {
+          setNotice("The original session cannot be deleted. Use /clear to empty it.");
+          return;
+        }
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-delete" });
         return;
       }
       if (command.id === "recover") {
@@ -1233,6 +1264,17 @@ export function LabEditor() {
       return;
     }
 
+    if (current.mode === "confirm-delete") {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        setPalette(null);
+        void deleteActiveSession();
+      } else if (event.key.length === 1) {
+        setPalette(null);
+      }
+      return;
+    }
+
     if (current.mode === "status") {
       if (event.key === "Enter") event.preventDefault();
       if (event.key.length === 1 || event.key === "Enter") setPalette(null);
@@ -1448,6 +1490,11 @@ export function LabEditor() {
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
               <span>Clear the note?</span>
+              <small>Press Enter to confirm · Esc to keep it</small>
+            </div>
+          ) : palette.mode === "confirm-delete" ? (
+            <div className="palette-message palette-confirm" data-testid="confirm-delete">
+              <span>Delete this session permanently?</span>
               <small>Press Enter to confirm · Esc to keep it</small>
             </div>
           ) : (

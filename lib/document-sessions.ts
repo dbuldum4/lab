@@ -1,4 +1,4 @@
-import { DEFAULT_DOCUMENT_ID } from "./local-vault.ts";
+import { DEFAULT_DOCUMENT_ID, deleteLocalDocument } from "./local-vault.ts";
 
 const SESSION_KEY_PREFIX = "lab.session.v1.";
 const SESSION_ACTIVITY_KEY_PREFIX = "lab.session.activity.v1.";
@@ -135,7 +135,7 @@ export async function ensureDocumentSession(id: string) {
     const now = Date.now();
     return writeSession({
       id: normalized,
-      name: normalized === DEFAULT_DOCUMENT_ID ? "Untitled" : "Untitled",
+      name: "Untitled",
       createdAt: now,
       updatedAt: now,
     });
@@ -188,6 +188,39 @@ export async function touchDocumentSession(id: string) {
       updatedAt: now,
     };
   });
+}
+
+/** Remove session metadata. The original document cannot be deleted. */
+export async function deleteDocumentSession(id: string) {
+  const normalized = normalizeId(id);
+  if (normalized === DEFAULT_DOCUMENT_ID) {
+    throw new Error("The original session cannot be deleted.");
+  }
+  return withSessionLock(normalized, () => {
+    const local = storage();
+    if (!local) throw new Error("Session metadata storage is unavailable.");
+    try {
+      local.removeItem(sessionKey(normalized));
+      local.removeItem(activityKey(normalized));
+    } catch {
+      throw new Error("Session metadata could not be deleted.");
+    }
+    return { id: normalized };
+  });
+}
+
+/**
+ * Permanently remove a non-default session's content and metadata.
+ * Purges durable replicas first, then list metadata, so a partial failure
+ * cannot leave private note text attached to a named session entry.
+ */
+export async function purgeDocumentSession(id: string) {
+  const normalized = normalizeId(id);
+  if (normalized === DEFAULT_DOCUMENT_ID) {
+    throw new Error("The original session cannot be deleted.");
+  }
+  await deleteLocalDocument(normalized);
+  return deleteDocumentSession(normalized);
 }
 
 export function listDocumentSessions(): DocumentSession[] {

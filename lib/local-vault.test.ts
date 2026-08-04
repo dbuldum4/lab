@@ -3,6 +3,7 @@ import { webcrypto } from "node:crypto";
 import test, { afterEach, beforeEach } from "node:test";
 import {
   compareSnapshotOrder,
+  deleteLocalDocument,
   inspectLocalStorage,
   listLocalRecoveryDrafts,
   loadLocalDocument,
@@ -168,6 +169,24 @@ function createFakeIndexedDb(): FakeIndexedDb {
             }, 0);
             return request;
           },
+          delete(key: IDBValidKey) {
+            pending += 1;
+            const requestState = {
+              result: undefined as unknown,
+              error: null as DOMException | null,
+              onsuccess: null as ((event: Event) => void) | null,
+              onerror: null as ((event: Event) => void) | null,
+            };
+            const request = requestState as unknown as IDBRequest;
+            setTimeout(() => {
+              if (settled) return;
+              pending -= 1;
+              store.delete(key);
+              requestState.onsuccess?.({} as Event);
+              maybeComplete();
+            }, 0);
+            return request;
+          },
         }),
       };
       const transaction = transactionState as unknown as IDBTransaction;
@@ -285,6 +304,10 @@ function createOpfsHarness(persisted = true): OpfsHarness {
           };
         },
       } as unknown as FileSystemFileHandle;
+    },
+    removeEntry: async (name: string) => {
+      if (!files.has(name)) throw new DOMException("Missing file", "NotFoundError");
+      files.delete(name);
     },
   } as unknown as FileSystemDirectoryHandle;
   const storage = {
@@ -948,4 +971,40 @@ test("document scopes isolate durable snapshots and pending recovery drafts", as
 
   assert.ok(environment.local.values.has("lab.document.v1"));
   assert.ok(environment.local.values.has("lab.document.v2.alpha"));
+});
+
+test("deleteLocalDocument purges scoped replicas and refuses the original session", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  assert.equal(stageLocalDocument("keep original"), true);
+  assert.equal((await saveLocalDocument("keep original")).saved, true);
+
+  setLocalDocumentScope("alpha");
+  assert.equal(stageLocalDocument("remove me"), true);
+  assert.equal((await saveLocalDocument("remove me")).saved, true);
+  assert.ok(environment.local.values.has("lab.document.v2.alpha"));
+  assert.ok(environment.idb?.read("authority:alpha"));
+  assert.ok(environment.idb?.read("current:alpha"));
+  assert.ok(environment.opfs?.files.has("lab.alpha.md.snapshot"));
+
+  setLocalDocumentScope("default");
+  await deleteLocalDocument("alpha");
+
+  // Scope must remain the caller's document after purging another session.
+  assert.equal(await loadLocalDocument(), "keep original");
+  assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+  assert.equal(
+    [...environment.local.values.keys()].some((key) => key.includes("alpha")),
+    false,
+  );
+  assert.equal(environment.idb?.read("authority:alpha"), undefined);
+  assert.equal(environment.idb?.read("current:alpha"), undefined);
+  assert.equal(environment.opfs?.files.has("lab.alpha.md.snapshot"), false);
+
+  setLocalDocumentScope("alpha");
+  assert.equal(await loadLocalDocument(), "");
+  setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument(), "keep original");
+
+  await assert.rejects(() => deleteLocalDocument("default"), /original session cannot be deleted/i);
 });

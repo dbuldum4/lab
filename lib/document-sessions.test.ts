@@ -4,12 +4,15 @@ import test, { afterEach, beforeEach } from "node:test";
 import {
   activeDocumentIdFromLocation,
   createDocumentSession,
+  deleteDocumentSession,
   documentSessionHash,
   ensureDocumentSession,
   listDocumentSessions,
+  purgeDocumentSession,
   renameDocumentSession,
   touchDocumentSession,
 } from "./document-sessions.ts";
+import { deleteLocalDocument } from "./local-vault.ts";
 
 class MemoryStorage implements Storage {
   readonly values = new Map<string, string>();
@@ -66,4 +69,38 @@ test("sessions are independent, resumable, and rename atomically per id", async 
   assert.equal(sessions.find((session) => session.id === beta.id)?.name, "Beta");
   assert.ok(touched.updatedAt > beforeTouch);
   assert.equal(sessions.find((session) => session.id === alpha.id)?.updatedAt, touched.updatedAt);
+});
+
+test("delete removes session metadata and activity without deleting the original", async () => {
+  const alpha = await createDocumentSession("Scratch");
+  await touchDocumentSession(alpha.id);
+  assert.ok(listDocumentSessions().some((session) => session.id === alpha.id));
+  assert.equal(localStorage.getItem(`lab.session.activity.v1.${alpha.id}`) !== null, true);
+
+  await deleteDocumentSession(alpha.id);
+
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+  assert.equal(localStorage.getItem(`lab.session.v1.${alpha.id}`), null);
+  assert.equal(localStorage.getItem(`lab.session.activity.v1.${alpha.id}`), null);
+  assert.ok(listDocumentSessions().some((session) => session.id === "default"));
+
+  await assert.rejects(() => deleteDocumentSession("default"), /original session cannot be deleted/i);
+});
+
+test("purge removes session metadata after content purge and refuses the original", async () => {
+  const alpha = await createDocumentSession("Doomed");
+  localStorage.setItem(`lab.document.v2.${alpha.id}`, JSON.stringify({
+    markdown: "secret",
+    updatedAt: 1,
+    checksum: "x",
+    version: 2,
+  }));
+
+  // purgeDocumentSession deletes content then metadata; unit env has no IDB/OPFS.
+  await purgeDocumentSession(alpha.id);
+
+  assert.equal(localStorage.getItem(`lab.document.v2.${alpha.id}`), null);
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+  await assert.rejects(() => purgeDocumentSession("default"), /original session cannot be deleted/i);
+  await assert.rejects(() => deleteLocalDocument("default"), /original session cannot be deleted/i);
 });

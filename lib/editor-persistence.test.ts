@@ -159,6 +159,58 @@ test("a stale save result cannot mark a newer revision persisted", async () => {
   assert.equal(controller.getState().persistedRevision, 2);
 });
 
+test("abandon cancels debounced saves without writing and ignores later edits", async () => {
+  const state = dependencies();
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("do not keep");
+  assert.equal(state.scheduler.pending, 1);
+  assert.deepEqual(state.staged, ["do not keep"]);
+
+  await controller.abandon();
+  assert.equal(state.scheduler.pending, 0);
+  assert.deepEqual(state.saved, []);
+  assert.equal(controller.getState().loaded, false);
+
+  assert.equal(controller.onEdit("after abandon"), 1);
+  assert.deepEqual(state.staged, ["do not keep"]);
+  assert.equal(state.scheduler.pending, 0);
+  assert.deepEqual(state.saved, []);
+});
+
+test("abandon waits for an in-flight save then blocks further durable writes", async () => {
+  let resolveSave: ((result: StorageHealth) => void) | undefined;
+  let saveCalls = 0;
+  let abandonResolved = false;
+  const state = dependencies({
+    save: () => {
+      saveCalls += 1;
+      return new Promise<StorageHealth>((resolve) => { resolveSave = resolve; });
+    },
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("in flight");
+  state.scheduler.fireNext();
+  await Promise.resolve();
+  assert.equal(controller.getState().saveInFlightRevision, 1);
+  assert.equal(saveCalls, 1);
+
+  const abandoned = controller.abandon().then(() => { abandonResolved = true; });
+  assert.equal(state.scheduler.pending, 0);
+  await Promise.resolve();
+  assert.equal(abandonResolved, false);
+
+  resolveSave?.(health(true));
+  await abandoned;
+  assert.equal(abandonResolved, true);
+  assert.equal(controller.getState().loaded, false);
+  assert.equal(controller.getState().saveInFlightRevision, null);
+  assert.equal(controller.onEdit("too late"), 1);
+  assert.equal(state.scheduler.pending, 0);
+  assert.equal(saveCalls, 1);
+});
+
 test("save outcomes distinguish conflict, degraded replicas, recovery drafts, and authority failure", async () => {
   const notices: string[] = [];
   let result: StorageHealth = health(false);

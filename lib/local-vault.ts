@@ -1189,6 +1189,64 @@ export function inspectLocalStorage(): Promise<StorageHealth> {
   return serializeVaultOperation(inspectLocalStorageNow);
 }
 
+/**
+ * Permanently remove durable and staged storage for a non-default document.
+ * Restores the previously active document scope when finished.
+ */
+export async function deleteLocalDocument(documentId: string) {
+  const normalized = normalizedDocumentId(documentId);
+  if (normalized === DEFAULT_DOCUMENT_ID) {
+    throw new Error("The original session cannot be deleted.");
+  }
+  const previous = activeDocumentId;
+  setLocalDocumentScope(normalized);
+  try {
+    await serializeVaultOperation(async () => {
+      const local = getLocalStorage();
+      if (local) {
+        try {
+          local.removeItem(localSnapshotKey());
+          local.removeItem(legacyPendingKey());
+          const keys: string[] = [];
+          for (let index = 0; index < local.length; index += 1) {
+            const key = local.key(index);
+            if (key?.startsWith(pendingKeyPrefix())) keys.push(key);
+          }
+          for (const key of keys) local.removeItem(key);
+        } catch {
+          throw new Error("Could not delete localStorage copies for this session.");
+        }
+      }
+
+      if (hasIndexedDb()) {
+        const db = await openDatabase();
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const transaction = db.transaction(STORE_NAME, "readwrite");
+            const store = transaction.objectStore(STORE_NAME);
+            store.delete(authorityKey());
+            store.delete(currentKey());
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error ?? new Error("Could not delete IndexedDB records."));
+            transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB delete was aborted."));
+          });
+        } finally {
+          db.close();
+        }
+      }
+
+      try {
+        const root = await opfsRoot();
+        if (root) await root.removeEntry(opfsFile());
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+      }
+    });
+  } finally {
+    setLocalDocumentScope(previous);
+  }
+}
+
 /** Reset process-local sequencing state between isolated storage contract tests. */
 export function resetLocalVaultStateForTests() {
   vaultQueue = Promise.resolve();

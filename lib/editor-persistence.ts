@@ -27,6 +27,13 @@ export type EditorPersistenceController = {
   onEdit: (markdown: string) => number;
   /** Persist the latest edit; false means a session switch would lose data. */
   flush: () => Promise<boolean>;
+  /**
+   * Stop accepting edits and cancel the debounce timer without writing.
+   * Waits for an in-flight save so vault work finishes before a purge.
+   * Use before deleting the active document; prefer dispose() when leaving with data intact.
+   */
+  abandon: () => Promise<void>;
+  /** Flush pending work, then stop accepting edits. */
   dispose: () => Promise<void>;
   inspect: () => Promise<StorageHealth>;
   getState: () => {
@@ -86,7 +93,7 @@ export function createEditorPersistenceController(
   };
 
   const reportHealth = (health: StorageHealth, revision: number) => {
-    if (revision !== editRevision) return;
+    if (disposed || revision !== editRevision) return;
     dependencies.onHealth?.(health);
     if (health.saved === true) {
       dependencies.onNotice?.(savedHealthNotice(health));
@@ -98,17 +105,17 @@ export function createEditorPersistenceController(
   };
 
   const saveRevision = async (markdown: string, revision: number): Promise<boolean> => {
-    if (!loaded || revision !== editRevision || revision <= persistedRevision) return true;
+    if (disposed || !loaded || revision !== editRevision || revision <= persistedRevision) return true;
     if (saveInFlight?.revision === revision) return saveInFlight.promise;
 
     const promise = (async () => {
       try {
         const health = await save(markdown);
         reportHealth(health, revision);
-        if (health.saved === true && revision === editRevision) persistedRevision = revision;
+        if (!disposed && health.saved === true && revision === editRevision) persistedRevision = revision;
         return health.saved === true;
       } catch {
-        if (revision === editRevision) {
+        if (!disposed && revision === editRevision) {
           dependencies.onNotice?.("This change could not be saved locally. Please export a copy before closing the page.");
         }
         return false;
@@ -123,6 +130,7 @@ export function createEditorPersistenceController(
   };
 
   const flush = async () => {
+    if (disposed) return true;
     clearTimer();
     if (!loaded) return true;
 
@@ -147,6 +155,7 @@ export function createEditorPersistenceController(
 
   return {
     async hydrate() {
+      if (disposed) return latestMarkdown;
       const markdown = await load();
       markLoaded(markdown);
       return markdown;
@@ -163,6 +172,7 @@ export function createEditorPersistenceController(
       const revision = editRevision;
       timer = schedule(() => {
         timer = null;
+        if (disposed) return;
         void saveRevision(markdown, revision);
       }, delayMs);
       return revision;
@@ -170,10 +180,20 @@ export function createEditorPersistenceController(
 
     flush,
 
+    async abandon() {
+      if (disposed) return;
+      clearTimer();
+      disposed = true;
+      loaded = false;
+      const inFlight = saveInFlight?.promise;
+      if (inFlight) await inFlight;
+    },
+
     async dispose() {
       if (disposed) return;
       const pending = flush();
       disposed = true;
+      loaded = false;
       await pending;
     },
 

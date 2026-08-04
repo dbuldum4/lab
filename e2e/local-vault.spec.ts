@@ -315,6 +315,57 @@ test("new, name, and sessions keep independent documents resumable across tabs",
   await expect(newEditor).toContainText("separate session note");
 });
 
+test("delete removes an extra session and returns to the original note", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.fill("keep the original note");
+  await waitForAuthority(page, "keep the original note");
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/new");
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const sessionUrl = page.url();
+  const scopedId = new URL(sessionUrl).hash.replace("#session=", "");
+  const newEditor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(newEditor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  await newEditor.fill("doomed session note");
+  await expect.poll(() => page.evaluate((scopedKey) => {
+    return JSON.parse(localStorage.getItem(scopedKey) ?? "null")?.markdown?.trim() ?? null;
+  }, `lab.document.v2.${scopedId}`), { timeout: 15000 }).toBe("doomed session note");
+
+  await newEditor.press("End");
+  await newEditor.press("Enter");
+  await newEditor.type("/name");
+  await page.keyboard.press("Enter");
+  const nameInput = page.getByLabel("Session name");
+  await nameInput.fill("Doomed");
+  await nameInput.press("Enter");
+  await expect(nameInput).toBeHidden();
+
+  await newEditor.press("End");
+  await newEditor.press("Enter");
+  await newEditor.type("/delete");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("confirm-delete")).toBeVisible();
+  await page.keyboard.press("Enter");
+
+  await expect(page).not.toHaveURL(/#session=/);
+  const restored = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(restored).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  await expect(restored).toContainText("keep the original note");
+  await expect.poll(() => page.evaluate((scopedKey) => localStorage.getItem(scopedKey), `lab.document.v2.${scopedId}`)).toBeNull();
+  await expect.poll(() => page.evaluate((sessionKey) => localStorage.getItem(sessionKey), `lab.session.v1.${scopedId}`)).toBeNull();
+
+  await restored.press("End");
+  await restored.press("Enter");
+  await restored.type("/sessions");
+  await page.keyboard.press("Enter");
+  const sessionList = page.getByTestId("session-list");
+  await expect(sessionList).toContainText("Untitled");
+  await expect(sessionList).not.toContainText("Doomed");
+});
+
 test("forward deletion next to a slash query remains undoable", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.type("/abc");
