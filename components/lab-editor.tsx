@@ -1005,9 +1005,10 @@ function LabEditorSession() {
     documentElement.removeAttribute("aria-activedescendant");
   }, [editor, filtered, palette, selected, sessions]);
 
-  const flushBeforeSessionSwitch = useCallback(async () => {
+  /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
+  const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
     try {
-      if (await persistence.flush()) return true;
+      if (await persistence.flush()) return "ok";
     } catch {
       // The controller normally converts save errors into a false result, but
       // session switching must remain safe if a custom persistence boundary
@@ -1018,17 +1019,19 @@ function LabEditorSession() {
     const switchAnyway = window.confirm(
       "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
     );
-    if (switchAnyway) return true;
+    if (switchAnyway) return "dirty";
     setNotice("This note could not be saved before switching sessions.");
-    return false;
+    return "cancel";
   }, [persistence]);
 
   /**
    * Stop accepting edits so the async gap before navigation cannot stage/save more text.
    * Disables the editor first, then flushes via dispose. Returns false if the user
    * declines to switch after a failed final flush (reloads to restore a live controller).
+   * When `allowDirtySwitch` is true the user already confirmed a failed flush, so
+   * dispose does not prompt a second time.
    */
-  const freezePersistenceForNavigation = useCallback(async () => {
+  const freezePersistenceForNavigation = useCallback(async (allowDirtySwitch = false) => {
     editor?.setEditable(false, false);
     let flushed = true;
     try {
@@ -1036,7 +1039,7 @@ function LabEditorSession() {
     } catch {
       flushed = false;
     }
-    if (flushed) return true;
+    if (flushed || allowDirtySwitch) return true;
     const switchAnyway = window.confirm(
       "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
     );
@@ -1063,8 +1066,9 @@ function LabEditorSession() {
   }, []);
 
   const resumeSession = useCallback(async (session: DocumentSession) => {
-    if (!(await flushBeforeSessionSwitch())) return false;
-    if (!(await freezePersistenceForNavigation())) return false;
+    const flushResult = await flushBeforeSessionSwitch();
+    if (flushResult === "cancel") return false;
+    if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return false;
     navigateToSession(session);
     return true;
   }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
@@ -1173,10 +1177,11 @@ function LabEditorSession() {
       }
       if (command.id === "new") {
         void (async () => {
-          if (!(await flushBeforeSessionSwitch())) return;
+          const flushResult = await flushBeforeSessionSwitch();
+          if (flushResult === "cancel") return;
           // Freeze before the async create gap so keystrokes cannot land on the
           // outgoing session after the last successful flush.
-          if (!(await freezePersistenceForNavigation())) return;
+          if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return;
           try {
             const session = await createDocumentSession();
             navigateToSession(session);
@@ -1273,6 +1278,7 @@ function LabEditorSession() {
   // documentId and vault scope are fixed at mount, so force a full reload when
   // the location's session id diverges from the bound document.
   useEffect(() => {
+    let rebinding = false;
     const rebindIfSessionChanged = () => {
       // Invalid hashes must not keep a misleading `#session=…` while bound to default.
       if (clearInvalidDocumentSessionHash()) {
@@ -1280,9 +1286,19 @@ function LabEditorSession() {
         if (documentId === DEFAULT_DOCUMENT_ID) return;
       }
       const nextId = activeDocumentIdFromLocation();
-      if (nextId !== documentId) {
+      if (nextId === documentId || rebinding) return;
+      rebinding = true;
+      // Best-effort durable flush before unload — same intent as /new and /sessions,
+      // without a confirm dialog on the history path (always rebind to the URL).
+      void (async () => {
+        editor?.setEditable(false, false);
+        try {
+          await persistence.flush();
+        } catch {
+          // Staged recovery drafts remain available via /recover after reload.
+        }
         window.location.reload();
-      }
+      })();
     };
     const onPageShow = (event: PageTransitionEvent) => {
       // bfcache restore can resurrect a page whose URL was changed via history.
@@ -1298,7 +1314,7 @@ function LabEditorSession() {
       window.removeEventListener("hashchange", rebindIfSessionChanged);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [documentId]);
+  }, [documentId, editor, persistence]);
 
   useEffect(() => {
     if (!editor) return;

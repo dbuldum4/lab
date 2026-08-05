@@ -221,9 +221,11 @@ export async function createDocumentSession(name = "Untitled") {
       ?? `${Date.now()}${Math.random().toString(36).slice(2)}`;
     if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
     const now = Date.now();
-    // null means the id became unusable under the lock (tombstone race); retry.
+    // null means the id became unusable under the lock (tombstone or live
+    // collision); retry with a fresh id so create never clobbers metadata.
     const created = await withSessionLock(id, () => {
       if (isLocalDocumentDeleted(id)) return null;
+      if (readSession(id)) return null;
       return writeSession({
         id,
         name: normalizeName(name),

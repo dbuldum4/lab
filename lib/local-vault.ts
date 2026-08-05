@@ -1142,13 +1142,20 @@ async function persistentStorageGranted() {
  * Replica writes happen after the authority commit. The authority check here
  * is only a freshness optimization for replicas; it is not used as a lock or
  * represented as an atomic localStorage/OPFS compare-and-set.
+ *
+ * Without Web Locks, a peer can finish deleteLocalDocument after our authority
+ * commit and before replicas complete. Always re-check the durable deletion
+ * marker so we never repopulate localStorage/OPFS for a deleted document.
  */
 async function writeReplicaIfCurrent(target: StorageTarget, snapshot: CanonicalSnapshot) {
+  if (await refreshDeletedFromIndexedDb()) return false;
   if (hasIndexedDb()) {
     const authority = await readIndexedDb();
     const current = await normalizeSnapshot(authority);
     if (current && !sameSnapshot(current, snapshot) && !shouldAcceptSnapshot(current, snapshot)) return false;
   }
+  // Peer delete can land during the async authority read above.
+  if (await refreshDeletedFromIndexedDb()) return false;
   return writeSnapshotIfNewer(target, snapshot);
 }
 
@@ -1384,8 +1391,8 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
     } else if (hasWebLocks() || !isBrowserContext()) {
       // Web Locks serializes this fallback in browsers that provide it. The
       // Node branch is intentionally only for the test/single-context runtime.
-      // Re-check sync tombstone before replica writes (no IDB CAS barrier).
-      if (isLocalDocumentDeleted()) {
+      // Re-check durable/local tombstones before replica writes (no IDB CAS barrier).
+      if (await refreshDeletedFromIndexedDb()) {
         const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
         return { ...health, saved: false };
       }
@@ -1395,7 +1402,10 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
       extraErrors.push("Cross-tab persistence requires IndexedDB or Web Locks; the candidate was not written.");
     }
 
-    if (isLocalDocumentDeleted()) {
+    // Re-read the IndexedDB deletion marker after authority work. A peer tab can
+    // finish deleteLocalDocument between commitIndexedDb acceptance and replica
+    // writes when Web Locks are missing; authority may already be gone.
+    if (await refreshDeletedFromIndexedDb()) {
       const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
       return { ...health, saved: false };
     }
@@ -1411,6 +1421,16 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
 
     if (!hasIndexedDb() && candidateSaved) {
       candidateSaved = writes.some((write) => write.status === "fulfilled" && write.value);
+    }
+    // A peer delete that lands during replica I/O must still force saved: false
+    // even if the authority commit had accepted this candidate earlier.
+    if (await refreshDeletedFromIndexedDb()) {
+      const health = await inspectLocalStorageNow([
+        ...extraErrors,
+        ...writeErrors,
+        "This session was deleted in another tab.",
+      ]);
+      return { ...health, saved: false };
     }
     // Save acceptance is not the same as final authority ownership: another
     // tab may commit a deterministic tie winner immediately afterward. Keep

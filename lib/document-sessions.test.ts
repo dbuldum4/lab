@@ -249,3 +249,40 @@ test("createDocumentSession retries when the id is tombstoned after the lock is 
   assert.equal(calls, 2);
   assert.equal(lockCalls, 2);
 });
+
+test("createDocumentSession retries when the chosen id already has live metadata", async () => {
+  const taken = "feedfacefeedfacefeedfacefeedface";
+  localStorage.setItem(
+    `lab.session.v1.${taken}`,
+    JSON.stringify({
+      id: taken,
+      name: "Existing",
+      createdAt: 1,
+      updatedAt: 1,
+    }),
+  );
+
+  let calls = 0;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      randomUUID() {
+        calls += 1;
+        return calls === 1
+          ? "feedface-feed-face-feed-facefeedface"
+          : "cafebabe-cafe-babe-cafe-babecafebabe";
+      },
+    },
+  });
+
+  const session = await createDocumentSession("Fresh");
+  assert.notEqual(session.id, taken);
+  assert.equal(session.id, "cafebabecafebabecafebabecafebabe");
+  assert.equal(session.name, "Fresh");
+  assert.equal(calls, 2);
+  // Existing session metadata must not be clobbered by the collision attempt.
+  assert.equal(
+    JSON.parse(localStorage.getItem(`lab.session.v1.${taken}`) ?? "null").name,
+    "Existing",
+  );
+});

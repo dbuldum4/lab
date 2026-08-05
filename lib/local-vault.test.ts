@@ -1082,3 +1082,70 @@ test("failed local purge before a durable marker leaves the session loadable", a
   assert.equal(await loadLocalDocument(), "keep me");
   assert.equal((await saveLocalDocument("keep me still")).saved, true);
 });
+
+test("in-flight save loses to peer delete after authority commit without Web Locks", async () => {
+  // Cross-tab TOCTOU: authority commit accepts, then a peer writes deleted:<id>
+  // and drops authority before replica writes. Without Web Locks this is the
+  // gap that used to repopulate localStorage/OPFS and report saved: true.
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: null });
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("seed")).saved, true);
+
+  const documents = environment.idb?.stores.get("documents");
+  assert.ok(documents);
+  const realSet = documents.set.bind(documents);
+  let sawRacerAuthority = false;
+  documents.set = ((key: IDBValidKey, value: unknown) => {
+    realSet(key, value);
+    if (
+      key === "authority:alpha"
+      && value
+      && typeof value === "object"
+      && (value as { snapshot?: { markdown?: string } }).snapshot?.markdown === "racer"
+    ) {
+      sawRacerAuthority = true;
+    }
+  }) as typeof documents.set;
+
+  const originalCrypto = globalThis.crypto;
+  let release: (() => void) | undefined;
+  let paused = false;
+  const digest = async (...args: Parameters<SubtleCrypto["digest"]>) => {
+    const result = await webcrypto.subtle.digest(...args);
+    // First digest after the racer authority put is post-commit normalizeSnapshot.
+    if (sawRacerAuthority && !paused) {
+      paused = true;
+      await new Promise<void>((resolve) => { release = resolve; });
+    }
+    return result;
+  };
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: { subtle: { digest } },
+  });
+
+  try {
+    const save = saveLocalDocument("racer");
+    while (!release) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Peer tab finished deleteLocalDocument: durable marker, no authority, purged replicas.
+    environment.idb?.write("deleted:alpha", { recordVersion: 1, deletedAt: Date.now() });
+    environment.idb?.remove("authority:alpha");
+    environment.idb?.remove("current:alpha");
+    environment.local.removeItem("lab.document.v2.alpha");
+    environment.opfs?.files.delete("lab.alpha.md.snapshot");
+    // No localStorage tombstone yet — the cold-tab race window.
+
+    release();
+    const health = await save;
+    assert.equal(health.saved, false);
+    assert.ok(health.errors.some((error) => /deleted in another tab/i.test(error)));
+    assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+    assert.equal(environment.opfs?.files.has("lab.alpha.md.snapshot"), false);
+    assert.ok(environment.idb?.read("deleted:alpha"));
+    assert.equal(environment.idb?.read("authority:alpha"), undefined);
+    assert.equal(environment.idb?.read("current:alpha"), undefined);
+  } finally {
+    Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
+  }
+});
