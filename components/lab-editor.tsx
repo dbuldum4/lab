@@ -323,7 +323,30 @@ const SlashCommandInput = Extension.create({
   },
 });
 
+/**
+ * Gate vault scope + persistence until the client has the real URL hash.
+ * Static pre-render and SSR have no hash, so mounting LabEditorSession there
+ * would permanently bind the default document for deep-linked sessions.
+ */
 export function LabEditor() {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+  if (!mounted) {
+    return (
+      <div
+        className="lab-editor"
+        data-hydrating="true"
+        aria-busy="true"
+        aria-label="lab local-only Markdown note"
+      />
+    );
+  }
+  return <LabEditorSession />;
+}
+
+function LabEditorSession() {
   const shellRef = useRef<HTMLDivElement>(null);
   const caretRef = useRef<HTMLDivElement>(null);
   const caretStrokeRef = useRef<HTMLSpanElement>(null);
@@ -343,6 +366,7 @@ export function LabEditor() {
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+  // Only constructed after LabEditor mounts on the client, so the hash is real.
   const [documentId] = useState(() => activeDocumentIdFromLocation());
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
@@ -910,8 +934,8 @@ export function LabEditor() {
   useEffect(() => {
     if (!editor) return;
     const documentElement = editor.view.dom;
-    const activeCommand = palette?.mode === "commands" ? filtered[selected] : undefined;
     if (palette?.mode === "commands") {
+      const activeCommand = filtered[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeCommand) {
@@ -923,10 +947,24 @@ export function LabEditor() {
       }
       return;
     }
+    if (palette?.mode === "sessions") {
+      const activeSession = sessions[selected];
+      documentElement.setAttribute("aria-expanded", "true");
+      documentElement.setAttribute("aria-controls", PALETTE_ID);
+      if (activeSession) {
+        documentElement.setAttribute(
+          "aria-activedescendant",
+          `${PALETTE_ID}-session-${activeSession.id}`,
+        );
+      } else {
+        documentElement.removeAttribute("aria-activedescendant");
+      }
+      return;
+    }
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [editor, filtered, palette, selected]);
+  }, [editor, filtered, palette, selected, sessions]);
 
   const flushBeforeSessionSwitch = useCallback(async () => {
     try {
@@ -946,19 +984,33 @@ export function LabEditor() {
     return false;
   }, [persistence]);
 
+  /** Stop accepting edits so the async gap before navigation cannot stage/save more text. */
+  const freezePersistenceForNavigation = useCallback(async () => {
+    editor?.setEditable(false, false);
+    await persistence.dispose();
+  }, [editor, persistence]);
+
   const navigateToSession = useCallback((session: DocumentSession) => {
-    const target = `${window.location.pathname}${window.location.search}${documentSessionHash(session.id)}`;
-    // Same-path hash changes often skip a full load. Push then reload so Back
-    // can return to the prior document and the page re-binds documentId.
-    window.history.pushState(null, "", target);
+    const hash = documentSessionHash(session.id);
+    const target = `${window.location.pathname}${window.location.search}${hash}`;
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    // Same-path hash changes do not load a new document by themselves. Push a
+    // real history entry, then reload so documentId and vault scope rebind.
+    // Back/forward are handled by the popstate listener below (also reload).
+    if (current === target) {
+      window.location.reload();
+      return;
+    }
+    window.history.pushState({ labDocumentId: session.id }, "", target);
     window.location.reload();
   }, []);
 
   const resumeSession = useCallback(async (session: DocumentSession) => {
     if (!(await flushBeforeSessionSwitch())) return false;
+    await freezePersistenceForNavigation();
     navigateToSession(session);
     return true;
-  }, [flushBeforeSessionSwitch, navigateToSession]);
+  }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
 
   const deleteActiveSession = useCallback(async () => {
     if (documentId === DEFAULT_DOCUMENT_ID) {
@@ -971,13 +1023,15 @@ export function LabEditor() {
       await purgeDocumentSession(documentId);
     } catch {
       // abandon() is irreversible; reload restores a live persistence controller.
+      // Tombstones are only published after a durable delete marker succeeds, so
+      // a failed purge keeps the note loadable after reload.
       setNotice("This session could not be deleted locally. Reloading…");
       window.location.reload();
       return false;
     }
     // Replace so Back does not return to the deleted session URL, then reload.
     const target = `${window.location.pathname}${window.location.search}`;
-    window.history.replaceState(null, "", target);
+    window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
     window.location.reload();
     return true;
   }, [documentId, persistence]);
@@ -1063,11 +1117,15 @@ export function LabEditor() {
       if (command.id === "new") {
         void (async () => {
           if (!(await flushBeforeSessionSwitch())) return;
+          // Freeze before the async create gap so keystrokes cannot land on the
+          // outgoing session after the last successful flush.
+          await freezePersistenceForNavigation();
           try {
             const session = await createDocumentSession();
             navigateToSession(session);
           } catch {
-            setNotice("A new session could not be created locally.");
+            setNotice("A new session could not be created locally. Reloading…");
+            window.location.reload();
           }
         })();
         return;
@@ -1144,8 +1202,34 @@ export function LabEditor() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
   );
+
+  // Hash-only history (Back/Forward) updates the URL without remounting React.
+  // documentId and vault scope are fixed at mount, so force a full reload when
+  // the location's session id diverges from the bound document.
+  useEffect(() => {
+    const rebindIfSessionChanged = () => {
+      const nextId = activeDocumentIdFromLocation();
+      if (nextId !== documentId) {
+        window.location.reload();
+      }
+    };
+    const onPageShow = (event: PageTransitionEvent) => {
+      // bfcache restore can resurrect a page whose URL was changed via history.
+      if (event.persisted || activeDocumentIdFromLocation() !== documentId) {
+        rebindIfSessionChanged();
+      }
+    };
+    window.addEventListener("popstate", rebindIfSessionChanged);
+    window.addEventListener("hashchange", rebindIfSessionChanged);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      window.removeEventListener("popstate", rebindIfSessionChanged);
+      window.removeEventListener("hashchange", rebindIfSessionChanged);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, [documentId]);
 
   useEffect(() => {
     if (!editor) return;
@@ -1156,7 +1240,7 @@ export function LabEditor() {
         if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
           if (!active) return;
           setNotice("This session was deleted. Returning to the original note…");
-          window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+          window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", `${window.location.pathname}${window.location.search}`);
           window.location.reload();
           return;
         }
@@ -1433,7 +1517,7 @@ export function LabEditor() {
             id={PALETTE_ID}
             className="command-palette"
             role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label="Slash commands"
+            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (

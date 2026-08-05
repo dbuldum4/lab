@@ -1034,3 +1034,51 @@ test("deleteLocalDocument does not redirect the caller's active scope mid-flight
   assert.equal((await saveLocalDocument("original still")).saved, true);
   assert.equal(await loadLocalDocument(), "original still");
 });
+
+test("IndexedDB deletion marker blocks commits even when localStorage tombstone is missing", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: null });
+
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("secret")).saved, true);
+  await deleteLocalDocument("alpha");
+
+  // Peer tab with a cold process-local cache and no localStorage tombstone still
+  // loses to the durable IndexedDB marker inside the authority transaction.
+  resetLocalVaultStateForTests();
+  setLocalDocumentScope("alpha");
+  environment.local.removeItem("lab.document.deleted.v1.alpha");
+  assert.equal(isLocalDocumentDeleted("alpha"), false);
+
+  const revived = await saveLocalDocument("resurrect");
+  assert.equal(revived.saved, false);
+  assert.ok(revived.errors.some((error) => /deleted in another tab/i.test(error)));
+  assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+  assert.equal(environment.idb?.read("authority:alpha"), undefined);
+  assert.ok(environment.idb?.read("deleted:alpha"));
+  assert.equal(await loadLocalDocument(), "");
+});
+
+test("failed local purge before a durable marker leaves the session loadable", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("keep me")).saved, true);
+
+  const originalSetItem = environment.local.setItem.bind(environment.local);
+  // Corrupt removeItem only for the document snapshot so purgeLocalReplicas throws
+  // before any IndexedDB deletion marker is written.
+  const originalRemove = environment.local.removeItem.bind(environment.local);
+  environment.local.removeItem = (key: string) => {
+    if (key === "lab.document.v2.alpha") throw new Error("quota");
+    originalRemove(key);
+  };
+
+  await assert.rejects(() => deleteLocalDocument("alpha"), /localStorage copies/i);
+  environment.local.removeItem = originalRemove;
+  environment.local.setItem = originalSetItem;
+
+  assert.equal(isLocalDocumentDeleted("alpha"), false);
+  assert.equal(environment.idb?.read("deleted:alpha"), undefined);
+  assert.equal(await loadLocalDocument(), "keep me");
+  assert.equal((await saveLocalDocument("keep me still")).saved, true);
+});

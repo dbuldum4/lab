@@ -1,4 +1,9 @@
-import { DEFAULT_DOCUMENT_ID, deleteLocalDocument } from "./local-vault.ts";
+import {
+  DEFAULT_DOCUMENT_ID,
+  deleteLocalDocument,
+  ensureDocumentNotDeleted,
+  isLocalDocumentDeleted,
+} from "./local-vault.ts";
 
 const SESSION_KEY_PREFIX = "lab.session.v1.";
 const SESSION_ACTIVITY_KEY_PREFIX = "lab.session.activity.v1.";
@@ -130,7 +135,11 @@ export function documentSessionHash(id: string) {
 /** Read session metadata without creating a ghost entry for unknown hashes. */
 export async function getDocumentSession(id: string): Promise<DocumentSession | null> {
   const normalized = normalizeId(id);
-  return withSessionLock(normalized, () => readSession(normalized));
+  if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) return null;
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) return null;
+    return readSession(normalized);
+  });
 }
 
 /**
@@ -139,7 +148,11 @@ export async function getDocumentSession(id: string): Promise<DocumentSession | 
  */
 export async function ensureDocumentSession(id: string) {
   const normalized = normalizeId(id);
+  await ensureDocumentNotDeleted(normalized);
   return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
     const existing = readSession(normalized);
     if (existing) return existing;
     const now = Date.now();
@@ -153,20 +166,33 @@ export async function ensureDocumentSession(id: string) {
 }
 
 export async function createDocumentSession(name = "Untitled") {
-  const id = globalThis.crypto?.randomUUID?.().replaceAll("-", "")
-    ?? `${Date.now()}${Math.random().toString(36).slice(2)}`;
-  const now = Date.now();
-  return withSessionLock(id, () => writeSession({
-    id,
-    name: normalizeName(name),
-    createdAt: now,
-    updatedAt: now,
-  }));
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const id = globalThis.crypto?.randomUUID?.().replaceAll("-", "")
+      ?? `${Date.now()}${Math.random().toString(36).slice(2)}`;
+    if (isLocalDocumentDeleted(id)) continue;
+    const now = Date.now();
+    return withSessionLock(id, () => {
+      if (isLocalDocumentDeleted(id)) {
+        throw new Error("This session was deleted.");
+      }
+      return writeSession({
+        id,
+        name: normalizeName(name),
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+  }
+  throw new Error("A new session id could not be allocated.");
 }
 
 export async function renameDocumentSession(id: string, name: string) {
   const normalized = normalizeId(id);
+  await ensureDocumentNotDeleted(normalized);
   return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
     const existing = readSession(normalized);
     const now = Date.now();
     return writeSession({
@@ -185,7 +211,11 @@ export async function renameDocumentSession(id: string, name: string) {
  */
 export async function touchDocumentSession(id: string) {
   const normalized = normalizeId(id);
+  await ensureDocumentNotDeleted(normalized);
   return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
     const existing = readSession(normalized);
     const now = Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1);
     const local = storage();
@@ -254,7 +284,9 @@ export function listDocumentSessions(): DocumentSession[] {
         const key = local.key(index);
         if (!key?.startsWith(SESSION_KEY_PREFIX)) continue;
         const session = parseSession(local.getItem(key));
-        if (session) sessions.push(mergeActivity(local, session));
+        if (!session) continue;
+        if (session.id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(session.id)) continue;
+        sessions.push(mergeActivity(local, session));
       }
     } catch {
       // Return any metadata that was readable before enumeration failed.

@@ -13,7 +13,7 @@ import {
   renameDocumentSession,
   touchDocumentSession,
 } from "./document-sessions.ts";
-import { deleteLocalDocument } from "./local-vault.ts";
+import { deleteLocalDocument, isLocalDocumentDeleted, resetLocalVaultStateForTests } from "./local-vault.ts";
 
 class MemoryStorage implements Storage {
   readonly values = new Map<string, string>();
@@ -37,9 +37,11 @@ beforeEach(() => {
     configurable: true,
     value: { locks: { request: async (_name: string, _options: unknown, callback: () => unknown) => callback() } },
   });
+  resetLocalVaultStateForTests();
 });
 
 afterEach(() => {
+  resetLocalVaultStateForTests();
   for (const [name, descriptor] of descriptors) {
     if (descriptor) Object.defineProperty(globalThis, name, descriptor);
     else Reflect.deleteProperty(globalThis, name);
@@ -53,6 +55,16 @@ test("the hash keeps the original document implicit and scopes named sessions", 
   assert.equal(activeDocumentIdFromLocation({ hash: "#session=../../bad" } as Location), "default");
   assert.equal(documentSessionHash("default"), "");
   assert.equal(documentSessionHash("alpha_1"), "#session=alpha_1");
+});
+
+test("location hash changes map back and forward session ids", () => {
+  // Browser Back/Forward only update location.hash; the editor reloads when this
+  // id diverges from the mount-time documentId.
+  assert.equal(activeDocumentIdFromLocation({ hash: "#session=alpha" } as Location), "alpha");
+  assert.equal(activeDocumentIdFromLocation({ hash: "" } as Location), "default");
+  assert.equal(activeDocumentIdFromLocation({ hash: "#session=beta" } as Location), "beta");
+  assert.equal(documentSessionHash("alpha"), "#session=alpha");
+  assert.equal(documentSessionHash("default"), "");
 });
 
 test("sessions are independent, resumable, and rename atomically per id", async () => {
@@ -111,7 +123,28 @@ test("purge removes session metadata after content purge and refuses the origina
   await purgeDocumentSession(alpha.id);
 
   assert.equal(localStorage.getItem(`lab.document.v2.${alpha.id}`), null);
+  assert.equal(isLocalDocumentDeleted(alpha.id), true);
   assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
   await assert.rejects(() => purgeDocumentSession("default"), /original session cannot be deleted/i);
   await assert.rejects(() => deleteLocalDocument("default"), /original session cannot be deleted/i);
+});
+
+test("tombstoned sessions cannot be renamed, touched, or re-listed as ghosts", async () => {
+  const alpha = await createDocumentSession("Doomed");
+  await purgeDocumentSession(alpha.id);
+
+  // Simulate leftover metadata a peer might still hold (or a partial metadata delete).
+  localStorage.setItem(`lab.session.v1.${alpha.id}`, JSON.stringify({
+    id: alpha.id,
+    name: "Stale",
+    createdAt: 1,
+    updatedAt: 1,
+  }));
+
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+  await assert.rejects(() => renameDocumentSession(alpha.id, "BackFromDead"), /deleted/i);
+  await assert.rejects(() => touchDocumentSession(alpha.id), /deleted/i);
+  await assert.rejects(() => ensureDocumentSession(alpha.id), /deleted/i);
+  assert.equal(await getDocumentSession(alpha.id), null);
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
 });

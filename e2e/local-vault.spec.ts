@@ -356,6 +356,32 @@ test("delete removes an extra session and returns to the original note", async (
   await expect(restored).toContainText("keep the original note");
   await expect.poll(() => page.evaluate((scopedKey) => localStorage.getItem(scopedKey), `lab.document.v2.${scopedId}`)).toBeNull();
   await expect.poll(() => page.evaluate((sessionKey) => localStorage.getItem(sessionKey), `lab.session.v1.${scopedId}`)).toBeNull();
+  await expect.poll(() => page.evaluate(async ({ scopedAuthority, scopedDeleted }) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("lab-private-vault");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      return await new Promise<{ authority: unknown; deleted: unknown }>((resolve, reject) => {
+        const transaction = database.transaction("documents", "readonly");
+        const store = transaction.objectStore("documents");
+        const authorityRequest = store.get(scopedAuthority);
+        const deletedRequest = store.get(scopedDeleted);
+        transaction.oncomplete = () => resolve({
+          authority: authorityRequest.result ?? null,
+          deleted: deletedRequest.result ?? null,
+        });
+        transaction.onerror = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
+  }, { scopedAuthority: `authority:${scopedId}`, scopedDeleted: `deleted:${scopedId}` })).toEqual({
+    authority: null,
+    deleted: expect.objectContaining({ recordVersion: 1 }),
+  });
+  await expect.poll(() => page.evaluate((tombstone) => localStorage.getItem(tombstone), `lab.document.deleted.v1.${scopedId}`)).not.toBeNull();
 
   await restored.press("End");
   await restored.press("Enter");
@@ -364,6 +390,38 @@ test("delete removes an extra session and returns to the original note", async (
   const sessionList = page.getByTestId("session-list");
   await expect(sessionList).toContainText("Untitled");
   await expect(sessionList).not.toContainText("Doomed");
+});
+
+test("browser back and forward rebind the active document from the URL hash", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.fill("home note");
+  await waitForAuthority(page, "home note");
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/new");
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const sessionUrl = page.url();
+  const scopedId = new URL(sessionUrl).hash.replace("#session=", "");
+  const sessionEditor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(sessionEditor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  await sessionEditor.fill("branch note");
+  await expect.poll(() => page.evaluate((scopedKey) => {
+    return JSON.parse(localStorage.getItem(scopedKey) ?? "null")?.markdown?.trim() ?? null;
+  }, `lab.document.v2.${scopedId}`), { timeout: 15000 }).toBe("branch note");
+
+  await page.goBack();
+  await expect(page).not.toHaveURL(/#session=/);
+  const homeEditor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(homeEditor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  await expect(homeEditor).toContainText("home note");
+
+  await page.goForward();
+  await expect(page).toHaveURL(sessionUrl);
+  const again = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(again).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  await expect(again).toContainText("branch note");
 });
 
 test("forward deletion next to a slash query remains undoable", async ({ page }) => {
