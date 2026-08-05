@@ -112,7 +112,14 @@ async function withSessionLock<T>(id: string, operation: () => T | Promise<T>) {
   } catch (error) {
     if (operationStarted) throw error;
     // Activity timestamps use a separate key, so an unlocked touch cannot
-    // overwrite a concurrent rename's session name.
+    // overwrite a concurrent rename's session name. Surface broken lock
+    // implementations in development so silent fallback is observable.
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(
+        `[document-sessions] Web Lock request failed for ${id}; continuing without exclusive lock.`,
+        error,
+      );
+    }
   }
   return operation();
 }

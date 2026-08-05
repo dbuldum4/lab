@@ -167,8 +167,8 @@ function clearLocalTombstone(documentId: string) {
   }
 }
 
-function isDefaultDocument() {
-  return currentDocumentId() === DEFAULT_DOCUMENT_ID;
+function isDefaultDocument(documentId: string = currentDocumentId()) {
+  return normalizedDocumentId(documentId) === DEFAULT_DOCUMENT_ID;
 }
 
 function localSnapshotKey() {
@@ -183,12 +183,24 @@ function pendingKeyPrefix() {
   return isDefaultDocument() ? LEGACY_PENDING_KEY_PREFIX : `lab.document.pending.scoped.v2.${currentDocumentId()}.`;
 }
 
+/** IndexedDB authority key for an explicit document id (no ambient scope). */
+function authorityKeyFor(documentId: string) {
+  const id = normalizedDocumentId(documentId);
+  return isDefaultDocument(id) ? LEGACY_AUTHORITY_KEY : `authority:${id}`;
+}
+
+/** IndexedDB current-snapshot key for an explicit document id (no ambient scope). */
+function currentKeyFor(documentId: string) {
+  const id = normalizedDocumentId(documentId);
+  return isDefaultDocument(id) ? LEGACY_CURRENT_KEY : `current:${id}`;
+}
+
 function authorityKey() {
-  return isDefaultDocument() ? LEGACY_AUTHORITY_KEY : `authority:${currentDocumentId()}`;
+  return authorityKeyFor(currentDocumentId());
 }
 
 function currentKey() {
-  return isDefaultDocument() ? LEGACY_CURRENT_KEY : `current:${currentDocumentId()}`;
+  return currentKeyFor(currentDocumentId());
 }
 
 function opfsFile() {
@@ -709,14 +721,15 @@ async function commitIndexedDb(candidate: CanonicalSnapshot): Promise<AuthorityC
  */
 async function commitIndexedDbDeletion(documentId: string, deletedAt: number) {
   const id = normalizedDocumentId(documentId);
+  // All keys are derived from `id` so this never depends on ambient vault scope.
   const db = await openDatabase();
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction(STORE_NAME, "readwrite");
       const store = transaction.objectStore(STORE_NAME);
       store.put({ recordVersion: 1, deletedAt } satisfies DeletedRecord, deletedIdbKey(id));
-      store.delete(authorityKey());
-      store.delete(currentKey());
+      store.delete(authorityKeyFor(id));
+      store.delete(currentKeyFor(id));
       transaction.oncomplete = () => resolve();
       transaction.onerror = () => reject(transaction.error ?? new Error("Could not record IndexedDB deletion."));
       transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB deletion was aborted."));

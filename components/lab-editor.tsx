@@ -13,7 +13,7 @@ import { NodeSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import katex from "katex";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   createEditorPersistenceController,
   type EditorPersistenceController,
@@ -181,17 +181,51 @@ function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
 }
 
+/** Index just before the code point ending at `index` (handles surrogate pairs). */
+function previousCodePointIndex(text: string, index: number) {
+  if (index <= 0) return 0;
+  if (index >= 2) {
+    const low = text.charCodeAt(index - 1);
+    const high = text.charCodeAt(index - 2);
+    if (low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff) {
+      return index - 2;
+    }
+  }
+  return index - 1;
+}
+
 function backwardWordStart(text: string) {
   let start = text.length;
-  while (start > 0 && /\s/.test(text[start - 1])) start -= 1;
+  while (start > 0) {
+    const prev = previousCodePointIndex(text, start);
+    if (!/\s/u.test(text.slice(prev, start))) break;
+    start = prev;
+  }
 
-  if (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) {
-    while (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) start -= 1;
-  } else if (start > 0) {
-    start -= 1;
+  if (start > 0) {
+    const prev = previousCodePointIndex(text, start);
+    const unit = text.slice(prev, start);
+    if (/[\p{L}\p{N}_]/u.test(unit)) {
+      while (start > 0) {
+        const p = previousCodePointIndex(text, start);
+        if (!/[\p{L}\p{N}_]/u.test(text.slice(p, start))) break;
+        start = p;
+      }
+    } else {
+      start = prev;
+    }
   }
 
   return start;
+}
+
+/** Client-only gate: false during SSR/prerender, true after hydration (no effect setState). */
+function useIsClient() {
+  return useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
 }
 
 function migrateInlineMath(instance: Editor) {
@@ -327,12 +361,10 @@ const SlashCommandInput = Extension.create({
  * Gate vault scope + persistence until the client has the real URL hash.
  * Static pre-render and SSR have no hash, so mounting LabEditorSession there
  * would permanently bind the default document for deep-linked sessions.
+ * useSyncExternalStore avoids setState-in-effect while still deferring to client.
  */
 export function LabEditor() {
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  const mounted = useIsClient();
   if (!mounted) {
     return (
       <div
