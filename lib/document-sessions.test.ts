@@ -3,12 +3,14 @@ import { webcrypto } from "node:crypto";
 import test, { afterEach, beforeEach } from "node:test";
 import {
   activeDocumentIdFromLocation,
+  clearInvalidDocumentSessionHash,
   createDocumentSession,
   deleteDocumentSession,
   documentSessionHash,
   ensureDocumentSession,
   getDocumentSession,
   listDocumentSessions,
+  parseActiveDocumentLocation,
   purgeDocumentSession,
   renameDocumentSession,
   touchDocumentSession,
@@ -53,8 +55,44 @@ test("the hash keeps the original document implicit and scopes named sessions", 
   assert.equal(activeDocumentIdFromLocation({ hash: "" } as Location), "default");
   assert.equal(activeDocumentIdFromLocation({ hash: "#session=alpha_1" } as Location), "alpha_1");
   assert.equal(activeDocumentIdFromLocation({ hash: "#session=../../bad" } as Location), "default");
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "#session=../../bad" }), {
+    id: "default",
+    hadInvalidSessionHash: true,
+  });
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "#session=%ZZ" }), {
+    id: "default",
+    hadInvalidSessionHash: true,
+  });
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "#session=alpha_1" }), {
+    id: "alpha_1",
+    hadInvalidSessionHash: false,
+  });
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "" }), {
+    id: "default",
+    hadInvalidSessionHash: false,
+  });
   assert.equal(documentSessionHash("default"), "");
   assert.equal(documentSessionHash("alpha_1"), "#session=alpha_1");
+});
+
+test("invalid session hashes are rewritten so the URL matches default storage", () => {
+  const location = {
+    hash: "#session=../../bad",
+    pathname: "/lab",
+    search: "?x=1",
+  };
+  let replaced: { state: unknown; url: string } | undefined;
+  const history = {
+    replaceState(state: unknown, _title: string, url: string) {
+      replaced = { state, url };
+      location.hash = "";
+    },
+  };
+
+  assert.equal(clearInvalidDocumentSessionHash(location, history), true);
+  assert.deepEqual(replaced, { state: { labDocumentId: "default" }, url: "/lab?x=1" });
+  assert.equal(clearInvalidDocumentSessionHash({ ...location, hash: "" }, history), false);
+  assert.equal(clearInvalidDocumentSessionHash({ ...location, hash: "#session=ok_id" }, history), false);
 });
 
 test("location hash changes map back and forward session ids", () => {
@@ -147,4 +185,67 @@ test("tombstoned sessions cannot be renamed, touched, or re-listed as ghosts", a
   await assert.rejects(() => ensureDocumentSession(alpha.id), /deleted/i);
   assert.equal(await getDocumentSession(alpha.id), null);
   assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+});
+
+test("createDocumentSession retries when the chosen id is already tombstoned", async () => {
+  const doomed = "deadbeefdeadbeefdeadbeefdeadbeef";
+  let calls = 0;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      randomUUID() {
+        calls += 1;
+        return calls === 1
+          ? "deadbeef-dead-beef-dead-beefdeadbeef"
+          : "cafebabe-cafe-babe-cafe-babecafebabe";
+      },
+    },
+  });
+  // localStorage tombstone is enough for isLocalDocumentDeleted after process-local reset.
+  localStorage.setItem(`lab.document.deleted.v1.${doomed}`, String(Date.now()));
+
+  const session = await createDocumentSession("Recovered");
+  assert.notEqual(session.id, doomed);
+  assert.equal(session.id, "cafebabecafebabecafebabecafebabe");
+  assert.equal(session.name, "Recovered");
+  assert.equal(calls, 2);
+});
+
+test("createDocumentSession retries when the id is tombstoned after the lock is acquired", async () => {
+  const doomed = "aabbccddeeff00112233445566778899";
+  let calls = 0;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      randomUUID() {
+        calls += 1;
+        return calls === 1
+          ? "aabbccdd-eeff-0011-2233-445566778899"
+          : "11223344-5566-7788-99aa-bbccddeeff00";
+      },
+    },
+  });
+
+  // First lock callback races a tombstone write, second id is free.
+  let lockCalls = 0;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      locks: {
+        request: async (_name: string, _options: unknown, callback: () => unknown) => {
+          lockCalls += 1;
+          if (lockCalls === 1) {
+            localStorage.setItem(`lab.document.deleted.v1.${doomed}`, String(Date.now()));
+          }
+          return callback();
+        },
+      },
+    },
+  });
+
+  const session = await createDocumentSession("UnderLock");
+  assert.equal(session.id, "112233445566778899aabbccddeeff00");
+  assert.equal(session.name, "UnderLock");
+  assert.equal(calls, 2);
+  assert.equal(lockCalls, 2);
 });

@@ -231,12 +231,15 @@ test("dispose flushes pending edits then stops accepting work without hanging", 
   assert.equal(saveCalls, 1);
 
   let disposeResolved = false;
-  const disposed = controller.dispose().then(() => { disposeResolved = true; });
+  const disposed = controller.dispose().then((flushed) => {
+    disposeResolved = true;
+    return flushed;
+  });
   await Promise.resolve();
   assert.equal(disposeResolved, false);
 
   resolveSave?.(health(true));
-  await disposed;
+  assert.equal(await disposed, true);
   assert.equal(disposeResolved, true);
   assert.equal(controller.getState().loaded, false);
   assert.equal(controller.getState().persistedRevision, 1);
@@ -253,10 +256,23 @@ test("dispose with only a debounced edit persists it before becoming inert", asy
   controller.onEdit("debounced");
   assert.equal(state.scheduler.pending, 1);
 
-  await controller.dispose();
+  assert.equal(await controller.dispose(), true);
   assert.deepEqual(state.saved, ["debounced"]);
   assert.equal(controller.getState().loaded, false);
   assert.equal(controller.getState().persistedRevision, 1);
+  assert.equal(controller.onEdit("too late"), 1);
+  assert.equal(state.scheduler.pending, 0);
+});
+
+test("dispose returns false when the final flush fails but still becomes inert", async () => {
+  const state = dependencies({
+    save: async () => health(false),
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("unsaved");
+  assert.equal(await controller.dispose(), false);
+  assert.equal(controller.getState().loaded, false);
   assert.equal(controller.onEdit("too late"), 1);
   assert.equal(state.scheduler.pending, 0);
 });

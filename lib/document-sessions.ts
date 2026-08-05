@@ -25,8 +25,42 @@ function storage(): Storage | null {
   }
 }
 
+function isValidDocumentId(value: string) {
+  return /^[a-zA-Z0-9_-]{1,96}$/.test(value);
+}
+
 function normalizeId(value: string | null | undefined) {
-  return value && /^[a-zA-Z0-9_-]{1,96}$/.test(value) ? value : DEFAULT_DOCUMENT_ID;
+  return value && isValidDocumentId(value) ? value : DEFAULT_DOCUMENT_ID;
+}
+
+export type ActiveDocumentLocation = {
+  id: string;
+  /** True when the hash claimed a session id that failed validation. */
+  hadInvalidSessionHash: boolean;
+};
+
+/**
+ * Parse the location hash into a document id.
+ * Invalid `#session=…` values map to the default document and set
+ * `hadInvalidSessionHash` so callers can rewrite the URL to match storage.
+ */
+export function parseActiveDocumentLocation(
+  location: Pick<Location, "hash"> | undefined = globalThis.location,
+): ActiveDocumentLocation {
+  const hash = location?.hash ?? "";
+  if (!hash.startsWith(SESSION_HASH_PREFIX)) {
+    return { id: DEFAULT_DOCUMENT_ID, hadInvalidSessionHash: false };
+  }
+  let raw: string;
+  try {
+    raw = decodeURIComponent(hash.slice(SESSION_HASH_PREFIX.length));
+  } catch {
+    return { id: DEFAULT_DOCUMENT_ID, hadInvalidSessionHash: true };
+  }
+  if (!raw || !isValidDocumentId(raw)) {
+    return { id: DEFAULT_DOCUMENT_ID, hadInvalidSessionHash: true };
+  }
+  return { id: raw, hadInvalidSessionHash: false };
 }
 
 function normalizeName(value: string) {
@@ -125,13 +159,22 @@ async function withSessionLock<T>(id: string, operation: () => T | Promise<T>) {
 }
 
 export function activeDocumentIdFromLocation(location: Pick<Location, "hash"> | undefined = globalThis.location) {
-  const hash = location?.hash ?? "";
-  if (!hash.startsWith(SESSION_HASH_PREFIX)) return DEFAULT_DOCUMENT_ID;
-  try {
-    return normalizeId(decodeURIComponent(hash.slice(SESSION_HASH_PREFIX.length)));
-  } catch {
-    return DEFAULT_DOCUMENT_ID;
-  }
+  return parseActiveDocumentLocation(location).id;
+}
+
+/**
+ * Clear a bad `#session=…` hash so the address bar matches default storage.
+ * Returns true when an invalid hash was present and rewritten.
+ */
+export function clearInvalidDocumentSessionHash(
+  location: Pick<Location, "hash" | "pathname" | "search"> | undefined = globalThis.location,
+  history: Pick<History, "replaceState"> | undefined = globalThis.history,
+): boolean {
+  if (!location || !history?.replaceState) return false;
+  if (!parseActiveDocumentLocation(location).hadInvalidSessionHash) return false;
+  const target = `${location.pathname}${location.search}`;
+  history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
+  return true;
 }
 
 export function documentSessionHash(id: string) {
@@ -176,12 +219,11 @@ export async function createDocumentSession(name = "Untitled") {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const id = globalThis.crypto?.randomUUID?.().replaceAll("-", "")
       ?? `${Date.now()}${Math.random().toString(36).slice(2)}`;
-    if (isLocalDocumentDeleted(id)) continue;
+    if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
     const now = Date.now();
-    return withSessionLock(id, () => {
-      if (isLocalDocumentDeleted(id)) {
-        throw new Error("This session was deleted.");
-      }
+    // null means the id became unusable under the lock (tombstone race); retry.
+    const created = await withSessionLock(id, () => {
+      if (isLocalDocumentDeleted(id)) return null;
       return writeSession({
         id,
         name: normalizeName(name),
@@ -189,6 +231,7 @@ export async function createDocumentSession(name = "Untitled") {
         updatedAt: now,
       });
     });
+    if (created) return created;
   }
   throw new Error("A new session id could not be allocated.");
 }

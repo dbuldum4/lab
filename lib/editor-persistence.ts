@@ -33,8 +33,12 @@ export type EditorPersistenceController = {
    * Use before deleting the active document; prefer dispose() when leaving with data intact.
    */
   abandon: () => Promise<void>;
-  /** Flush pending work, then stop accepting edits. */
-  dispose: () => Promise<void>;
+  /**
+   * Flush pending work, then stop accepting edits.
+   * Returns false when the final flush failed (data may be incomplete before navigation).
+   * Always becomes disposed, even on flush failure.
+   */
+  dispose: () => Promise<boolean>;
   inspect: () => Promise<StorageHealth>;
   getState: () => {
     loaded: boolean;
@@ -199,18 +203,20 @@ export function createEditorPersistenceController(
     },
 
     async dispose() {
-      if (disposed) return;
+      if (disposed) return true;
       // Await flush while still accepting in-flight completion so saveRevision can
       // advance persistedRevision. Setting disposed first made flush hang forever:
       // saveRevision returned true without updating persistedRevision while the
       // loop kept waiting for editRevision > persistedRevision.
+      let flushed = true;
       try {
-        await flush();
+        flushed = await flush();
       } finally {
         clearTimer();
         disposed = true;
         loaded = false;
       }
+      return flushed;
     },
 
     inspect,

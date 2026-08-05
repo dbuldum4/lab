@@ -30,10 +30,12 @@ import {
 } from "@/lib/local-vault";
 import {
   activeDocumentIdFromLocation,
+  clearInvalidDocumentSessionHash,
   createDocumentSession,
   documentSessionHash,
   getDocumentSession,
   listDocumentSessions,
+  parseActiveDocumentLocation,
   purgeDocumentSession,
   renameDocumentSession,
   touchDocumentSession,
@@ -399,7 +401,12 @@ function LabEditorSession() {
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
+  // Invalid ids still map to the default document; the hash is rewritten in layout
+  // (not during useState init) so React Strict Mode double-init stays correct.
   const [documentId] = useState(() => activeDocumentIdFromLocation());
+  const [openedWithInvalidSessionHash] = useState(
+    () => parseActiveDocumentLocation().hadInvalidSessionHash,
+  );
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
@@ -843,11 +850,11 @@ function LabEditorSession() {
           view.dispatch(closeHistory(view.state.tr.delete(from, from + 1)));
           return true;
         }
-        if (event.key === "Backspace" && (event.metaKey || event.altKey)) {
+        if (event.key === "Backspace" && (event.metaKey || event.altKey || event.ctrlKey)) {
           // Native modified deletion differs between browsers and operating
           // systems. Keep slash-command editing deterministic while the
-          // palette is open: Meta deletes to the start of the text block and
-          // Alt deletes the preceding word.
+          // palette is open: Meta deletes to the start of the text block;
+          // Alt (macOS) and Ctrl (Windows/Linux) delete the preceding word.
           event.preventDefault();
           const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
           const start = event.metaKey
@@ -1016,10 +1023,28 @@ function LabEditorSession() {
     return false;
   }, [persistence]);
 
-  /** Stop accepting edits so the async gap before navigation cannot stage/save more text. */
+  /**
+   * Stop accepting edits so the async gap before navigation cannot stage/save more text.
+   * Disables the editor first, then flushes via dispose. Returns false if the user
+   * declines to switch after a failed final flush (reloads to restore a live controller).
+   */
   const freezePersistenceForNavigation = useCallback(async () => {
     editor?.setEditable(false, false);
-    await persistence.dispose();
+    let flushed = true;
+    try {
+      flushed = await persistence.dispose();
+    } catch {
+      flushed = false;
+    }
+    if (flushed) return true;
+    const switchAnyway = window.confirm(
+      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
+    );
+    if (switchAnyway) return true;
+    setNotice("This note could not be saved before switching sessions.");
+    // dispose() is irreversible; reload restores a live persistence controller.
+    window.location.reload();
+    return false;
   }, [editor, persistence]);
 
   const navigateToSession = useCallback((session: DocumentSession) => {
@@ -1039,7 +1064,7 @@ function LabEditorSession() {
 
   const resumeSession = useCallback(async (session: DocumentSession) => {
     if (!(await flushBeforeSessionSwitch())) return false;
-    await freezePersistenceForNavigation();
+    if (!(await freezePersistenceForNavigation())) return false;
     navigateToSession(session);
     return true;
   }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
@@ -1151,7 +1176,7 @@ function LabEditorSession() {
           if (!(await flushBeforeSessionSwitch())) return;
           // Freeze before the async create gap so keystrokes cannot land on the
           // outgoing session after the last successful flush.
-          await freezePersistenceForNavigation();
+          if (!(await freezePersistenceForNavigation())) return;
           try {
             const session = await createDocumentSession();
             navigateToSession(session);
@@ -1237,11 +1262,23 @@ function LabEditorSession() {
     [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
   );
 
+  // Rewrite a bad `#session=…` so the address bar matches default storage binding.
+  useLayoutEffect(() => {
+    if (openedWithInvalidSessionHash) {
+      clearInvalidDocumentSessionHash();
+    }
+  }, [openedWithInvalidSessionHash]);
+
   // Hash-only history (Back/Forward) updates the URL without remounting React.
   // documentId and vault scope are fixed at mount, so force a full reload when
   // the location's session id diverges from the bound document.
   useEffect(() => {
     const rebindIfSessionChanged = () => {
+      // Invalid hashes must not keep a misleading `#session=…` while bound to default.
+      if (clearInvalidDocumentSessionHash()) {
+        setNotice("That session link was invalid. Opened the original note.");
+        if (documentId === DEFAULT_DOCUMENT_ID) return;
+      }
       const nextId = activeDocumentIdFromLocation();
       if (nextId !== documentId) {
         window.location.reload();
@@ -1267,13 +1304,23 @@ function LabEditorSession() {
     if (!editor) return;
     let active = true;
     void (async () => {
+      // `return` inside try still runs finally — gate so redirect paths never enable the editor.
+      let finishHydration = true;
+      const redirectToOriginalAfterDelete = () => {
+        finishHydration = false;
+        setNotice("This session was deleted. Returning to the original note…");
+        window.history.replaceState(
+          { labDocumentId: DEFAULT_DOCUMENT_ID },
+          "",
+          `${window.location.pathname}${window.location.search}`,
+        );
+        window.location.reload();
+      };
       try {
         await requestPersistentStorage();
         if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
           if (!active) return;
-          setNotice("This session was deleted. Returning to the original note…");
-          window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", `${window.location.pathname}${window.location.search}`);
-          window.location.reload();
+          redirectToOriginalAfterDelete();
           return;
         }
         try {
@@ -1288,21 +1335,31 @@ function LabEditorSession() {
           if (active) setNotice("Session names are unavailable, but this note can still be loaded.");
         }
         const markdown = await persistence.hydrate();
+        // loadLocalDocument can discover an IndexedDB-only tombstone and write the
+        // local marker during hydrate; re-check so we take the same recovery path.
+        if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
+          if (!active) return;
+          redirectToOriginalAfterDelete();
+          return;
+        }
         if (!active) return;
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
         persistence.markLoaded(markdown);
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);
-        setNotice(nextHealth.errors.length > 0
+        const loadNotice = nextHealth.errors.length > 0
           ? "Some local storage locations are unavailable."
           : nextHealth.conflicts > 0
             ? `${nextHealth.conflicts} conflicting local ${nextHealth.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`
-            : null);
+            : openedWithInvalidSessionHash
+              ? "That session link was invalid. Opened the original note."
+              : null;
+        setNotice(loadNotice);
       } catch {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       } finally {
-        if (!active) return;
+        if (!active || !finishHydration) return;
         if (!persistence.getState().loaded) persistence.markLoaded(editor.getMarkdown());
         editor.setEditable(true, false);
         setHydrating(false);
@@ -1313,7 +1370,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, persistence, syncInterface]);
+  }, [documentId, editor, openedWithInvalidSessionHash, persistence, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
