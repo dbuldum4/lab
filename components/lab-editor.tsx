@@ -21,6 +21,7 @@ import {
 import {
   DEFAULT_DOCUMENT_ID,
   inspectLocalStorage,
+  isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
   requestPersistentStorage,
   setLocalDocumentScope,
@@ -31,7 +32,7 @@ import {
   activeDocumentIdFromLocation,
   createDocumentSession,
   documentSessionHash,
-  ensureDocumentSession,
+  getDocumentSession,
   listDocumentSessions,
   purgeDocumentSession,
   renameDocumentSession,
@@ -935,13 +936,21 @@ export function LabEditor() {
       // session switching must remain safe if a custom persistence boundary
       // rejects unexpectedly.
     }
+    // Authority conflicts and replica failures both yield false. Staged recovery
+    // drafts remain available via /recover, so offer an explicit escape hatch.
+    const switchAnyway = window.confirm(
+      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
+    );
+    if (switchAnyway) return true;
     setNotice("This note could not be saved before switching sessions.");
     return false;
   }, [persistence]);
 
   const navigateToSession = useCallback((session: DocumentSession) => {
     const target = `${window.location.pathname}${window.location.search}${documentSessionHash(session.id)}`;
-    window.history.replaceState(null, "", target);
+    // Same-path hash changes often skip a full load. Push then reload so Back
+    // can return to the prior document and the page re-binds documentId.
+    window.history.pushState(null, "", target);
     window.location.reload();
   }, []);
 
@@ -961,15 +970,17 @@ export function LabEditor() {
     try {
       await purgeDocumentSession(documentId);
     } catch {
-      setNotice("This session could not be deleted locally.");
-      editor?.commands.focus();
+      // abandon() is irreversible; reload restores a live persistence controller.
+      setNotice("This session could not be deleted locally. Reloading…");
+      window.location.reload();
       return false;
     }
+    // Replace so Back does not return to the deleted session URL, then reload.
     const target = `${window.location.pathname}${window.location.search}`;
     window.history.replaceState(null, "", target);
     window.location.reload();
     return true;
-  }, [documentId, editor, persistence]);
+  }, [documentId, persistence]);
 
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
@@ -1142,9 +1153,18 @@ export function LabEditor() {
     void (async () => {
       try {
         await requestPersistentStorage();
+        if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
+          if (!active) return;
+          setNotice("This session was deleted. Returning to the original note…");
+          window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+          window.location.reload();
+          return;
+        }
         try {
-          const activeSession = await ensureDocumentSession(documentId);
-          if (active) {
+          // Do not ensure/create metadata for arbitrary hashes — only load existing
+          // names. First durable save (touchDocumentSession) creates the entry.
+          const activeSession = await getDocumentSession(documentId);
+          if (active && activeSession) {
             setSessionName(activeSession.name);
             setSavedSessionName(activeSession.name);
           }

@@ -7,6 +7,7 @@ import {
   deleteDocumentSession,
   documentSessionHash,
   ensureDocumentSession,
+  getDocumentSession,
   listDocumentSessions,
   purgeDocumentSession,
   renameDocumentSession,
@@ -69,6 +70,16 @@ test("sessions are independent, resumable, and rename atomically per id", async 
   assert.equal(sessions.find((session) => session.id === beta.id)?.name, "Beta");
   assert.ok(touched.updatedAt > beforeTouch);
   assert.equal(sessions.find((session) => session.id === alpha.id)?.updatedAt, touched.updatedAt);
+});
+
+test("unknown hashes do not create session metadata until first durable touch", async () => {
+  assert.equal(await getDocumentSession("typoOrSharedId"), null);
+  assert.equal(listDocumentSessions().some((session) => session.id === "typoOrSharedId"), false);
+
+  const created = await touchDocumentSession("typoOrSharedId");
+  assert.equal(created.name, "Untitled");
+  assert.equal((await getDocumentSession("typoOrSharedId"))?.id, "typoOrSharedId");
+  assert.ok(listDocumentSessions().some((session) => session.id === "typoOrSharedId"));
 });
 
 test("delete removes session metadata and activity without deleting the original", async () => {

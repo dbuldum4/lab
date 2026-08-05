@@ -127,6 +127,16 @@ export function documentSessionHash(id: string) {
   return normalized === DEFAULT_DOCUMENT_ID ? "" : `${SESSION_HASH_PREFIX}${encodeURIComponent(normalized)}`;
 }
 
+/** Read session metadata without creating a ghost entry for unknown hashes. */
+export async function getDocumentSession(id: string): Promise<DocumentSession | null> {
+  const normalized = normalizeId(id);
+  return withSessionLock(normalized, () => readSession(normalized));
+}
+
+/**
+ * Return existing metadata, or create it. Prefer getDocumentSession for hydration
+ * of arbitrary URL hashes so typos do not pollute /sessions.
+ */
 export async function ensureDocumentSession(id: string) {
   const normalized = normalizeId(id);
   return withSessionLock(normalized, () => {
@@ -168,7 +178,11 @@ export async function renameDocumentSession(id: string, name: string) {
   });
 }
 
-/** Advance activity metadata without rewriting the session name record. */
+/**
+ * Advance activity metadata without rewriting the session name record.
+ * Creates a session entry on first durable save so unknown hashes only appear
+ * in /sessions after the user has written real content.
+ */
 export async function touchDocumentSession(id: string) {
   const normalized = normalizeId(id);
   return withSessionLock(normalized, () => {
@@ -181,10 +195,18 @@ export async function touchDocumentSession(id: string) {
     } catch {
       throw new Error("Session activity storage is unavailable.");
     }
+    if (!existing) {
+      return writeSession({
+        id: normalized,
+        name: "Untitled",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
     return {
       id: normalized,
-      name: existing?.name ?? "Untitled",
-      createdAt: existing?.createdAt ?? now,
+      name: existing.name,
+      createdAt: existing.createdAt,
       updatedAt: now,
     };
   });

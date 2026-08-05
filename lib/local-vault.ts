@@ -76,15 +76,22 @@ type AuthorityCommitResult = {
 };
 
 const VAULT_LOCK_PREFIX = "lab-private-vault";
+const DELETED_KEY_PREFIX = "lab.document.deleted.v1.";
 
 let vaultQueue: Promise<void> = Promise.resolve();
 let lastIssuedTimestamp = 0;
 let pendingOwner: string | null = null;
 let webLocksUnavailable = false;
 let activeDocumentId = DEFAULT_DOCUMENT_ID;
+/** Bound for the duration of a queued vault operation so key helpers stay on the enqueued scope. */
+let operationDocumentId: string | null = null;
 
 function normalizedDocumentId(documentId: string) {
   return /^[a-zA-Z0-9_-]{1,96}$/.test(documentId) ? documentId : DEFAULT_DOCUMENT_ID;
+}
+
+function currentDocumentId() {
+  return operationDocumentId ?? activeDocumentId;
 }
 
 /** Select the document namespace for this page realm before loading or saving. */
@@ -92,38 +99,63 @@ export function setLocalDocumentScope(documentId: string) {
   const next = normalizedDocumentId(documentId);
   if (next === activeDocumentId) return;
   activeDocumentId = next;
-  vaultQueue = Promise.resolve();
+  // Keep vaultQueue so in-flight work for the previous scope can finish under
+  // its captured operationDocumentId instead of writing into the new namespace.
   lastIssuedTimestamp = 0;
   pendingOwner = null;
-  webLocksUnavailable = false;
+}
+
+function deletedKey(documentId: string) {
+  return `${DELETED_KEY_PREFIX}${normalizedDocumentId(documentId)}`;
+}
+
+/** True when another tab (or this one) has permanently deleted the document. */
+export function isLocalDocumentDeleted(documentId: string = currentDocumentId()) {
+  const storage = getLocalStorage();
+  if (!storage) return false;
+  try {
+    return storage.getItem(deletedKey(documentId)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function markLocalDocumentDeleted(documentId: string) {
+  const storage = getLocalStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(deletedKey(documentId), String(Date.now()));
+  } catch {
+    // Tombstone is best-effort; purge still removes durable replicas.
+  }
 }
 
 function isDefaultDocument() {
-  return activeDocumentId === DEFAULT_DOCUMENT_ID;
+  return currentDocumentId() === DEFAULT_DOCUMENT_ID;
 }
 
 function localSnapshotKey() {
-  return isDefaultDocument() ? LEGACY_LOCAL_KEY : `lab.document.v2.${activeDocumentId}`;
+  return isDefaultDocument() ? LEGACY_LOCAL_KEY : `lab.document.v2.${currentDocumentId()}`;
 }
 
 function legacyPendingKey() {
-  return isDefaultDocument() ? LEGACY_PENDING_KEY : `lab.document.pending.v1.${activeDocumentId}`;
+  return isDefaultDocument() ? LEGACY_PENDING_KEY : `lab.document.pending.v1.${currentDocumentId()}`;
 }
 
 function pendingKeyPrefix() {
-  return isDefaultDocument() ? LEGACY_PENDING_KEY_PREFIX : `lab.document.pending.scoped.v2.${activeDocumentId}.`;
+  return isDefaultDocument() ? LEGACY_PENDING_KEY_PREFIX : `lab.document.pending.scoped.v2.${currentDocumentId()}.`;
 }
 
 function authorityKey() {
-  return isDefaultDocument() ? LEGACY_AUTHORITY_KEY : `authority:${activeDocumentId}`;
+  return isDefaultDocument() ? LEGACY_AUTHORITY_KEY : `authority:${currentDocumentId()}`;
 }
 
 function currentKey() {
-  return isDefaultDocument() ? LEGACY_CURRENT_KEY : `current:${activeDocumentId}`;
+  return isDefaultDocument() ? LEGACY_CURRENT_KEY : `current:${currentDocumentId()}`;
 }
 
 function opfsFile() {
-  return isDefaultDocument() ? LEGACY_OPFS_FILE : `lab.${activeDocumentId}.md.snapshot`;
+  return isDefaultDocument() ? LEGACY_OPFS_FILE : `lab.${currentDocumentId()}.md.snapshot`;
 }
 
 function getLocalStorage(): Storage | null {
@@ -168,14 +200,14 @@ function isBrowserContext() {
   return typeof window !== "undefined";
 }
 
-async function withVaultLock<T>(operation: () => Promise<T>) {
+async function withVaultLock<T>(documentId: string, operation: () => Promise<T>) {
   const browserNavigator = typeof navigator === "undefined" ? undefined : navigator;
   const locks = browserNavigator?.locks;
   if (!locks || typeof locks.request !== "function") return operation();
 
   let operationStarted = false;
   try {
-    return await locks.request(`${VAULT_LOCK_PREFIX}:${activeDocumentId}`, { mode: "exclusive" }, () => {
+    return await locks.request(`${VAULT_LOCK_PREFIX}:${documentId}`, { mode: "exclusive" }, () => {
       operationStarted = true;
       return operation();
     });
@@ -190,8 +222,26 @@ async function withVaultLock<T>(operation: () => Promise<T>) {
   }
 }
 
-function serializeVaultOperation<T>(operation: () => Promise<T>): Promise<T> {
-  const result = vaultQueue.then(() => withVaultLock(operation), () => withVaultLock(operation));
+async function runWithDocumentScope<T>(documentId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = operationDocumentId;
+  operationDocumentId = documentId;
+  try {
+    return await withVaultLock(documentId, operation);
+  } finally {
+    operationDocumentId = previous;
+  }
+}
+
+/**
+ * Serialize vault work. Captures the active document id at enqueue time so a
+ * concurrent setLocalDocumentScope cannot redirect in-flight key helpers.
+ */
+function serializeVaultOperation<T>(operation: () => Promise<T>, documentId: string = activeDocumentId): Promise<T> {
+  const scope = normalizedDocumentId(documentId);
+  const result = vaultQueue.then(
+    () => runWithDocumentScope(scope, operation),
+    () => runWithDocumentScope(scope, operation),
+  );
   // Keep the queue usable if an operation fails, while returning its error to its caller.
   vaultQueue = result.then(() => undefined, () => undefined);
   return result;
@@ -691,6 +741,7 @@ function clearPendingDocument(expected: PendingDocument | null = null) {
  * This gives pagehide/unload a local recovery point even if async storage writes are cut short.
  */
 export function stageLocalDocument(markdown: string) {
+  if (isLocalDocumentDeleted()) return false;
   const storage = getLocalStorage();
   if (!storage) return false;
   const updatedAt = issueTimestamp();
@@ -1029,6 +1080,8 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
 
 export function loadLocalDocument() {
   return serializeVaultOperation(async () => {
+    if (isLocalDocumentDeleted()) return "";
+
     const reads = await readSnapshots();
     const pendingDocuments = readPendingDocuments();
     const pendingDocument = currentPendingDocument(pendingDocuments);
@@ -1104,6 +1157,11 @@ export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
 
 export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
   return serializeVaultOperation(async () => {
+    if (isLocalDocumentDeleted()) {
+      const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
+      return { ...health, saved: false };
+    }
+
     const pending = readPendingDocument();
     const pendingRead = await readPendingSnapshot(pending);
     const trustedPending = pendingRead.snapshot ? pending : null;
@@ -1191,60 +1249,61 @@ export function inspectLocalStorage(): Promise<StorageHealth> {
 
 /**
  * Permanently remove durable and staged storage for a non-default document.
- * Restores the previously active document scope when finished.
+ * Writes a tombstone first so peer tabs cannot recreate content after purge.
+ * Operates on the target id without mutating the caller's active document scope.
  */
 export async function deleteLocalDocument(documentId: string) {
   const normalized = normalizedDocumentId(documentId);
   if (normalized === DEFAULT_DOCUMENT_ID) {
     throw new Error("The original session cannot be deleted.");
   }
-  const previous = activeDocumentId;
-  setLocalDocumentScope(normalized);
-  try {
-    await serializeVaultOperation(async () => {
-      const local = getLocalStorage();
-      if (local) {
-        try {
-          local.removeItem(localSnapshotKey());
-          local.removeItem(legacyPendingKey());
-          const keys: string[] = [];
-          for (let index = 0; index < local.length; index += 1) {
-            const key = local.key(index);
-            if (key?.startsWith(pendingKeyPrefix())) keys.push(key);
-          }
-          for (const key of keys) local.removeItem(key);
-        } catch {
-          throw new Error("Could not delete localStorage copies for this session.");
-        }
-      }
+  // Publish the tombstone before any async purge so concurrent saves observe it.
+  markLocalDocumentDeleted(normalized);
 
-      if (hasIndexedDb()) {
-        const db = await openDatabase();
-        try {
-          await new Promise<void>((resolve, reject) => {
-            const transaction = db.transaction(STORE_NAME, "readwrite");
-            const store = transaction.objectStore(STORE_NAME);
-            store.delete(authorityKey());
-            store.delete(currentKey());
-            transaction.oncomplete = () => resolve();
-            transaction.onerror = () => reject(transaction.error ?? new Error("Could not delete IndexedDB records."));
-            transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB delete was aborted."));
-          });
-        } finally {
-          db.close();
-        }
-      }
+  await serializeVaultOperation(async () => {
+    // Re-assert tombstone under the vault lock in case a peer cleared storage mid-flight.
+    markLocalDocumentDeleted(normalized);
 
+    const local = getLocalStorage();
+    if (local) {
       try {
-        const root = await opfsRoot();
-        if (root) await root.removeEntry(opfsFile());
-      } catch (error) {
-        if (!isNotFound(error)) throw error;
+        local.removeItem(localSnapshotKey());
+        local.removeItem(legacyPendingKey());
+        const keys: string[] = [];
+        for (let index = 0; index < local.length; index += 1) {
+          const key = local.key(index);
+          if (key?.startsWith(pendingKeyPrefix())) keys.push(key);
+        }
+        for (const key of keys) local.removeItem(key);
+      } catch {
+        throw new Error("Could not delete localStorage copies for this session.");
       }
-    });
-  } finally {
-    setLocalDocumentScope(previous);
-  }
+    }
+
+    if (hasIndexedDb()) {
+      const db = await openDatabase();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const transaction = db.transaction(STORE_NAME, "readwrite");
+          const store = transaction.objectStore(STORE_NAME);
+          store.delete(authorityKey());
+          store.delete(currentKey());
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error ?? new Error("Could not delete IndexedDB records."));
+          transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB delete was aborted."));
+        });
+      } finally {
+        db.close();
+      }
+    }
+
+    try {
+      const root = await opfsRoot();
+      if (root) await root.removeEntry(opfsFile());
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+    }
+  }, normalized);
 }
 
 /** Reset process-local sequencing state between isolated storage contract tests. */
@@ -1254,4 +1313,5 @@ export function resetLocalVaultStateForTests() {
   pendingOwner = null;
   webLocksUnavailable = false;
   activeDocumentId = DEFAULT_DOCUMENT_ID;
+  operationDocumentId = null;
 }

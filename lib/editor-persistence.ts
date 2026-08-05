@@ -44,6 +44,10 @@ export type EditorPersistenceController = {
   };
 };
 
+function isDeletedSessionFailure(health: StorageHealth) {
+  return health.errors.some((error) => error.includes("deleted in another tab"));
+}
+
 function isAuthorityFailure(health: StorageHealth) {
   return health.errors.some((error) => (
     error.includes("authority")
@@ -99,6 +103,10 @@ export function createEditorPersistenceController(
       dependencies.onNotice?.(savedHealthNotice(health));
       return;
     }
+    if (isDeletedSessionFailure(health)) {
+      dependencies.onNotice?.("This session was deleted in another tab. Export a copy if you still need this text.");
+      return;
+    }
     dependencies.onNotice?.(isAuthorityFailure(health)
       ? "This change could not be saved locally. Please export a copy before closing the page."
       : "A newer local revision is already stored in another tab.");
@@ -136,11 +144,12 @@ export function createEditorPersistenceController(
 
     // An edit can arrive while an async save is in flight. Keep flushing until
     // the revision observed at the end is the revision that was persisted.
-    while (editRevision > persistedRevision) {
+    while (!disposed && editRevision > persistedRevision) {
       const revision = editRevision;
       const saved = saveInFlight?.revision === revision
         ? await saveInFlight.promise
         : await saveRevision(latestMarkdown, revision);
+      if (disposed) return true;
       if (!saved) return false;
     }
     return true;
@@ -191,10 +200,17 @@ export function createEditorPersistenceController(
 
     async dispose() {
       if (disposed) return;
-      const pending = flush();
-      disposed = true;
-      loaded = false;
-      await pending;
+      // Await flush while still accepting in-flight completion so saveRevision can
+      // advance persistedRevision. Setting disposed first made flush hang forever:
+      // saveRevision returned true without updating persistedRevision while the
+      // loop kept waiting for editRevision > persistedRevision.
+      try {
+        await flush();
+      } finally {
+        clearTimer();
+        disposed = true;
+        loaded = false;
+      }
     },
 
     inspect,

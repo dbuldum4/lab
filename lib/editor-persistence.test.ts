@@ -211,6 +211,56 @@ test("abandon waits for an in-flight save then blocks further durable writes", a
   assert.equal(saveCalls, 1);
 });
 
+test("dispose flushes pending edits then stops accepting work without hanging", async () => {
+  let resolveSave: ((result: StorageHealth) => void) | undefined;
+  let saveCalls = 0;
+  let savedMarkdown: string | undefined;
+  const state = dependencies({
+    save: (markdown) => {
+      saveCalls += 1;
+      savedMarkdown = markdown;
+      return new Promise<StorageHealth>((resolve) => { resolveSave = resolve; });
+    },
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("keep me");
+  state.scheduler.fireNext();
+  await Promise.resolve();
+  assert.equal(controller.getState().saveInFlightRevision, 1);
+  assert.equal(saveCalls, 1);
+
+  let disposeResolved = false;
+  const disposed = controller.dispose().then(() => { disposeResolved = true; });
+  await Promise.resolve();
+  assert.equal(disposeResolved, false);
+
+  resolveSave?.(health(true));
+  await disposed;
+  assert.equal(disposeResolved, true);
+  assert.equal(controller.getState().loaded, false);
+  assert.equal(controller.getState().persistedRevision, 1);
+  assert.equal(savedMarkdown, "keep me");
+  assert.equal(controller.onEdit("after dispose"), 1);
+  assert.equal(state.scheduler.pending, 0);
+  assert.equal(saveCalls, 1);
+});
+
+test("dispose with only a debounced edit persists it before becoming inert", async () => {
+  const state = dependencies();
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("debounced");
+  assert.equal(state.scheduler.pending, 1);
+
+  await controller.dispose();
+  assert.deepEqual(state.saved, ["debounced"]);
+  assert.equal(controller.getState().loaded, false);
+  assert.equal(controller.getState().persistedRevision, 1);
+  assert.equal(controller.onEdit("too late"), 1);
+  assert.equal(state.scheduler.pending, 0);
+});
+
 test("save outcomes distinguish conflict, degraded replicas, recovery drafts, and authority failure", async () => {
   const notices: string[] = [];
   let result: StorageHealth = health(false);

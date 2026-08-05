@@ -5,6 +5,7 @@ import {
   compareSnapshotOrder,
   deleteLocalDocument,
   inspectLocalStorage,
+  isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
   loadLocalDocument,
   resetLocalVaultStateForTests,
@@ -993,8 +994,11 @@ test("deleteLocalDocument purges scoped replicas and refuses the original sessio
   // Scope must remain the caller's document after purging another session.
   assert.equal(await loadLocalDocument(), "keep original");
   assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+  assert.equal(isLocalDocumentDeleted("alpha"), true);
   assert.equal(
-    [...environment.local.values.keys()].some((key) => key.includes("alpha")),
+    [...environment.local.values.keys()].some((key) => (
+      key.includes("alpha") && !key.startsWith("lab.document.deleted.v1.")
+    )),
     false,
   );
   assert.equal(environment.idb?.read("authority:alpha"), undefined);
@@ -1003,8 +1007,30 @@ test("deleteLocalDocument purges scoped replicas and refuses the original sessio
 
   setLocalDocumentScope("alpha");
   assert.equal(await loadLocalDocument(), "");
+  // Peer-tab style rewrite after delete must not resurrect content.
+  assert.equal(stageLocalDocument("resurrect me"), false);
+  const revived = await saveLocalDocument("resurrect me");
+  assert.equal(revived.saved, false);
+  assert.ok(revived.errors.some((error) => /deleted in another tab/i.test(error)));
+  assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+
   setLocalDocumentScope("default");
   assert.equal(await loadLocalDocument(), "keep original");
 
   await assert.rejects(() => deleteLocalDocument("default"), /original session cannot be deleted/i);
+});
+
+test("deleteLocalDocument does not redirect the caller's active scope mid-flight", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  setLocalDocumentScope("default");
+  assert.equal((await saveLocalDocument("original")).saved, true);
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("alpha body")).saved, true);
+  setLocalDocumentScope("default");
+
+  await deleteLocalDocument("alpha");
+  assert.equal(await loadLocalDocument(), "original");
+  assert.equal((await saveLocalDocument("original still")).saved, true);
+  assert.equal(await loadLocalDocument(), "original still");
 });
