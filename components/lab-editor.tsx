@@ -418,18 +418,9 @@ function LabEditorSession() {
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
-  // Invalid ids still map to the default document; the hash is rewritten in layout
-  // (not during useState init) so React Strict Mode double-init stays correct.
-  // Vault scope must be bound synchronously at mount so the persistence
-  // controller and first hydrate see the correct namespace. This initializer
-  // runs once on the client (LabEditor is client-gated) and is safe to
-  // perform the scope side effect here — setLocalDocumentScope is idempotent
-  // (guards on activeDocumentId).
-  const [documentId] = useState(() => {
-    const id = activeDocumentIdFromLocation();
-    setLocalDocumentScope(id);
-    return id;
-  });
+  // Invalid ids still map to the default document; the hash is rewritten in
+  // useLayoutEffect below so React StrictMode double init stays correct.
+  const [documentId] = useState(() => activeDocumentIdFromLocation());
   const [openedWithInvalidSessionHash] = useState(
     () => parseActiveDocumentLocation().hadInvalidSessionHash,
   );
@@ -1107,7 +1098,10 @@ function LabEditorSession() {
       setNotice("The original session cannot be deleted. Use /clear to empty it.");
       return false;
     }
-    // Drop debounced writes before purge so a late save cannot revive the session.
+    // Stop accepting edits so keystrokes during the async purge cannot land in
+    // the DOM and be lost when the reload lands. Drop debounced writes first
+    // (abandon) so a late save cannot revive the session.
+    editor?.setEditable(false, false);
     await persistence.abandon();
     try {
       await purgeDocumentSession(documentId);
@@ -1124,7 +1118,7 @@ function LabEditorSession() {
     window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
     window.location.reload();
     return true;
-  }, [documentId, persistence]);
+  }, [documentId, editor, persistence]);
 
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
@@ -1295,6 +1289,14 @@ function LabEditorSession() {
     },
     [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
   );
+
+  // Bind vault scope synchronously once the client hash is known. Layout effects
+  // run before the passive hydration effect, so the persistence controller's
+  // first hydrate() sees the correct namespace. setLocalDocumentScope is
+  // idempotent (guards on activeDocumentId) and StrictMode-safe.
+  useLayoutEffect(() => {
+    setLocalDocumentScope(documentId);
+  }, [documentId]);
 
   // Rewrite a bad `#session=…` so the address bar matches default storage binding.
   useLayoutEffect(() => {
