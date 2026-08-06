@@ -1,12 +1,13 @@
-const LOCAL_KEY = "lab.document.v1";
-const PENDING_KEY = "lab.document.pending.v1";
-const PENDING_KEY_PREFIX = "lab.document.pending.v2.";
+export const DEFAULT_DOCUMENT_ID = "default";
+const LEGACY_LOCAL_KEY = "lab.document.v1";
+const LEGACY_PENDING_KEY = "lab.document.pending.v1";
+const LEGACY_PENDING_KEY_PREFIX = "lab.document.pending.v2.";
 const DB_NAME = "lab-private-vault";
 const STORE_NAME = "documents";
-const OPFS_FILE = "lab.md.snapshot";
+const LEGACY_OPFS_FILE = "lab.md.snapshot";
 const DB_VERSION = 2;
-const AUTHORITY_KEY = "authority";
-const CURRENT_KEY = "current";
+const LEGACY_AUTHORITY_KEY = "authority";
+const LEGACY_CURRENT_KEY = "current";
 const MAX_RECOVERY_DRAFTS = 8;
 
 export type LocalSnapshot = {
@@ -72,14 +73,139 @@ type AuthorityCommitResult = {
   changed: boolean;
   revision: number;
   rawSnapshot: LocalSnapshot | null;
+  /** True when a durable deletion marker blocked the commit. */
+  rejectedBecauseDeleted?: boolean;
 };
 
-const VAULT_LOCK = "lab-private-vault";
+type DeletedRecord = {
+  recordVersion: 1;
+  deletedAt: number;
+};
+
+const VAULT_LOCK_PREFIX = "lab-private-vault";
+const DELETED_KEY_PREFIX = "lab.document.deleted.v1.";
 
 let vaultQueue: Promise<void> = Promise.resolve();
 let lastIssuedTimestamp = 0;
 let pendingOwner: string | null = null;
 let webLocksUnavailable = false;
+let activeDocumentId = DEFAULT_DOCUMENT_ID;
+/** Bound for the duration of a queued vault operation so key helpers stay on the enqueued scope. */
+let operationDocumentId: string | null = null;
+/** Process-local tombstones so stage/save refuse even if localStorage setItem fails after IDB delete. */
+const deletedDocuments = new Set<string>();
+
+function normalizedDocumentId(documentId: string) {
+  return /^[a-zA-Z0-9_-]{1,96}$/.test(documentId) ? documentId : DEFAULT_DOCUMENT_ID;
+}
+
+function currentDocumentId() {
+  return operationDocumentId ?? activeDocumentId;
+}
+
+/** Select the document namespace for this page realm before loading or saving. */
+export function setLocalDocumentScope(documentId: string) {
+  const next = normalizedDocumentId(documentId);
+  if (next === activeDocumentId) return;
+  activeDocumentId = next;
+  // Keep vaultQueue so in-flight work for the previous scope can finish under
+  // its captured operationDocumentId instead of writing into the new namespace.
+  lastIssuedTimestamp = 0;
+  pendingOwner = null;
+}
+
+function deletedKey(documentId: string) {
+  return `${DELETED_KEY_PREFIX}${normalizedDocumentId(documentId)}`;
+}
+
+function deletedIdbKey(documentId: string = currentDocumentId()) {
+  return `deleted:${normalizedDocumentId(documentId)}`;
+}
+
+function isDeletedRecord(value: unknown): value is DeletedRecord {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<DeletedRecord>;
+  return candidate.recordVersion === 1 && Number.isFinite(candidate.deletedAt);
+}
+
+/** True when another tab (or this one) has permanently deleted the document. */
+export function isLocalDocumentDeleted(documentId: string = currentDocumentId()) {
+  const id = normalizedDocumentId(documentId);
+  if (deletedDocuments.has(id)) return true;
+  const storage = getLocalStorage();
+  if (!storage) return false;
+  try {
+    return storage.getItem(deletedKey(id)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** Persist a sync localStorage tombstone. Returns false when the marker could not be written. */
+function writeLocalTombstone(documentId: string, deletedAt: number = Date.now()): boolean {
+  const id = normalizedDocumentId(documentId);
+  deletedDocuments.add(id);
+  const storage = getLocalStorage();
+  if (!storage) return false;
+  try {
+    storage.setItem(deletedKey(id), String(deletedAt));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearLocalTombstone(documentId: string) {
+  const id = normalizedDocumentId(documentId);
+  deletedDocuments.delete(id);
+  const storage = getLocalStorage();
+  if (!storage) return;
+  try {
+    storage.removeItem(deletedKey(id));
+  } catch {
+    // Best-effort rollback when a delete aborts before completion.
+  }
+}
+
+function isDefaultDocument(documentId: string = currentDocumentId()) {
+  return normalizedDocumentId(documentId) === DEFAULT_DOCUMENT_ID;
+}
+
+function localSnapshotKey() {
+  return isDefaultDocument() ? LEGACY_LOCAL_KEY : `lab.document.v2.${currentDocumentId()}`;
+}
+
+function legacyPendingKey() {
+  return isDefaultDocument() ? LEGACY_PENDING_KEY : `lab.document.pending.v1.${currentDocumentId()}`;
+}
+
+function pendingKeyPrefix() {
+  return isDefaultDocument() ? LEGACY_PENDING_KEY_PREFIX : `lab.document.pending.scoped.v2.${currentDocumentId()}.`;
+}
+
+/** IndexedDB authority key for an explicit document id (no ambient scope). */
+function authorityKeyFor(documentId: string) {
+  const id = normalizedDocumentId(documentId);
+  return isDefaultDocument(id) ? LEGACY_AUTHORITY_KEY : `authority:${id}`;
+}
+
+/** IndexedDB current-snapshot key for an explicit document id (no ambient scope). */
+function currentKeyFor(documentId: string) {
+  const id = normalizedDocumentId(documentId);
+  return isDefaultDocument(id) ? LEGACY_CURRENT_KEY : `current:${id}`;
+}
+
+function authorityKey() {
+  return authorityKeyFor(currentDocumentId());
+}
+
+function currentKey() {
+  return currentKeyFor(currentDocumentId());
+}
+
+function opfsFile() {
+  return isDefaultDocument() ? LEGACY_OPFS_FILE : `lab.${currentDocumentId()}.md.snapshot`;
+}
 
 function getLocalStorage(): Storage | null {
   // Accessing the global property itself can throw SecurityError in privacy
@@ -96,9 +222,9 @@ function pendingStorageKey() {
   // provide that guarantee because auxiliary and duplicated tabs can inherit a
   // copy of the opener's values. Reload recovery still works because load scans
   // every namespaced pending record before this page creates its next draft.
-  if (!isBrowserContext()) return PENDING_KEY;
+  if (!isBrowserContext()) return legacyPendingKey();
   pendingOwner ??= globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-  return `${PENDING_KEY_PREFIX}${pendingOwner}`;
+  return `${pendingKeyPrefix()}${pendingOwner}`;
 }
 
 function hasIndexedDb() {
@@ -123,14 +249,14 @@ function isBrowserContext() {
   return typeof window !== "undefined";
 }
 
-async function withVaultLock<T>(operation: () => Promise<T>) {
+async function withVaultLock<T>(documentId: string, operation: () => Promise<T>) {
   const browserNavigator = typeof navigator === "undefined" ? undefined : navigator;
   const locks = browserNavigator?.locks;
   if (!locks || typeof locks.request !== "function") return operation();
 
   let operationStarted = false;
   try {
-    return await locks.request(VAULT_LOCK, { mode: "exclusive" }, () => {
+    return await locks.request(`${VAULT_LOCK_PREFIX}:${documentId}`, { mode: "exclusive" }, () => {
       operationStarted = true;
       return operation();
     });
@@ -145,8 +271,26 @@ async function withVaultLock<T>(operation: () => Promise<T>) {
   }
 }
 
-function serializeVaultOperation<T>(operation: () => Promise<T>): Promise<T> {
-  const result = vaultQueue.then(() => withVaultLock(operation), () => withVaultLock(operation));
+async function runWithDocumentScope<T>(documentId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = operationDocumentId;
+  operationDocumentId = documentId;
+  try {
+    return await withVaultLock(documentId, operation);
+  } finally {
+    operationDocumentId = previous;
+  }
+}
+
+/**
+ * Serialize vault work. Captures the active document id at enqueue time so a
+ * concurrent setLocalDocumentScope cannot redirect in-flight key helpers.
+ */
+function serializeVaultOperation<T>(operation: () => Promise<T>, documentId: string = activeDocumentId): Promise<T> {
+  const scope = normalizedDocumentId(documentId);
+  const result = vaultQueue.then(
+    () => runWithDocumentScope(scope, operation),
+    () => runWithDocumentScope(scope, operation),
+  );
   // Keep the queue usable if an operation fails, while returning its error to its caller.
   vaultQueue = result.then(() => undefined, () => undefined);
   return result;
@@ -291,6 +435,7 @@ function openDatabase() {
 type IndexedDbRawState = {
   authority: unknown;
   current: unknown;
+  deleted: unknown;
 };
 
 async function readIndexedDbRawState(): Promise<IndexedDbRawState> {
@@ -301,23 +446,64 @@ async function readIndexedDbRawState(): Promise<IndexedDbRawState> {
       const store = transaction.objectStore(STORE_NAME);
       let authority: unknown;
       let current: unknown;
-      const authorityRequest = store.get(AUTHORITY_KEY);
+      let deleted: unknown;
+      const authorityRequest = store.get(authorityKey());
       authorityRequest.onsuccess = () => {
         authority = authorityRequest.result;
       };
       authorityRequest.onerror = () => reject(authorityRequest.error ?? new Error("Could not read IndexedDB."));
-      const currentRequest = store.get(CURRENT_KEY);
+      const currentRequest = store.get(currentKey());
       currentRequest.onsuccess = () => {
         current = currentRequest.result;
       };
       currentRequest.onerror = () => reject(currentRequest.error ?? new Error("Could not read IndexedDB."));
-      transaction.oncomplete = () => resolve({ authority, current });
+      const deletedRequest = store.get(deletedIdbKey());
+      deletedRequest.onsuccess = () => {
+        deleted = deletedRequest.result;
+      };
+      deletedRequest.onerror = () => reject(deletedRequest.error ?? new Error("Could not read IndexedDB deletion marker."));
+      transaction.oncomplete = () => resolve({ authority, current, deleted });
       transaction.onerror = () => reject(transaction.error ?? new Error("Could not read IndexedDB."));
       transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB read was aborted."));
     });
   } finally {
     db.close();
   }
+}
+
+/**
+ * Refresh process-local + localStorage tombstones from the durable IndexedDB marker.
+ * Must run under the target document's vault scope (operationDocumentId / active scope).
+ */
+async function refreshDeletedFromIndexedDb(): Promise<boolean> {
+  const id = currentDocumentId();
+  if (isLocalDocumentDeleted(id)) return true;
+  if (!hasIndexedDb()) return false;
+  try {
+    const raw = await readIndexedDbRawState();
+    if (!isDeletedRecord(raw.deleted)) return false;
+    writeLocalTombstone(id, raw.deleted.deletedAt);
+    return true;
+  } catch {
+    return isLocalDocumentDeleted(id);
+  }
+}
+
+/**
+ * Throw when the document has a local or durable deletion marker.
+ * Uses the vault queue so IndexedDB tombstones are visible across tabs.
+ */
+export async function ensureDocumentNotDeleted(documentId: string) {
+  const id = normalizedDocumentId(documentId);
+  if (id === DEFAULT_DOCUMENT_ID) return;
+  if (isLocalDocumentDeleted(id)) {
+    throw new Error("This session was deleted.");
+  }
+  await serializeVaultOperation(async () => {
+    if (await refreshDeletedFromIndexedDb()) {
+      throw new Error("This session was deleted.");
+    }
+  }, id);
 }
 
 function authorityRecord(value: unknown): AuthorityRecord | null {
@@ -355,6 +541,10 @@ async function readIndexedDb(): Promise<LocalSnapshot | null> {
  */
 async function repairCorruptIndexedDbAuthority(fallback: CanonicalSnapshot) {
   const raw = await readIndexedDbRawState();
+  if (isDeletedRecord(raw.deleted)) {
+    writeLocalTombstone(currentDocumentId(), raw.deleted.deletedAt);
+    return;
+  }
   const authority = authorityRecord(raw.authority);
   if (!authority || await normalizeSnapshot(authority.snapshot)) return;
   const current = await normalizeSnapshot(raw.current);
@@ -364,14 +554,14 @@ async function repairCorruptIndexedDbAuthority(fallback: CanonicalSnapshot) {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction(STORE_NAME, "readwrite");
       const store = transaction.objectStore(STORE_NAME);
-      const request = store.get(AUTHORITY_KEY);
+      const request = store.get(authorityKey());
       request.onsuccess = () => {
         const latest = authorityRecord(request.result);
         if (latest
           && latest.revision === authority.revision
           && sameSnapshot(latest.snapshot, authority.snapshot)) {
-          store.put({ recordVersion: 1, revision: latest.revision + 1, snapshot: replacement } satisfies AuthorityRecord, AUTHORITY_KEY);
-          store.put(replacement, CURRENT_KEY);
+          store.put({ recordVersion: 1, revision: latest.revision + 1, snapshot: replacement } satisfies AuthorityRecord, authorityKey());
+          store.put(replacement, currentKey());
         }
       };
       request.onerror = () => reject(request.error ?? new Error("Could not read IndexedDB authority."));
@@ -412,18 +602,31 @@ async function commitIndexedDbOnce(
       const store = transaction.objectStore(STORE_NAME);
       let authorityRaw: unknown;
       let currentRaw: unknown;
+      let deletedRaw: unknown;
       let authorityDone = false;
       let currentDone = false;
+      let deletedDone = false;
       let decisionMade = false;
       let result: AuthorityCommitResult | null = null;
       const finish = () => {
-        if (!authorityDone || !currentDone || decisionMade) return;
+        if (!authorityDone || !currentDone || !deletedDone || decisionMade) return;
         decisionMade = true;
         // SHA-256 verification is asynchronous, so it happens before this
         // transaction. If either record changed since that verification, retry
         // from a fresh observation rather than trusting an unverified value.
         if (!sameRawValue(authorityRaw, observed.authority)
-          || !sameRawValue(currentRaw, observed.current)) return;
+          || !sameRawValue(currentRaw, observed.current)
+          || !sameRawValue(deletedRaw, observed.deleted)) return;
+        if (isDeletedRecord(deletedRaw)) {
+          result = {
+            accepted: false,
+            changed: false,
+            revision,
+            rawSnapshot: null,
+            rejectedBecauseDeleted: true,
+          };
+          return;
+        }
         if (!isLegacyMigration && !shouldAcceptSnapshot(existing, candidate)) {
           result = { accepted: false, changed: false, revision, rawSnapshot: existing };
           return;
@@ -433,24 +636,31 @@ async function commitIndexedDbOnce(
           return;
         }
         const nextRevision = revision + 1;
-        store.put({ recordVersion: 1, revision: nextRevision, snapshot: candidate } satisfies AuthorityRecord, AUTHORITY_KEY);
-        store.put(candidate, CURRENT_KEY);
+        store.put({ recordVersion: 1, revision: nextRevision, snapshot: candidate } satisfies AuthorityRecord, authorityKey());
+        store.put(candidate, currentKey());
         result = { accepted: true, changed: true, revision: nextRevision, rawSnapshot: candidate };
       };
-      const authorityRequest = store.get(AUTHORITY_KEY);
+      const authorityRequest = store.get(authorityKey());
       authorityRequest.onsuccess = () => {
         authorityRaw = authorityRequest.result;
         authorityDone = true;
         finish();
       };
       authorityRequest.onerror = () => reject(authorityRequest.error ?? new Error("Could not read IndexedDB authority."));
-      const currentRequest = store.get(CURRENT_KEY);
+      const currentRequest = store.get(currentKey());
       currentRequest.onsuccess = () => {
         currentRaw = currentRequest.result;
         currentDone = true;
         finish();
       };
       currentRequest.onerror = () => reject(currentRequest.error ?? new Error("Could not read IndexedDB current snapshot."));
+      const deletedRequest = store.get(deletedIdbKey());
+      deletedRequest.onsuccess = () => {
+        deletedRaw = deletedRequest.result;
+        deletedDone = true;
+        finish();
+      };
+      deletedRequest.onerror = () => reject(deletedRequest.error ?? new Error("Could not read IndexedDB deletion marker."));
       transaction.oncomplete = () => resolve(result);
       transaction.onerror = () => reject(transaction.error ?? new Error("Could not commit IndexedDB authority."));
       transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB authority commit was aborted."));
@@ -463,6 +673,16 @@ async function commitIndexedDbOnce(
 async function commitIndexedDb(candidate: CanonicalSnapshot): Promise<AuthorityCommitResult> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const observed = await readIndexedDbRawState();
+    if (isDeletedRecord(observed.deleted)) {
+      writeLocalTombstone(currentDocumentId(), observed.deleted.deletedAt);
+      return {
+        accepted: false,
+        changed: false,
+        revision: 0,
+        rawSnapshot: null,
+        rejectedBecauseDeleted: true,
+      };
+    }
     const authority = authorityRecord(observed.authority);
     const [verifiedAuthority, verifiedCurrent] = await Promise.all([
       normalizeSnapshot(authority?.snapshot),
@@ -495,6 +715,53 @@ async function commitIndexedDb(candidate: CanonicalSnapshot): Promise<AuthorityC
   throw new Error("IndexedDB authority changed during commit.");
 }
 
+/**
+ * Atomically record deletion and drop authority/current rows for this document.
+ * IndexedDB transaction order is the cross-tab barrier when Web Locks are missing.
+ */
+async function commitIndexedDbDeletion(documentId: string, deletedAt: number) {
+  const id = normalizedDocumentId(documentId);
+  // All keys are derived from `id` so this never depends on ambient vault scope.
+  const db = await openDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, "readwrite");
+      const store = transaction.objectStore(STORE_NAME);
+      store.put({ recordVersion: 1, deletedAt } satisfies DeletedRecord, deletedIdbKey(id));
+      store.delete(authorityKeyFor(id));
+      store.delete(currentKeyFor(id));
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error ?? new Error("Could not record IndexedDB deletion."));
+      transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB deletion was aborted."));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+function purgeLocalReplicas() {
+  const local = getLocalStorage();
+  if (!local) return;
+  local.removeItem(localSnapshotKey());
+  local.removeItem(legacyPendingKey());
+  const keys: string[] = [];
+  for (let index = 0; index < local.length; index += 1) {
+    const key = local.key(index);
+    if (key?.startsWith(pendingKeyPrefix())) keys.push(key);
+  }
+  for (const key of keys) local.removeItem(key);
+}
+
+async function purgeOpfsReplica() {
+  const root = await opfsRoot();
+  if (!root) return;
+  try {
+    await root.removeEntry(opfsFile());
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+  }
+}
+
 type StorageManagerWithDirectory = StorageManager & {
   getDirectory?: () => Promise<FileSystemDirectoryHandle>;
 };
@@ -514,7 +781,7 @@ async function readOpfs(): Promise<LocalSnapshot | null> {
   const root = await opfsRoot();
   if (!root) return null;
   try {
-    const handle = await root.getFileHandle(OPFS_FILE);
+    const handle = await root.getFileHandle(opfsFile());
     const file = await handle.getFile();
     return JSON.parse(await file.text()) as LocalSnapshot;
   } catch (error) {
@@ -526,7 +793,7 @@ async function readOpfs(): Promise<LocalSnapshot | null> {
 async function writeOpfs(snapshot: CanonicalSnapshot) {
   const root = await opfsRoot();
   if (!root) throw new Error("The browser file system is unavailable.");
-  const handle = await root.getFileHandle(OPFS_FILE, { create: true });
+  const handle = await root.getFileHandle(opfsFile(), { create: true });
   const writer = await handle.createWritable();
   try {
     await writer.write(JSON.stringify(snapshot));
@@ -540,7 +807,7 @@ function readLocalStorage(): LocalSnapshot | null {
   if (!storage) throw new Error("localStorage is unavailable.");
   let value: string | null;
   try {
-    value = storage.getItem(LOCAL_KEY);
+    value = storage.getItem(localSnapshotKey());
   } catch {
     throw new Error("localStorage is unavailable.");
   }
@@ -557,18 +824,18 @@ async function writeLocalStorage(snapshot: CanonicalSnapshot) {
   const storage = getLocalStorage();
   if (!storage) throw new Error("localStorage is unavailable.");
   try {
-    storage.setItem(LOCAL_KEY, JSON.stringify(snapshot));
+    storage.setItem(localSnapshotKey(), JSON.stringify(snapshot));
   } catch {
     throw new Error("Could not write localStorage.");
   }
 }
 
 function pendingDocumentsFromStorage(storage: Storage, currentKey: string) {
-  const keys = new Set<string>([currentKey, PENDING_KEY]);
+  const keys = new Set<string>([currentKey, legacyPendingKey()]);
   try {
     for (let index = 0; index < storage.length; index += 1) {
       const key = storage.key(index);
-      if (key === PENDING_KEY || key?.startsWith(PENDING_KEY_PREFIX)) keys.add(key);
+      if (key === legacyPendingKey() || key?.startsWith(pendingKeyPrefix())) keys.add(key);
     }
   } catch {
     // A storage implementation may expose neither enumeration nor all keys.
@@ -610,7 +877,7 @@ function readPendingDocuments(): PendingDocument[] {
 function currentPendingDocument(documents: readonly PendingDocument[]) {
   const currentKey = pendingStorageKey();
   return documents.find((document) => document.storageKey === currentKey)
-    ?? documents.find((document) => document.storageKey === PENDING_KEY)
+    ?? documents.find((document) => document.storageKey === legacyPendingKey())
     ?? null;
 }
 
@@ -644,8 +911,14 @@ function clearPendingDocument(expected: PendingDocument | null = null) {
 /**
  * Stage the newest editor value synchronously before the debounced replica write.
  * This gives pagehide/unload a local recovery point even if async storage writes are cut short.
+ * Synchronous by design: IndexedDB tombstones are promoted to localStorage/memory
+ * asynchronously via refreshDeletedFromIndexedDb() in load/save paths. A peer
+ * delete that exists only in IndexedDB may still stage once before the next
+ * async vault operation; the subsequent save will then fail with saved:false
+ * and surface the deleted-session notice.
  */
 export function stageLocalDocument(markdown: string) {
+  if (isLocalDocumentDeleted()) return false;
   const storage = getLocalStorage();
   if (!storage) return false;
   const updatedAt = issueTimestamp();
@@ -874,13 +1147,20 @@ async function persistentStorageGranted() {
  * Replica writes happen after the authority commit. The authority check here
  * is only a freshness optimization for replicas; it is not used as a lock or
  * represented as an atomic localStorage/OPFS compare-and-set.
+ *
+ * Without Web Locks, a peer can finish deleteLocalDocument after our authority
+ * commit and before replicas complete. Always re-check the durable deletion
+ * marker so we never repopulate localStorage/OPFS for a deleted document.
  */
 async function writeReplicaIfCurrent(target: StorageTarget, snapshot: CanonicalSnapshot) {
+  if (await refreshDeletedFromIndexedDb()) return false;
   if (hasIndexedDb()) {
     const authority = await readIndexedDb();
     const current = await normalizeSnapshot(authority);
     if (current && !sameSnapshot(current, snapshot) && !shouldAcceptSnapshot(current, snapshot)) return false;
   }
+  // Peer delete can land during the async authority read above.
+  if (await refreshDeletedFromIndexedDb()) return false;
   return writeSnapshotIfNewer(target, snapshot);
 }
 
@@ -984,6 +1264,8 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
 
 export function loadLocalDocument() {
   return serializeVaultOperation(async () => {
+    if (await refreshDeletedFromIndexedDb()) return "";
+
     const reads = await readSnapshots();
     const pendingDocuments = readPendingDocuments();
     const pendingDocument = currentPendingDocument(pendingDocuments);
@@ -1059,6 +1341,11 @@ export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
 
 export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
   return serializeVaultOperation(async () => {
+    if (await refreshDeletedFromIndexedDb()) {
+      const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
+      return { ...health, saved: false };
+    }
+
     const pending = readPendingDocument();
     const pendingRead = await readPendingSnapshot(pending);
     const trustedPending = pendingRead.snapshot ? pending : null;
@@ -1087,6 +1374,10 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
       try {
         await repairCorruptIndexedDbAuthority(snapshot);
         const result = await commitIndexedDb(snapshot);
+        if (result.rejectedBecauseDeleted) {
+          const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
+          return { ...health, saved: false };
+        }
         const normalized = await normalizeSnapshot(result.rawSnapshot);
         if (result.accepted && normalized && sameSnapshot(normalized, snapshot)) {
           candidateSaved = true;
@@ -1105,10 +1396,23 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
     } else if (hasWebLocks() || !isBrowserContext()) {
       // Web Locks serializes this fallback in browsers that provide it. The
       // Node branch is intentionally only for the test/single-context runtime.
+      // Re-check durable/local tombstones before replica writes (no IDB CAS barrier).
+      if (await refreshDeletedFromIndexedDb()) {
+        const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
+        return { ...health, saved: false };
+      }
       candidateSaved = true;
     } else {
       authorityFailed = true;
       extraErrors.push("Cross-tab persistence requires IndexedDB or Web Locks; the candidate was not written.");
+    }
+
+    // Re-read the IndexedDB deletion marker after authority work. A peer tab can
+    // finish deleteLocalDocument between commitIndexedDb acceptance and replica
+    // writes when Web Locks are missing; authority may already be gone.
+    if (await refreshDeletedFromIndexedDb()) {
+      const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
+      return { ...health, saved: false };
     }
 
     const writes = authorityFailed
@@ -1122,6 +1426,16 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
 
     if (!hasIndexedDb() && candidateSaved) {
       candidateSaved = writes.some((write) => write.status === "fulfilled" && write.value);
+    }
+    // A peer delete that lands during replica I/O must still force saved: false
+    // even if the authority commit had accepted this candidate earlier.
+    if (await refreshDeletedFromIndexedDb()) {
+      const health = await inspectLocalStorageNow([
+        ...extraErrors,
+        ...writeErrors,
+        "This session was deleted in another tab.",
+      ]);
+      return { ...health, saved: false };
     }
     // Save acceptance is not the same as final authority ownership: another
     // tab may commit a deterministic tie winner immediately afterward. Keep
@@ -1144,10 +1458,90 @@ export function inspectLocalStorage(): Promise<StorageHealth> {
   return serializeVaultOperation(inspectLocalStorageNow);
 }
 
+/**
+ * Permanently remove durable and staged storage for a non-default document.
+ *
+ * Under the per-document vault lock:
+ * 1. Purge local staged/durable copies (best-effort first pass).
+ * 2. Atomically write an IndexedDB deletion marker and drop authority/current.
+ * 3. Purge OPFS (best-effort).
+ * 4. Publish localStorage + memory tombstones only after the durable marker exists
+ *    (or after local purge when IndexedDB is unavailable).
+ *
+ * If the durable marker cannot be written, no tombstone is left behind so the
+ * session remains loadable and the user can retry. Peer saves that race without
+ * Web Locks still lose to the IndexedDB deletion marker inside commitIndexedDb.
+ *
+ * Operates on the target id without mutating the caller's active document scope.
+ */
+export async function deleteLocalDocument(documentId: string) {
+  const normalized = normalizedDocumentId(documentId);
+  if (normalized === DEFAULT_DOCUMENT_ID) {
+    throw new Error("The original session cannot be deleted.");
+  }
+
+  await serializeVaultOperation(async () => {
+    const deletedAt = Date.now();
+    let durableMarkerWritten = false;
+
+    try {
+      try {
+        purgeLocalReplicas();
+      } catch {
+        throw new Error("Could not delete localStorage copies for this session.");
+      }
+
+      if (hasIndexedDb()) {
+        await commitIndexedDbDeletion(normalized, deletedAt);
+        durableMarkerWritten = true;
+        // Memory + LS fast-path for stage() and other same-tab checks.
+        writeLocalTombstone(normalized, deletedAt);
+      }
+
+      try {
+        await purgeOpfsReplica();
+      } catch {
+        // OPFS residue is unreachable once the durable marker exists; keep deleting.
+        if (!durableMarkerWritten) {
+          throw new Error("Could not delete the browser file system copy for this session.");
+        }
+      }
+
+      // Environments without IndexedDB (or tests) rely on the localStorage marker.
+      if (!durableMarkerWritten) {
+        try {
+          purgeLocalReplicas();
+        } catch {
+          throw new Error("Could not delete localStorage copies for this session.");
+        }
+        if (!writeLocalTombstone(normalized, deletedAt)) {
+          clearLocalTombstone(normalized);
+          throw new Error("Could not record a local deletion marker for this session.");
+        }
+        durableMarkerWritten = true;
+      } else {
+        // Second pass clears anything a concurrent unlocked writer may have staged.
+        try {
+          purgeLocalReplicas();
+        } catch {
+          // Content remains blocked by the durable tombstone.
+        }
+        writeLocalTombstone(normalized, deletedAt);
+      }
+    } catch (error) {
+      if (!durableMarkerWritten) clearLocalTombstone(normalized);
+      throw error;
+    }
+  }, normalized);
+}
+
 /** Reset process-local sequencing state between isolated storage contract tests. */
 export function resetLocalVaultStateForTests() {
   vaultQueue = Promise.resolve();
   lastIssuedTimestamp = 0;
   pendingOwner = null;
   webLocksUnavailable = false;
+  activeDocumentId = DEFAULT_DOCUMENT_ID;
+  operationDocumentId = null;
+  deletedDocuments.clear();
 }

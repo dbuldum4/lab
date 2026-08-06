@@ -1,0 +1,288 @@
+import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
+import test, { afterEach, beforeEach } from "node:test";
+import {
+  activeDocumentIdFromLocation,
+  clearInvalidDocumentSessionHash,
+  createDocumentSession,
+  deleteDocumentSession,
+  documentSessionHash,
+  ensureDocumentSession,
+  getDocumentSession,
+  listDocumentSessions,
+  parseActiveDocumentLocation,
+  purgeDocumentSession,
+  renameDocumentSession,
+  touchDocumentSession,
+} from "./document-sessions.ts";
+import { deleteLocalDocument, isLocalDocumentDeleted, resetLocalVaultStateForTests } from "./local-vault.ts";
+
+class MemoryStorage implements Storage {
+  readonly values = new Map<string, string>();
+  get length() { return this.values.size; }
+  clear() { this.values.clear(); }
+  getItem(key: string) { return this.values.get(key) ?? null; }
+  key(index: number) { return [...this.values.keys()][index] ?? null; }
+  removeItem(key: string) { this.values.delete(key); }
+  setItem(key: string, value: string) { this.values.set(key, value); }
+}
+
+const descriptors = new Map<string, PropertyDescriptor | undefined>();
+
+beforeEach(() => {
+  for (const name of ["localStorage", "crypto", "navigator"]) {
+    descriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+  }
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: new MemoryStorage() });
+  Object.defineProperty(globalThis, "crypto", { configurable: true, value: webcrypto });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { locks: { request: async (_name: string, _options: unknown, callback: () => unknown) => callback() } },
+  });
+  resetLocalVaultStateForTests();
+});
+
+afterEach(() => {
+  resetLocalVaultStateForTests();
+  for (const [name, descriptor] of descriptors) {
+    if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+    else Reflect.deleteProperty(globalThis, name);
+  }
+  descriptors.clear();
+});
+
+test("the hash keeps the original document implicit and scopes named sessions", () => {
+  assert.equal(activeDocumentIdFromLocation({ hash: "" } as Location), "default");
+  assert.equal(activeDocumentIdFromLocation({ hash: "#session=alpha_1" } as Location), "alpha_1");
+  assert.equal(activeDocumentIdFromLocation({ hash: "#session=../../bad" } as Location), "default");
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "#session=../../bad" }), {
+    id: "default",
+    hadInvalidSessionHash: true,
+  });
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "#session=%ZZ" }), {
+    id: "default",
+    hadInvalidSessionHash: true,
+  });
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "#session=alpha_1" }), {
+    id: "alpha_1",
+    hadInvalidSessionHash: false,
+  });
+  assert.deepEqual(parseActiveDocumentLocation({ hash: "" }), {
+    id: "default",
+    hadInvalidSessionHash: false,
+  });
+  assert.equal(documentSessionHash("default"), "");
+  assert.equal(documentSessionHash("alpha_1"), "#session=alpha_1");
+});
+
+test("invalid session hashes are rewritten so the URL matches default storage", () => {
+  const location = {
+    hash: "#session=../../bad",
+    pathname: "/lab",
+    search: "?x=1",
+  };
+  let replaced: { state: unknown; url: string } | undefined;
+  const history = {
+    replaceState(state: unknown, _title: string, url: string) {
+      replaced = { state, url };
+      location.hash = "";
+    },
+  };
+
+  assert.equal(clearInvalidDocumentSessionHash(location, history), true);
+  assert.deepEqual(replaced, { state: { labDocumentId: "default" }, url: "/lab?x=1" });
+  assert.equal(clearInvalidDocumentSessionHash({ ...location, hash: "" }, history), false);
+  assert.equal(clearInvalidDocumentSessionHash({ ...location, hash: "#session=ok_id" }, history), false);
+});
+
+test("location hash changes map back and forward session ids", () => {
+  // Browser Back/Forward only update location.hash; the editor reloads when this
+  // id diverges from the mount-time documentId.
+  assert.equal(activeDocumentIdFromLocation({ hash: "#session=alpha" } as Location), "alpha");
+  assert.equal(activeDocumentIdFromLocation({ hash: "" } as Location), "default");
+  assert.equal(activeDocumentIdFromLocation({ hash: "#session=beta" } as Location), "beta");
+  assert.equal(documentSessionHash("alpha"), "#session=alpha");
+  assert.equal(documentSessionHash("default"), "");
+});
+
+test("sessions are independent, resumable, and rename atomically per id", async () => {
+  const original = await ensureDocumentSession("default");
+  const alpha = await createDocumentSession("Alpha");
+  const beta = await createDocumentSession("Beta");
+  await renameDocumentSession(alpha.id, "  Research   notes  ");
+  const beforeTouch = listDocumentSessions().find((session) => session.id === alpha.id)?.updatedAt ?? 0;
+  const touched = await touchDocumentSession(alpha.id);
+
+  const sessions = listDocumentSessions();
+  assert.equal(original.id, "default");
+  assert.equal(sessions.length, 3);
+  assert.equal(sessions.find((session) => session.id === alpha.id)?.name, "Research notes");
+  assert.equal(sessions.find((session) => session.id === beta.id)?.name, "Beta");
+  assert.ok(touched.updatedAt > beforeTouch);
+  assert.equal(sessions.find((session) => session.id === alpha.id)?.updatedAt, touched.updatedAt);
+});
+
+test("unknown hashes do not create session metadata until first durable touch", async () => {
+  assert.equal(await getDocumentSession("typoOrSharedId"), null);
+  assert.equal(listDocumentSessions().some((session) => session.id === "typoOrSharedId"), false);
+
+  const created = await touchDocumentSession("typoOrSharedId");
+  assert.equal(created.name, "Untitled");
+  assert.equal((await getDocumentSession("typoOrSharedId"))?.id, "typoOrSharedId");
+  assert.ok(listDocumentSessions().some((session) => session.id === "typoOrSharedId"));
+});
+
+test("delete removes session metadata and activity without deleting the original", async () => {
+  const alpha = await createDocumentSession("Scratch");
+  await touchDocumentSession(alpha.id);
+  assert.ok(listDocumentSessions().some((session) => session.id === alpha.id));
+  assert.equal(localStorage.getItem(`lab.session.activity.v1.${alpha.id}`) !== null, true);
+
+  await deleteDocumentSession(alpha.id);
+
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+  assert.equal(localStorage.getItem(`lab.session.v1.${alpha.id}`), null);
+  assert.equal(localStorage.getItem(`lab.session.activity.v1.${alpha.id}`), null);
+  assert.ok(listDocumentSessions().some((session) => session.id === "default"));
+
+  await assert.rejects(() => deleteDocumentSession("default"), /original session cannot be deleted/i);
+});
+
+test("purge removes session metadata after content purge and refuses the original", async () => {
+  const alpha = await createDocumentSession("Doomed");
+  localStorage.setItem(`lab.document.v2.${alpha.id}`, JSON.stringify({
+    markdown: "secret",
+    updatedAt: 1,
+    checksum: "x",
+    version: 2,
+  }));
+
+  // purgeDocumentSession deletes content then metadata; unit env has no IDB/OPFS.
+  await purgeDocumentSession(alpha.id);
+
+  assert.equal(localStorage.getItem(`lab.document.v2.${alpha.id}`), null);
+  assert.equal(isLocalDocumentDeleted(alpha.id), true);
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+  await assert.rejects(() => purgeDocumentSession("default"), /original session cannot be deleted/i);
+  await assert.rejects(() => deleteLocalDocument("default"), /original session cannot be deleted/i);
+});
+
+test("tombstoned sessions cannot be renamed, touched, or re-listed as ghosts", async () => {
+  const alpha = await createDocumentSession("Doomed");
+  await purgeDocumentSession(alpha.id);
+
+  // Simulate leftover metadata a peer might still hold (or a partial metadata delete).
+  localStorage.setItem(`lab.session.v1.${alpha.id}`, JSON.stringify({
+    id: alpha.id,
+    name: "Stale",
+    createdAt: 1,
+    updatedAt: 1,
+  }));
+
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+  await assert.rejects(() => renameDocumentSession(alpha.id, "BackFromDead"), /deleted/i);
+  await assert.rejects(() => touchDocumentSession(alpha.id), /deleted/i);
+  await assert.rejects(() => ensureDocumentSession(alpha.id), /deleted/i);
+  assert.equal(await getDocumentSession(alpha.id), null);
+  assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
+});
+
+test("createDocumentSession retries when the chosen id is already tombstoned", async () => {
+  const doomed = "deadbeefdeadbeefdeadbeefdeadbeef";
+  let calls = 0;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      randomUUID() {
+        calls += 1;
+        return calls === 1
+          ? "deadbeef-dead-beef-dead-beefdeadbeef"
+          : "cafebabe-cafe-babe-cafe-babecafebabe";
+      },
+    },
+  });
+  // localStorage tombstone is enough for isLocalDocumentDeleted after process-local reset.
+  localStorage.setItem(`lab.document.deleted.v1.${doomed}`, String(Date.now()));
+
+  const session = await createDocumentSession("Recovered");
+  assert.notEqual(session.id, doomed);
+  assert.equal(session.id, "cafebabecafebabecafebabecafebabe");
+  assert.equal(session.name, "Recovered");
+  assert.equal(calls, 2);
+});
+
+test("createDocumentSession retries when the id is tombstoned after the lock is acquired", async () => {
+  const doomed = "aabbccddeeff00112233445566778899";
+  let calls = 0;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      randomUUID() {
+        calls += 1;
+        return calls === 1
+          ? "aabbccdd-eeff-0011-2233-445566778899"
+          : "11223344-5566-7788-99aa-bbccddeeff00";
+      },
+    },
+  });
+
+  // First lock callback races a tombstone write, second id is free.
+  let lockCalls = 0;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      locks: {
+        request: async (_name: string, _options: unknown, callback: () => unknown) => {
+          lockCalls += 1;
+          if (lockCalls === 1) {
+            localStorage.setItem(`lab.document.deleted.v1.${doomed}`, String(Date.now()));
+          }
+          return callback();
+        },
+      },
+    },
+  });
+
+  const session = await createDocumentSession("UnderLock");
+  assert.equal(session.id, "112233445566778899aabbccddeeff00");
+  assert.equal(session.name, "UnderLock");
+  assert.equal(calls, 2);
+  assert.equal(lockCalls, 2);
+});
+
+test("createDocumentSession retries when the chosen id already has live metadata", async () => {
+  const taken = "feedfacefeedfacefeedfacefeedface";
+  localStorage.setItem(
+    `lab.session.v1.${taken}`,
+    JSON.stringify({
+      id: taken,
+      name: "Existing",
+      createdAt: 1,
+      updatedAt: 1,
+    }),
+  );
+
+  let calls = 0;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      randomUUID() {
+        calls += 1;
+        return calls === 1
+          ? "feedface-feed-face-feed-facefeedface"
+          : "cafebabe-cafe-babe-cafe-babecafebabe";
+      },
+    },
+  });
+
+  const session = await createDocumentSession("Fresh");
+  assert.notEqual(session.id, taken);
+  assert.equal(session.id, "cafebabecafebabecafebabecafebabe");
+  assert.equal(session.name, "Fresh");
+  assert.equal(calls, 2);
+  // Existing session metadata must not be clobbered by the collision attempt.
+  assert.equal(
+    JSON.parse(localStorage.getItem(`lab.session.v1.${taken}`) ?? "null").name,
+    "Existing",
+  );
+});

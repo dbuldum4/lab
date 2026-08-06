@@ -13,21 +13,37 @@ import { NodeSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import katex from "katex";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   createEditorPersistenceController,
   type EditorPersistenceController,
 } from "@/lib/editor-persistence";
 import {
+  DEFAULT_DOCUMENT_ID,
   inspectLocalStorage,
+  isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
   requestPersistentStorage,
+  setLocalDocumentScope,
   type LocalRecoveryDraft,
   type StorageHealth,
 } from "@/lib/local-vault";
+import {
+  activeDocumentIdFromLocation,
+  clearInvalidDocumentSessionHash,
+  createDocumentSession,
+  documentSessionHash,
+  getDocumentSession,
+  listDocumentSessions,
+  parseActiveDocumentLocation,
+  purgeDocumentSession,
+  renameDocumentSession,
+  touchDocumentSession,
+  type DocumentSession,
+} from "@/lib/document-sessions";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -76,6 +92,10 @@ const COMMANDS: Command[] = [
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
   { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
   { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
+  { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
+  { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
+  { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
+  { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
 ];
@@ -163,17 +183,68 @@ function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
 }
 
+/** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
+function previousGraphemeIndex(text: string, index: number) {
+  if (index <= 0) return 0;
+  const Segmenter = (globalThis as unknown as { Intl?: { Segmenter?: unknown } }).Intl?.Segmenter as
+    | (new (locale: string | undefined, opts: { granularity: string }) => { segment(input: string): Iterable<{ segment: string; index: number }> })
+    | undefined;
+  if (Segmenter) {
+    try {
+      const segmenter = new Segmenter(undefined, { granularity: "grapheme" });
+      let prev = 0;
+      for (const { segment } of segmenter.segment(text.slice(0, index))) {
+        const next = prev + segment.length;
+        if (next >= index) return prev;
+        prev = next;
+      }
+      return prev;
+    } catch {
+      // Fall through to code-unit fallback.
+    }
+  }
+  if (index >= 2) {
+    const low = text.charCodeAt(index - 1);
+    const high = text.charCodeAt(index - 2);
+    if (low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff) {
+      return index - 2;
+    }
+  }
+  return index - 1;
+}
+
 function backwardWordStart(text: string) {
   let start = text.length;
-  while (start > 0 && /\s/.test(text[start - 1])) start -= 1;
+  while (start > 0) {
+    const prev = previousGraphemeIndex(text, start);
+    if (!/\s/u.test(text.slice(prev, start))) break;
+    start = prev;
+  }
 
-  if (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) {
-    while (start > 0 && /[\p{L}\p{N}_]/u.test(text[start - 1])) start -= 1;
-  } else if (start > 0) {
-    start -= 1;
+  if (start > 0) {
+    const prev = previousGraphemeIndex(text, start);
+    const unit = text.slice(prev, start);
+    if (/[\p{L}\p{N}_]/u.test(unit)) {
+      while (start > 0) {
+        const p = previousGraphemeIndex(text, start);
+        if (!/[\p{L}\p{N}_]/u.test(text.slice(p, start))) break;
+        start = p;
+      }
+    } else {
+      start = prev;
+    }
   }
 
   return start;
+}
+
+/** Client-only gate: false during SSR/prerender, true after hydration (no effect setState). */
+function useIsClient() {
+  return useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
 }
 
 function migrateInlineMath(instance: Editor) {
@@ -305,13 +376,35 @@ const SlashCommandInput = Extension.create({
   },
 });
 
+/**
+ * Gate vault scope + persistence until the client has the real URL hash.
+ * Static pre-render and SSR have no hash, so mounting LabEditorSession there
+ * would permanently bind the default document for deep-linked sessions.
+ * useSyncExternalStore avoids setState-in-effect while still deferring to client.
+ */
 export function LabEditor() {
+  const mounted = useIsClient();
+  if (!mounted) {
+    return (
+      <div
+        className="lab-editor"
+        data-hydrating="true"
+        aria-busy="true"
+        aria-label="lab local-only Markdown note"
+      />
+    );
+  }
+  return <LabEditorSession />;
+}
+
+function LabEditorSession() {
   const shellRef = useRef<HTMLDivElement>(null);
   const caretRef = useRef<HTMLDivElement>(null);
   const caretStrokeRef = useRef<HTMLSpanElement>(null);
   const paletteElementRef = useRef<HTMLDivElement>(null);
   const mathEditorElementRef = useRef<HTMLDivElement>(null);
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
   const paletteRef = useRef<PaletteState | null>(null);
@@ -324,6 +417,16 @@ export function LabEditor() {
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+  // Only constructed after LabEditor mounts on the client, so the hash is real.
+  // Invalid ids still map to the default document; the hash is rewritten in
+  // useLayoutEffect below so React StrictMode double init stays correct.
+  const [documentId] = useState(() => activeDocumentIdFromLocation());
+  const [openedWithInvalidSessionHash] = useState(
+    () => parseActiveDocumentLocation().hadInvalidSessionHash,
+  );
+  const [sessionName, setSessionName] = useState("Untitled");
+  const [savedSessionName, setSavedSessionName] = useState("Untitled");
+  const [sessions, setSessions] = useState<DocumentSession[]>([]);
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -331,7 +434,12 @@ export function LabEditor() {
       : (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__;
     return createEditorPersistenceController({
       delayMs: Number.isFinite(e2eDelay) ? e2eDelay : undefined,
-      onHealth: setHealth,
+      onHealth: (nextHealth) => {
+        setHealth(nextHealth);
+        // documentId is stable for the mount lifetime (session switches reload),
+        // so capturing it here is intentional and avoids a ref.
+        if (nextHealth.saved === true) void touchDocumentSession(documentId).catch(() => undefined);
+      },
       onNotice: setNotice,
       onStageFailure: () => setNotice("This edit could not be staged locally. Please export a copy before closing the page."),
     });
@@ -760,11 +868,11 @@ export function LabEditor() {
           view.dispatch(closeHistory(view.state.tr.delete(from, from + 1)));
           return true;
         }
-        if (event.key === "Backspace" && (event.metaKey || event.altKey)) {
+        if (event.key === "Backspace" && (event.metaKey || event.altKey || event.ctrlKey)) {
           // Native modified deletion differs between browsers and operating
           // systems. Keep slash-command editing deterministic while the
-          // palette is open: Meta deletes to the start of the text block and
-          // Alt deletes the preceding word.
+          // palette is open: Meta deletes to the start of the text block;
+          // Alt (macOS) and Ctrl (Windows/Linux) delete the preceding word.
           event.preventDefault();
           const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
           const start = event.metaKey
@@ -867,6 +975,15 @@ export function LabEditor() {
     return () => window.cancelAnimationFrame(frame);
   }, [mathEditorIdentity]);
 
+  useEffect(() => {
+    if (palette?.mode !== "name") return;
+    const frame = window.requestAnimationFrame(() => {
+      sessionNameInputRef.current?.focus();
+      sessionNameInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
   useLayoutEffect(() => {
     repositionMathEditor();
   }, [mathEditorState, repositionMathEditor]);
@@ -874,8 +991,8 @@ export function LabEditor() {
   useEffect(() => {
     if (!editor) return;
     const documentElement = editor.view.dom;
-    const activeCommand = palette?.mode === "commands" ? filtered[selected] : undefined;
     if (palette?.mode === "commands") {
+      const activeCommand = filtered[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeCommand) {
@@ -887,10 +1004,138 @@ export function LabEditor() {
       }
       return;
     }
+    if (palette?.mode === "sessions") {
+      const activeSession = sessions[selected];
+      documentElement.setAttribute("aria-expanded", "true");
+      documentElement.setAttribute("aria-controls", PALETTE_ID);
+      if (activeSession) {
+        documentElement.setAttribute(
+          "aria-activedescendant",
+          `${PALETTE_ID}-session-${activeSession.id}`,
+        );
+      } else {
+        documentElement.removeAttribute("aria-activedescendant");
+      }
+      return;
+    }
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [editor, filtered, palette, selected]);
+  }, [editor, filtered, palette, selected, sessions]);
+
+  /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
+  const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
+    try {
+      if (await persistence.flush()) return "ok";
+    } catch {
+      // The controller normally converts save errors into a false result, but
+      // session switching must remain safe if a custom persistence boundary
+      // rejects unexpectedly.
+    }
+    // Authority conflicts and replica failures both yield false. Staged recovery
+    // drafts remain available via /recover, so offer an explicit escape hatch.
+    const switchAnyway = window.confirm(
+      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
+    );
+    if (switchAnyway) return "dirty";
+    setNotice("This note could not be saved before switching sessions.");
+    return "cancel";
+  }, [persistence]);
+
+  /**
+   * Stop accepting edits so the async gap before navigation cannot stage/save more text.
+   * Disables the editor first, then flushes via dispose. Returns false if the user
+   * declines to switch after a failed final flush (reloads to restore a live controller).
+   * When `allowDirtySwitch` is true the user already confirmed a failed flush, so
+   * dispose does not prompt a second time.
+   */
+  const freezePersistenceForNavigation = useCallback(async (allowDirtySwitch = false) => {
+    editor?.setEditable(false, false);
+    let flushed = true;
+    try {
+      flushed = await persistence.dispose();
+    } catch {
+      flushed = false;
+    }
+    if (flushed || allowDirtySwitch) return true;
+    const switchAnyway = window.confirm(
+      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
+    );
+    if (switchAnyway) return true;
+    setNotice("This note could not be saved before switching sessions.");
+    // dispose() is irreversible; reload restores a live persistence controller.
+    window.location.reload();
+    return false;
+  }, [editor, persistence]);
+
+  const navigateToSession = useCallback((session: DocumentSession) => {
+    const hash = documentSessionHash(session.id);
+    const target = `${window.location.pathname}${window.location.search}${hash}`;
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    // Same-path hash changes do not load a new document by themselves. Push a
+    // real history entry, then reload so documentId and vault scope rebind.
+    // Back/forward are handled by the popstate listener below (also reload).
+    // Full reload is intentional: vault scope and persistence are bound at mount
+    // and must rebind cleanly to the new document namespace.
+    if (current === target) {
+      window.location.reload();
+      return;
+    }
+    window.history.pushState({ labDocumentId: session.id }, "", target);
+    window.location.reload();
+  }, []);
+
+  const resumeSession = useCallback(async (session: DocumentSession) => {
+    const flushResult = await flushBeforeSessionSwitch();
+    if (flushResult === "cancel") return false;
+    if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return false;
+    navigateToSession(session);
+    return true;
+  }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
+
+  const deleteActiveSession = useCallback(async () => {
+    if (documentId === DEFAULT_DOCUMENT_ID) {
+      setNotice("The original session cannot be deleted. Use /clear to empty it.");
+      return false;
+    }
+    // Stop accepting edits so keystrokes during the async purge cannot land in
+    // the DOM and be lost when the reload lands. Drop debounced writes first
+    // (abandon) so a late save cannot revive the session.
+    editor?.setEditable(false, false);
+    await persistence.abandon();
+    try {
+      await purgeDocumentSession(documentId);
+    } catch {
+      // abandon() is irreversible; reload restores a live persistence controller.
+      // Tombstones are only published after a durable delete marker succeeds, so
+      // a failed purge keeps the note loadable after reload.
+      setNotice("This session could not be deleted locally. Reloading…");
+      window.location.reload();
+      return false;
+    }
+    // Replace so Back does not return to the deleted session URL, then reload.
+    const target = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
+    window.location.reload();
+    return true;
+  }, [documentId, editor, persistence]);
+
+  const submitSessionName = useCallback(() => {
+    const nextName = sessionName.trim();
+    if (!nextName) {
+      setNotice("Enter a name for this session.");
+      return;
+    }
+    void renameDocumentSession(documentId, nextName)
+      .then((session) => {
+        setSessionName(session.name);
+        setSavedSessionName(session.name);
+        setNotice(`Named this session “${session.name}”.`);
+        setPalette(null);
+        editor?.commands.focus();
+      })
+      .catch(() => setNotice("This session name could not be saved locally."));
+  }, [documentId, editor, sessionName, setPalette]);
 
   const runCommand = useCallback(
     (command: Command) => {
@@ -927,6 +1172,14 @@ export function LabEditor() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-clear" });
         return;
       }
+      if (command.id === "delete") {
+        if (documentId === DEFAULT_DOCUMENT_ID) {
+          setNotice("The original session cannot be deleted. Use /clear to empty it.");
+          return;
+        }
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-delete" });
+        return;
+      }
       if (command.id === "recover") {
         const revisionAtRequest = persistence.getState().editRevision;
         void listLocalRecoveryDrafts()
@@ -943,6 +1196,36 @@ export function LabEditor() {
             setNotice(`Exported ${drafts.length} recovery ${drafts.length === 1 ? "draft" : "drafts"}.`);
           })
           .catch(() => setNotice("Could not export the local recovery drafts."));
+        return;
+      }
+      if (command.id === "new") {
+        void (async () => {
+          const flushResult = await flushBeforeSessionSwitch();
+          if (flushResult === "cancel") return;
+          // Freeze before the async create gap so keystrokes cannot land on the
+          // outgoing session after the last successful flush.
+          if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return;
+          try {
+            const session = await createDocumentSession();
+            navigateToSession(session);
+          } catch {
+            setNotice("A new session could not be created locally. Reloading…");
+            window.location.reload();
+          }
+        })();
+        return;
+      }
+      if (command.id === "name") {
+        setSessionName(savedSessionName);
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "name" });
+        return;
+      }
+      if (command.id === "sessions") {
+        const available = listDocumentSessions();
+        setSessions(available);
+        const activeIndex = available.findIndex((session) => session.id === documentId);
+        setSelected(Math.max(0, activeIndex));
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
         return;
       }
       if (command.id === "undo") {
@@ -1004,31 +1287,126 @@ export function LabEditor() {
         }
       }
     },
-    [editor, openMathEditor, persistence, setPalette],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
   );
+
+  // Bind vault scope synchronously once the client hash is known. Layout effects
+  // run before the passive hydration effect, so the persistence controller's
+  // first hydrate() sees the correct namespace. setLocalDocumentScope is
+  // idempotent (guards on activeDocumentId) and StrictMode-safe.
+  useLayoutEffect(() => {
+    setLocalDocumentScope(documentId);
+  }, [documentId]);
+
+  // Rewrite a bad `#session=…` so the address bar matches default storage binding.
+  useLayoutEffect(() => {
+    if (openedWithInvalidSessionHash) {
+      clearInvalidDocumentSessionHash();
+    }
+  }, [openedWithInvalidSessionHash]);
+
+  // Hash-only history (Back/Forward) updates the URL without remounting React.
+  // documentId and vault scope are fixed at mount, so force a full reload when
+  // the location's session id diverges from the bound document.
+  useEffect(() => {
+    let rebinding = false;
+    const rebindIfSessionChanged = () => {
+      // Invalid hashes must not keep a misleading `#session=…` while bound to default.
+      if (clearInvalidDocumentSessionHash()) {
+        setNotice("That session link was invalid. Opened the original note.");
+        if (documentId === DEFAULT_DOCUMENT_ID) return;
+      }
+      const nextId = activeDocumentIdFromLocation();
+      if (nextId === documentId || rebinding) return;
+      rebinding = true;
+      // Best-effort durable flush before unload — same intent as /new and /sessions,
+      // without a confirm dialog on the history path (always rebind to the URL).
+      void (async () => {
+        editor?.setEditable(false, false);
+        try {
+          await persistence.flush();
+        } catch {
+          // Staged recovery drafts remain available via /recover after reload.
+        }
+        window.location.reload();
+      })();
+    };
+    const onPageShow = (event: PageTransitionEvent) => {
+      // bfcache restore can resurrect a page whose URL was changed via history.
+      if (event.persisted || activeDocumentIdFromLocation() !== documentId) {
+        rebindIfSessionChanged();
+      }
+    };
+    window.addEventListener("popstate", rebindIfSessionChanged);
+    window.addEventListener("hashchange", rebindIfSessionChanged);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      window.removeEventListener("popstate", rebindIfSessionChanged);
+      window.removeEventListener("hashchange", rebindIfSessionChanged);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, [documentId, editor, persistence]);
 
   useEffect(() => {
     if (!editor) return;
     let active = true;
     void (async () => {
+      // `return` inside try still runs finally — gate so redirect paths never enable the editor.
+      let finishHydration = true;
+      const redirectToOriginalAfterDelete = () => {
+        finishHydration = false;
+        setNotice("This session was deleted. Returning to the original note…");
+        window.history.replaceState(
+          { labDocumentId: DEFAULT_DOCUMENT_ID },
+          "",
+          `${window.location.pathname}${window.location.search}`,
+        );
+        window.location.reload();
+      };
       try {
         await requestPersistentStorage();
+        if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
+          if (!active) return;
+          redirectToOriginalAfterDelete();
+          return;
+        }
+        try {
+          // Do not ensure/create metadata for arbitrary hashes — only load existing
+          // names. First durable save (touchDocumentSession) creates the entry.
+          const activeSession = await getDocumentSession(documentId);
+          if (active && activeSession) {
+            setSessionName(activeSession.name);
+            setSavedSessionName(activeSession.name);
+          }
+        } catch {
+          if (active) setNotice("Session names are unavailable, but this note can still be loaded.");
+        }
         const markdown = await persistence.hydrate();
+        // loadLocalDocument can discover an IndexedDB-only tombstone and write the
+        // local marker during hydrate; re-check so we take the same recovery path.
+        if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
+          if (!active) return;
+          redirectToOriginalAfterDelete();
+          return;
+        }
         if (!active) return;
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
         persistence.markLoaded(markdown);
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);
-        setNotice(nextHealth.errors.length > 0
+        const loadNotice = nextHealth.errors.length > 0
           ? "Some local storage locations are unavailable."
           : nextHealth.conflicts > 0
             ? `${nextHealth.conflicts} conflicting local ${nextHealth.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`
-            : null);
+            : openedWithInvalidSessionHash
+              ? "That session link was invalid. Opened the original note."
+              : null;
+        setNotice(loadNotice);
       } catch {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       } finally {
-        if (!active) return;
+        if (!active || !finishHydration) return;
         if (!persistence.getState().loaded) persistence.markLoaded(editor.getMarkdown());
         editor.setEditable(true, false);
         setHydrating(false);
@@ -1039,7 +1417,7 @@ export function LabEditor() {
     return () => {
       active = false;
     };
-  }, [editor, persistence, syncInterface]);
+  }, [documentId, editor, openedWithInvalidSessionHash, persistence, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -1087,7 +1465,30 @@ export function LabEditor() {
 
     if (event.key === "Escape") {
       event.preventDefault();
+      if (current.mode === "name") setSessionName(savedSessionName);
       setPalette(null);
+      editor?.commands.focus();
+      return;
+    }
+
+    if (current.mode === "name") return;
+
+    if (current.mode === "sessions") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, sessions.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && sessions.length > 0) {
+        event.preventDefault();
+        const session = sessions[selectedRef.current] ?? sessions[0];
+        if (session.id === documentId) {
+          setPalette(null);
+          editor?.commands.focus();
+        } else {
+          void resumeSession(session);
+        }
+      }
       return;
     }
 
@@ -1097,6 +1498,17 @@ export function LabEditor() {
         editor?.commands.clearContent(true);
         setPalette(null);
         editor?.commands.focus("start");
+      } else if (event.key.length === 1) {
+        setPalette(null);
+      }
+      return;
+    }
+
+    if (current.mode === "confirm-delete") {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        setPalette(null);
+        void deleteActiveSession();
       } else if (event.key.length === 1) {
         setPalette(null);
       }
@@ -1240,8 +1652,8 @@ export function LabEditor() {
             ref={paletteElementRef}
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" ? "listbox" : "status"}
-            aria-label="Slash commands"
+            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
@@ -1269,9 +1681,61 @@ export function LabEditor() {
             ) : (
               <div className="palette-message">No command</div>
             )
+          ) : palette.mode === "name" ? (
+            <div className="session-name-panel">
+              <label htmlFor="session-name-input">Session name</label>
+              <input
+                ref={sessionNameInputRef}
+                id="session-name-input"
+                value={sessionName}
+                maxLength={80}
+                autoComplete="off"
+                onChange={(event) => setSessionName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    submitSessionName();
+                  }
+                }}
+              />
+              <small>Enter to save · Esc to cancel</small>
+            </div>
+          ) : palette.mode === "sessions" ? (
+            <div className="command-list session-list" data-testid="session-list">
+              {sessions.map((session, index) => (
+                <div
+                  className="command-item"
+                  data-selected={index === selected}
+                  data-current={session.id === documentId}
+                  id={`${PALETTE_ID}-session-${session.id}`}
+                  key={session.id}
+                  role="option"
+                  aria-selected={index === selected}
+                  aria-current={session.id === documentId ? "true" : undefined}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    if (session.id === documentId) {
+                      setPalette(null);
+                      editor?.commands.focus();
+                    } else {
+                      void resumeSession(session);
+                    }
+                  }}
+                  onMouseEnter={() => setSelected(index)}
+                >
+                  <span>{session.name}</span>
+                  <small>{session.id === documentId ? "Current session" : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}</small>
+                </div>
+              ))}
+            </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
               <span>Clear the note?</span>
+              <small>Press Enter to confirm · Esc to keep it</small>
+            </div>
+          ) : palette.mode === "confirm-delete" ? (
+            <div className="palette-message palette-confirm" data-testid="confirm-delete">
+              <span>Delete this session permanently?</span>
               <small>Press Enter to confirm · Esc to keep it</small>
             </div>
           ) : (

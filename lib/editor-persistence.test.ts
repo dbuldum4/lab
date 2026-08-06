@@ -114,6 +114,18 @@ test("flush cancels debounce and persists the latest content", async () => {
   assert.equal(state.scheduler.pending, 0);
 });
 
+test("flush reports failed persistence so destructive navigation can be blocked", async () => {
+  const state = dependencies({
+    save: async () => health(false, ["IndexedDB authority is unavailable; the candidate was not written."]),
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("must not be lost");
+
+  assert.equal(await controller.flush(), false);
+  assert.equal(controller.getState().persistedRevision, 0);
+});
+
 test("a stale save result cannot mark a newer revision persisted", async () => {
   let resolveFirst: ((result: StorageHealth) => void) | undefined;
   let resolveSecond: ((result: StorageHealth) => void) | undefined;
@@ -145,6 +157,124 @@ test("a stale save result cannot mark a newer revision persisted", async () => {
   resolveSecond?.(health(true));
   await controller.flush();
   assert.equal(controller.getState().persistedRevision, 2);
+});
+
+test("abandon cancels debounced saves without writing and ignores later edits", async () => {
+  const state = dependencies();
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("do not keep");
+  assert.equal(state.scheduler.pending, 1);
+  assert.deepEqual(state.staged, ["do not keep"]);
+
+  await controller.abandon();
+  assert.equal(state.scheduler.pending, 0);
+  assert.deepEqual(state.saved, []);
+  assert.equal(controller.getState().loaded, false);
+
+  assert.equal(controller.onEdit("after abandon"), 1);
+  assert.deepEqual(state.staged, ["do not keep"]);
+  assert.equal(state.scheduler.pending, 0);
+  assert.deepEqual(state.saved, []);
+});
+
+test("abandon waits for an in-flight save then blocks further durable writes", async () => {
+  let resolveSave: ((result: StorageHealth) => void) | undefined;
+  let saveCalls = 0;
+  let abandonResolved = false;
+  const state = dependencies({
+    save: () => {
+      saveCalls += 1;
+      return new Promise<StorageHealth>((resolve) => { resolveSave = resolve; });
+    },
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("in flight");
+  state.scheduler.fireNext();
+  await Promise.resolve();
+  assert.equal(controller.getState().saveInFlightRevision, 1);
+  assert.equal(saveCalls, 1);
+
+  const abandoned = controller.abandon().then(() => { abandonResolved = true; });
+  assert.equal(state.scheduler.pending, 0);
+  await Promise.resolve();
+  assert.equal(abandonResolved, false);
+
+  resolveSave?.(health(true));
+  await abandoned;
+  assert.equal(abandonResolved, true);
+  assert.equal(controller.getState().loaded, false);
+  assert.equal(controller.getState().saveInFlightRevision, null);
+  assert.equal(controller.onEdit("too late"), 1);
+  assert.equal(state.scheduler.pending, 0);
+  assert.equal(saveCalls, 1);
+});
+
+test("dispose flushes pending edits then stops accepting work without hanging", async () => {
+  let resolveSave: ((result: StorageHealth) => void) | undefined;
+  let saveCalls = 0;
+  let savedMarkdown: string | undefined;
+  const state = dependencies({
+    save: (markdown) => {
+      saveCalls += 1;
+      savedMarkdown = markdown;
+      return new Promise<StorageHealth>((resolve) => { resolveSave = resolve; });
+    },
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("keep me");
+  state.scheduler.fireNext();
+  await Promise.resolve();
+  assert.equal(controller.getState().saveInFlightRevision, 1);
+  assert.equal(saveCalls, 1);
+
+  let disposeResolved = false;
+  const disposed = controller.dispose().then((flushed) => {
+    disposeResolved = true;
+    return flushed;
+  });
+  await Promise.resolve();
+  assert.equal(disposeResolved, false);
+
+  resolveSave?.(health(true));
+  assert.equal(await disposed, true);
+  assert.equal(disposeResolved, true);
+  assert.equal(controller.getState().loaded, false);
+  assert.equal(controller.getState().persistedRevision, 1);
+  assert.equal(savedMarkdown, "keep me");
+  assert.equal(controller.onEdit("after dispose"), 1);
+  assert.equal(state.scheduler.pending, 0);
+  assert.equal(saveCalls, 1);
+});
+
+test("dispose with only a debounced edit persists it before becoming inert", async () => {
+  const state = dependencies();
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("debounced");
+  assert.equal(state.scheduler.pending, 1);
+
+  assert.equal(await controller.dispose(), true);
+  assert.deepEqual(state.saved, ["debounced"]);
+  assert.equal(controller.getState().loaded, false);
+  assert.equal(controller.getState().persistedRevision, 1);
+  assert.equal(controller.onEdit("too late"), 1);
+  assert.equal(state.scheduler.pending, 0);
+});
+
+test("dispose returns false when the final flush fails but still becomes inert", async () => {
+  const state = dependencies({
+    save: async () => health(false),
+  });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("unsaved");
+  assert.equal(await controller.dispose(), false);
+  assert.equal(controller.getState().loaded, false);
+  assert.equal(controller.onEdit("too late"), 1);
+  assert.equal(state.scheduler.pending, 0);
 });
 
 test("save outcomes distinguish conflict, degraded replicas, recovery drafts, and authority failure", async () => {

@@ -3,13 +3,16 @@ import { webcrypto } from "node:crypto";
 import test, { afterEach, beforeEach } from "node:test";
 import {
   compareSnapshotOrder,
+  deleteLocalDocument,
   inspectLocalStorage,
+  isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
   loadLocalDocument,
   resetLocalVaultStateForTests,
   sameSnapshot,
   saveLocalDocument,
   selectCurrentSnapshot,
+  setLocalDocumentScope,
   shouldAcceptSnapshot,
   stageLocalDocument,
   type LocalSnapshot,
@@ -167,6 +170,24 @@ function createFakeIndexedDb(): FakeIndexedDb {
             }, 0);
             return request;
           },
+          delete(key: IDBValidKey) {
+            pending += 1;
+            const requestState = {
+              result: undefined as unknown,
+              error: null as DOMException | null,
+              onsuccess: null as ((event: Event) => void) | null,
+              onerror: null as ((event: Event) => void) | null,
+            };
+            const request = requestState as unknown as IDBRequest;
+            setTimeout(() => {
+              if (settled) return;
+              pending -= 1;
+              store.delete(key);
+              requestState.onsuccess?.({} as Event);
+              maybeComplete();
+            }, 0);
+            return request;
+          },
         }),
       };
       const transaction = transactionState as unknown as IDBTransaction;
@@ -284,6 +305,10 @@ function createOpfsHarness(persisted = true): OpfsHarness {
           };
         },
       } as unknown as FileSystemFileHandle;
+    },
+    removeEntry: async (name: string) => {
+      if (!files.has(name)) throw new DOMException("Missing file", "NotFoundError");
+      files.delete(name);
     },
   } as unknown as FileSystemDirectoryHandle;
   const storage = {
@@ -916,6 +941,210 @@ test("a newer staged edit cannot be cleared by an older save in flight", async (
     const health = await save;
     assert.equal(health.saved, false);
     assert.equal(await loadLocalDocument(), "newer");
+  } finally {
+    Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
+  }
+});
+
+test("document scopes isolate durable snapshots and pending recovery drafts", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  assert.equal(stageLocalDocument("original note"), true);
+  assert.equal((await saveLocalDocument("original note")).saved, true);
+
+  setLocalDocumentScope("alpha");
+  assert.equal(await loadLocalDocument(), "");
+  assert.equal(stageLocalDocument("alpha note"), true);
+  assert.equal((await saveLocalDocument("alpha note")).saved, true);
+
+  setLocalDocumentScope("beta");
+  assert.equal(stageLocalDocument("beta draft"), true);
+  assert.ok([...environment.local.values.keys()].some((key) => key.startsWith("lab.document.pending.scoped.v2.beta.")));
+  setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument(), "original note");
+  setLocalDocumentScope("beta");
+  assert.equal(await loadLocalDocument(), "beta draft");
+
+  setLocalDocumentScope("alpha");
+  assert.equal(await loadLocalDocument(), "alpha note");
+  setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument(), "original note");
+
+  assert.ok(environment.local.values.has("lab.document.v1"));
+  assert.ok(environment.local.values.has("lab.document.v2.alpha"));
+});
+
+test("deleteLocalDocument purges scoped replicas and refuses the original session", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  assert.equal(stageLocalDocument("keep original"), true);
+  assert.equal((await saveLocalDocument("keep original")).saved, true);
+
+  setLocalDocumentScope("alpha");
+  assert.equal(stageLocalDocument("remove me"), true);
+  assert.equal((await saveLocalDocument("remove me")).saved, true);
+  assert.ok(environment.local.values.has("lab.document.v2.alpha"));
+  assert.ok(environment.idb?.read("authority:alpha"));
+  assert.ok(environment.idb?.read("current:alpha"));
+  assert.ok(environment.opfs?.files.has("lab.alpha.md.snapshot"));
+
+  setLocalDocumentScope("default");
+  await deleteLocalDocument("alpha");
+
+  // Scope must remain the caller's document after purging another session.
+  assert.equal(await loadLocalDocument(), "keep original");
+  assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+  assert.equal(isLocalDocumentDeleted("alpha"), true);
+  assert.equal(
+    [...environment.local.values.keys()].some((key) => (
+      key.includes("alpha") && !key.startsWith("lab.document.deleted.v1.")
+    )),
+    false,
+  );
+  assert.equal(environment.idb?.read("authority:alpha"), undefined);
+  assert.equal(environment.idb?.read("current:alpha"), undefined);
+  assert.equal(environment.opfs?.files.has("lab.alpha.md.snapshot"), false);
+
+  setLocalDocumentScope("alpha");
+  assert.equal(await loadLocalDocument(), "");
+  // Peer-tab style rewrite after delete must not resurrect content.
+  assert.equal(stageLocalDocument("resurrect me"), false);
+  const revived = await saveLocalDocument("resurrect me");
+  assert.equal(revived.saved, false);
+  assert.ok(revived.errors.some((error) => /deleted in another tab/i.test(error)));
+  assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+
+  setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument(), "keep original");
+
+  await assert.rejects(() => deleteLocalDocument("default"), /original session cannot be deleted/i);
+});
+
+test("deleteLocalDocument does not redirect the caller's active scope mid-flight", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  setLocalDocumentScope("default");
+  assert.equal((await saveLocalDocument("original")).saved, true);
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("alpha body")).saved, true);
+  setLocalDocumentScope("default");
+
+  await deleteLocalDocument("alpha");
+  assert.equal(await loadLocalDocument(), "original");
+  assert.equal((await saveLocalDocument("original still")).saved, true);
+  assert.equal(await loadLocalDocument(), "original still");
+});
+
+test("IndexedDB deletion marker blocks commits even when localStorage tombstone is missing", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: null });
+
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("secret")).saved, true);
+  await deleteLocalDocument("alpha");
+
+  // Peer tab with a cold process-local cache and no localStorage tombstone still
+  // loses to the durable IndexedDB marker inside the authority transaction.
+  resetLocalVaultStateForTests();
+  setLocalDocumentScope("alpha");
+  environment.local.removeItem("lab.document.deleted.v1.alpha");
+  assert.equal(isLocalDocumentDeleted("alpha"), false);
+
+  const revived = await saveLocalDocument("resurrect");
+  assert.equal(revived.saved, false);
+  assert.ok(revived.errors.some((error) => /deleted in another tab/i.test(error)));
+  assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+  assert.equal(environment.idb?.read("authority:alpha"), undefined);
+  assert.ok(environment.idb?.read("deleted:alpha"));
+  assert.equal(await loadLocalDocument(), "");
+});
+
+test("failed local purge before a durable marker leaves the session loadable", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("keep me")).saved, true);
+
+  const originalSetItem = environment.local.setItem.bind(environment.local);
+  // Corrupt removeItem only for the document snapshot so purgeLocalReplicas throws
+  // before any IndexedDB deletion marker is written.
+  const originalRemove = environment.local.removeItem.bind(environment.local);
+  environment.local.removeItem = (key: string) => {
+    if (key === "lab.document.v2.alpha") throw new Error("quota");
+    originalRemove(key);
+  };
+
+  await assert.rejects(() => deleteLocalDocument("alpha"), /localStorage copies/i);
+  environment.local.removeItem = originalRemove;
+  environment.local.setItem = originalSetItem;
+
+  assert.equal(isLocalDocumentDeleted("alpha"), false);
+  assert.equal(environment.idb?.read("deleted:alpha"), undefined);
+  assert.equal(await loadLocalDocument(), "keep me");
+  assert.equal((await saveLocalDocument("keep me still")).saved, true);
+});
+
+test("in-flight save loses to peer delete after authority commit without Web Locks", async () => {
+  // Cross-tab TOCTOU: authority commit accepts, then a peer writes deleted:<id>
+  // and drops authority before replica writes. Without Web Locks this is the
+  // gap that used to repopulate localStorage/OPFS and report saved: true.
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: null });
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("seed")).saved, true);
+
+  const documents = environment.idb?.stores.get("documents");
+  assert.ok(documents);
+  const realSet = documents.set.bind(documents);
+  let sawRacerAuthority = false;
+  documents.set = ((key: IDBValidKey, value: unknown) => {
+    realSet(key, value);
+    if (
+      key === "authority:alpha"
+      && value
+      && typeof value === "object"
+      && (value as { snapshot?: { markdown?: string } }).snapshot?.markdown === "racer"
+    ) {
+      sawRacerAuthority = true;
+    }
+  }) as typeof documents.set;
+
+  const originalCrypto = globalThis.crypto;
+  let release: (() => void) | undefined;
+  let paused = false;
+  const digest = async (...args: Parameters<SubtleCrypto["digest"]>) => {
+    const result = await webcrypto.subtle.digest(...args);
+    // First digest after the racer authority put is post-commit normalizeSnapshot.
+    if (sawRacerAuthority && !paused) {
+      paused = true;
+      await new Promise<void>((resolve) => { release = resolve; });
+    }
+    return result;
+  };
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: { subtle: { digest } },
+  });
+
+  try {
+    const save = saveLocalDocument("racer");
+    while (!release) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Peer tab finished deleteLocalDocument: durable marker, no authority, purged replicas.
+    environment.idb?.write("deleted:alpha", { recordVersion: 1, deletedAt: Date.now() });
+    environment.idb?.remove("authority:alpha");
+    environment.idb?.remove("current:alpha");
+    environment.local.removeItem("lab.document.v2.alpha");
+    environment.opfs?.files.delete("lab.alpha.md.snapshot");
+    // No localStorage tombstone yet — the cold-tab race window.
+
+    release();
+    const health = await save;
+    assert.equal(health.saved, false);
+    assert.ok(health.errors.some((error) => /deleted in another tab/i.test(error)));
+    assert.equal(environment.local.values.has("lab.document.v2.alpha"), false);
+    assert.equal(environment.opfs?.files.has("lab.alpha.md.snapshot"), false);
+    assert.ok(environment.idb?.read("deleted:alpha"));
+    assert.equal(environment.idb?.read("authority:alpha"), undefined);
+    assert.equal(environment.idb?.read("current:alpha"), undefined);
   } finally {
     Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
   }

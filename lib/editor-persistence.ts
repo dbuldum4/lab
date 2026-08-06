@@ -25,8 +25,20 @@ export type EditorPersistenceController = {
   hydrate: () => Promise<string>;
   markLoaded: (markdown: string) => void;
   onEdit: (markdown: string) => number;
-  flush: () => Promise<void>;
-  dispose: () => Promise<void>;
+  /** Persist the latest edit; false means a session switch would lose data. */
+  flush: () => Promise<boolean>;
+  /**
+   * Stop accepting edits and cancel the debounce timer without writing.
+   * Waits for an in-flight save so vault work finishes before a purge.
+   * Use before deleting the active document; prefer dispose() when leaving with data intact.
+   */
+  abandon: () => Promise<void>;
+  /**
+   * Flush pending work, then stop accepting edits.
+   * Returns false when the final flush failed (data may be incomplete before navigation).
+   * Always becomes disposed, even on flush failure.
+   */
+  dispose: () => Promise<boolean>;
   inspect: () => Promise<StorageHealth>;
   getState: () => {
     loaded: boolean;
@@ -35,6 +47,10 @@ export type EditorPersistenceController = {
     saveInFlightRevision: number | null;
   };
 };
+
+function isDeletedSessionFailure(health: StorageHealth) {
+  return health.errors.some((error) => error.includes("deleted in another tab"));
+}
 
 function isAuthorityFailure(health: StorageHealth) {
   return health.errors.some((error) => (
@@ -76,7 +92,7 @@ export function createEditorPersistenceController(
   let persistedRevision = 0;
   let latestMarkdown = "";
   let timer: TimerHandle | null = null;
-  let saveInFlight: { revision: number; promise: Promise<void> } | null = null;
+  let saveInFlight: { revision: number; promise: Promise<boolean> } | null = null;
 
   const clearTimer = () => {
     if (timer === null) return;
@@ -85,10 +101,14 @@ export function createEditorPersistenceController(
   };
 
   const reportHealth = (health: StorageHealth, revision: number) => {
-    if (revision !== editRevision) return;
+    if (disposed || revision !== editRevision) return;
     dependencies.onHealth?.(health);
     if (health.saved === true) {
       dependencies.onNotice?.(savedHealthNotice(health));
+      return;
+    }
+    if (isDeletedSessionFailure(health)) {
+      dependencies.onNotice?.("This session was deleted in another tab. Export a copy if you still need this text.");
       return;
     }
     dependencies.onNotice?.(isAuthorityFailure(health)
@@ -96,34 +116,47 @@ export function createEditorPersistenceController(
       : "A newer local revision is already stored in another tab.");
   };
 
-  const saveRevision = async (markdown: string, revision: number) => {
-    if (!loaded || revision !== editRevision || revision <= persistedRevision) return;
+  const saveRevision = async (markdown: string, revision: number): Promise<boolean> => {
+    if (disposed || !loaded || revision !== editRevision || revision <= persistedRevision) return true;
     if (saveInFlight?.revision === revision) return saveInFlight.promise;
 
     const promise = (async () => {
       try {
         const health = await save(markdown);
         reportHealth(health, revision);
-        if (health.saved === true && revision === editRevision) persistedRevision = revision;
+        if (!disposed && health.saved === true && revision === editRevision) persistedRevision = revision;
+        return health.saved === true;
       } catch {
-        if (revision === editRevision) {
+        if (!disposed && revision === editRevision) {
           dependencies.onNotice?.("This change could not be saved locally. Please export a copy before closing the page.");
         }
+        return false;
       }
     })();
     saveInFlight = { revision, promise };
     try {
-      await promise;
+      return await promise;
     } finally {
       if (saveInFlight?.promise === promise) saveInFlight = null;
     }
   };
 
-  const flush = () => {
+  const flush = async () => {
+    if (disposed) return true;
     clearTimer();
-    if (!loaded || editRevision <= persistedRevision) return Promise.resolve();
-    if (saveInFlight?.revision === editRevision) return saveInFlight.promise;
-    return saveRevision(latestMarkdown, editRevision);
+    if (!loaded) return true;
+
+    // An edit can arrive while an async save is in flight. Keep flushing until
+    // the revision observed at the end is the revision that was persisted.
+    while (!disposed && editRevision > persistedRevision) {
+      const revision = editRevision;
+      const saved = saveInFlight?.revision === revision
+        ? await saveInFlight.promise
+        : await saveRevision(latestMarkdown, revision);
+      if (disposed) return true;
+      if (!saved) return false;
+    }
+    return true;
   };
 
   const markLoaded = (markdown: string) => {
@@ -135,6 +168,7 @@ export function createEditorPersistenceController(
 
   return {
     async hydrate() {
+      if (disposed) return latestMarkdown;
       const markdown = await load();
       markLoaded(markdown);
       return markdown;
@@ -151,6 +185,7 @@ export function createEditorPersistenceController(
       const revision = editRevision;
       timer = schedule(() => {
         timer = null;
+        if (disposed) return;
         void saveRevision(markdown, revision);
       }, delayMs);
       return revision;
@@ -158,11 +193,30 @@ export function createEditorPersistenceController(
 
     flush,
 
-    async dispose() {
+    async abandon() {
       if (disposed) return;
-      const pending = flush();
+      clearTimer();
       disposed = true;
-      await pending;
+      loaded = false;
+      const inFlight = saveInFlight?.promise;
+      if (inFlight) await inFlight;
+    },
+
+    async dispose() {
+      if (disposed) return true;
+      // Await flush while still accepting in-flight completion so saveRevision can
+      // advance persistedRevision. Setting disposed first made flush hang forever:
+      // saveRevision returned true without updating persistedRevision while the
+      // loop kept waiting for editRevision > persistedRevision.
+      let flushed = true;
+      try {
+        flushed = await flush();
+      } finally {
+        clearTimer();
+        disposed = true;
+        loaded = false;
+      }
+      return flushed;
     },
 
     inspect,
