@@ -8,7 +8,7 @@ import TaskList from "@tiptap/extension-task-list";
 import { BlockMath, InlineMath } from "@tiptap/extension-mathematics";
 import { Markdown } from "@tiptap/markdown";
 import { closeHistory } from "@tiptap/pm/history";
-import { type Node as PMNode } from "@tiptap/pm/model";
+import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
 import { NodeSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -41,6 +41,7 @@ import {
   touchDocumentSession,
   type DocumentSession,
 } from "@/lib/document-sessions";
+import { classifyClipboardPaste } from "@/lib/paste-normalization";
 
 type SlashRange = { from: number; to: number };
 type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
@@ -756,10 +757,21 @@ function LabEditorSession() {
     editorProps: {
       handlePaste: (view, event) => {
         const text = event.clipboardData?.getData("text/plain") ?? "";
-        if (!text) return false;
-
+        const html = event.clipboardData?.getData("text/html") ?? "";
         const { $from } = view.state.selection;
-        if ($from.parent.isTextblock && !isCodeBlock($from.parent) && /^\/[a-z0-9-]*$/i.test(text)) {
+        const insideCodeBlock = isCodeBlock($from.parent);
+
+        // 1. Inside a code block every paste is literal plain text: no Markdown
+        // or LaTeX interpretation, whitespace and line endings preserved.
+        if (insideCodeBlock) {
+          if (!text) return false;
+          view.dispatch(view.state.tr.insertText(text).scrollIntoView());
+          return true;
+        }
+
+        // 2. Slash-fragment completion first because it interacts with
+        // slash-command input and undo history.
+        if ($from.parent.isTextblock && /^\/[a-z0-9-]*$/i.test(text)) {
           const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
           if (/(?:^|\s)\/[a-z0-9-]*$/i.test(before + text)) {
             view.dispatch(view.state.tr.insertText(text).setMeta("addToHistory", false).scrollIntoView());
@@ -767,7 +779,9 @@ function LabEditorSession() {
           }
         }
 
-        if ($from.parent.isTextblock && !isCodeBlock($from.parent)) {
+        // 3. Exact math-node insertion for the app's established delimiters:
+        // `$$x^2$$` inline and `$$` on their own lines as block math.
+        if ($from.parent.isTextblock) {
           const inlineMatch = text.match(INLINE_MATH_PATTERN);
           if (inlineMatch) {
             view.dispatch(
@@ -788,7 +802,9 @@ function LabEditorSession() {
           }
         }
 
-        const before = $from.parent.isTextblock && !isCodeBlock($from.parent)
+        // 4. Partial Markdown-link completion, e.g. typing `[label](` and then
+        // pasting a URL.
+        const before = $from.parent.isTextblock
           ? $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc")
           : "";
         const linkMatch = (before + text).match(MARKDOWN_LINK_PATTERN);
@@ -805,6 +821,63 @@ function LabEditorSession() {
               .scrollIntoView(),
           );
           return true;
+        }
+
+        // 5. Classify and execute the clipboard intent.
+        const intent = classifyClipboardPaste({ plainText: text, html, insideCodeBlock: false });
+        switch (intent.kind) {
+          case "native":
+            // Meaningful rich HTML: let Tiptap's schema-based parsing handle it.
+            return false;
+          case "plain-text":
+            // Plain prose: ProseMirror's native text handling splits paragraphs
+            // and normalizes line endings exactly as the editor expects. However,
+            // the markdown input rules also run on native pastes (ProseMirror
+            // routes plain-text pastes through `handleTextInput`), so ambiguous
+            // fragments like `_identifier_` or `5 * 3` would be auto-converted
+            // into emphasis marks. Insert such text literally instead.
+            if (!/[`*_~]/.test(text)) return false;
+            const lines = text.split(/\r\n?|\n/);
+            if (lines.length === 1) {
+              view.dispatch(view.state.tr.insertText(text).scrollIntoView());
+            } else {
+              const { paragraph } = view.state.schema.nodes;
+              const blocks = lines
+                .filter((line) => line.length > 0)
+                .map((line) => paragraph.create(null, view.state.schema.text(line)));
+              view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.from(blocks), 0, 0)).scrollIntoView());
+            }
+            return true;
+          case "markdown": {
+            const editor = editorRef.current;
+            if (!editor) return false;
+            editor.commands.insertContentAt(
+              {
+                from: view.state.selection.from,
+                to: view.state.selection.to,
+              },
+              intent.markdown,
+              {
+                contentType: "markdown",
+                updateSelection: true,
+              },
+            );
+            return true;
+          }
+          case "inline-math":
+            view.dispatch(
+              view.state.tr
+                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({ latex: intent.latex }))
+                .scrollIntoView(),
+            );
+            return true;
+          case "block-math":
+            view.dispatch(
+              view.state.tr
+                .replaceSelectionWith(view.state.schema.nodes.blockMath.create({ latex: intent.latex }))
+                .scrollIntoView(),
+            );
+            return true;
         }
         return false;
       },
