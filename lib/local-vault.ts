@@ -911,6 +911,11 @@ function clearPendingDocument(expected: PendingDocument | null = null) {
 /**
  * Stage the newest editor value synchronously before the debounced replica write.
  * This gives pagehide/unload a local recovery point even if async storage writes are cut short.
+ * Synchronous by design: IndexedDB tombstones are promoted to localStorage/memory
+ * asynchronously via refreshDeletedFromIndexedDb() in load/save paths. A peer
+ * delete that exists only in IndexedDB may still stage once before the next
+ * async vault operation; the subsequent save will then fail with saved:false
+ * and surface the deleted-session notice.
  */
 export function stageLocalDocument(markdown: string) {
   if (isLocalDocumentDeleted()) return false;

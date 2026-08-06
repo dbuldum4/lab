@@ -403,7 +403,15 @@ function LabEditorSession() {
   // Only constructed after LabEditor mounts on the client, so the hash is real.
   // Invalid ids still map to the default document; the hash is rewritten in layout
   // (not during useState init) so React Strict Mode double-init stays correct.
-  const [documentId] = useState(() => activeDocumentIdFromLocation());
+  // Vault scope must be bound synchronously at mount so the persistence
+  // controller and first hydrate see the correct namespace. This initializer
+  // runs once on the client (LabEditor is client-gated) and is safe to
+  // perform the scope side effect here.
+  const [documentId] = useState(() => {
+    const id = activeDocumentIdFromLocation();
+    setLocalDocumentScope(id);
+    return id;
+  });
   const [openedWithInvalidSessionHash] = useState(
     () => parseActiveDocumentLocation().hadInvalidSessionHash,
   );
@@ -412,7 +420,6 @@ function LabEditorSession() {
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
 
   const [persistence] = useState<EditorPersistenceController>(() => {
-    setLocalDocumentScope(documentId);
     const e2eDelay = typeof window === "undefined"
       ? undefined
       : (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__;
@@ -1057,6 +1064,8 @@ function LabEditorSession() {
     // Same-path hash changes do not load a new document by themselves. Push a
     // real history entry, then reload so documentId and vault scope rebind.
     // Back/forward are handled by the popstate listener below (also reload).
+    // Full reload is intentional: vault scope and persistence are bound at mount
+    // and must rebind cleanly to the new document namespace.
     if (current === target) {
       window.location.reload();
       return;

@@ -165,6 +165,8 @@ export function activeDocumentIdFromLocation(location: Pick<Location, "hash"> | 
 /**
  * Clear a bad `#session=…` hash so the address bar matches default storage.
  * Returns true when an invalid hash was present and rewritten.
+ * The app only uses #session=; other hash fragments are intentionally not
+ * preserved when an invalid session hash is rewritten.
  */
 export function clearInvalidDocumentSessionHash(
   location: Pick<Location, "hash" | "pathname" | "search"> | undefined = globalThis.location,
@@ -217,8 +219,11 @@ export async function ensureDocumentSession(id: string) {
 
 export async function createDocumentSession(name = "Untitled") {
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const id = globalThis.crypto?.randomUUID?.().replaceAll("-", "")
-      ?? `${Date.now()}${Math.random().toString(36).slice(2)}`;
+    const fallbackId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`;
+    const raw = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ?? fallbackId;
+    // Sanitize fallback entropy (toString(36) is already [0-9a-z]) and cap length so
+    // isValidDocumentId stays cheap and the loop can retry on any invalid shape.
+    const id = raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || fallbackId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
     if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
     const now = Date.now();
     // null means the id became unusable under the lock (tombstone or live
