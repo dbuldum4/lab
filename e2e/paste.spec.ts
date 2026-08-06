@@ -116,6 +116,41 @@ test("structured Markdown paste becomes real document structure", async ({ page 
   await expect(editor.locator("pre")).toHaveCount(0);
 });
 
+test("a bare Markdown link paste becomes a link without page errors", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(`${error.name}: ${error.message}`));
+  const editor = await openEditor(page);
+  await editor.click();
+  await paste(page, { text: "[docs](https://x.com)" });
+
+  await expect(editor.locator('a[href="https://x.com"]')).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
+test("a Markdown document ending in a link is parsed without page errors", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(`${error.name}: ${error.message}`));
+  const editor = await openEditor(page);
+  await editor.click();
+  await paste(page, { text: "# Heading\n\nSee [docs](https://x.com)" });
+
+  await expect(editor.locator("h1")).toHaveText("Heading");
+  await expect(editor.locator('p a[href="https://x.com"]')).toHaveText("docs");
+  expect(errors).toEqual([]);
+});
+
+test("pasting a URL completes a partially typed Markdown link", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(`${error.name}: ${error.message}`));
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("[docs](");
+  await paste(page, { text: "https://x.com)" });
+
+  await expect(editor.locator('a[href="https://x.com"]')).toHaveText("docs");
+  expect(errors).toEqual([]);
+});
+
 test("GFM paste keeps task lists, nested lists, fences, strike, and tables", async ({ page }) => {
   const editor = await openEditor(page);
   const markdown = [

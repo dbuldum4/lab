@@ -761,13 +761,12 @@ function LabEditorSession() {
         const { $from } = view.state.selection;
         const insideCodeBlock = isCodeBlock($from.parent);
 
-        // 1. Inside a code block every paste is literal plain text: no Markdown
-        // or LaTeX interpretation, whitespace and line endings preserved.
         if (insideCodeBlock) {
-          if (!text) return false;
           view.dispatch(view.state.tr.insertText(text).scrollIntoView());
           return true;
         }
+
+        const intent = classifyClipboardPaste({ plainText: text, html });
 
         // 2. Slash-fragment completion first because it interacts with
         // slash-command input and undo history.
@@ -809,8 +808,17 @@ function LabEditorSession() {
           : "";
         const linkMatch = (before + text).match(MARKDOWN_LINK_PATTERN);
         const linkMark = view.state.schema.marks.link;
-        if (linkMatch && linkMark) {
-          const tokenFrom = view.state.selection.from - (linkMatch[0].length - text.length);
+        if (
+          linkMatch?.index !== undefined
+          && linkMatch.index < before.length
+          && linkMatch[0].length > text.length
+          && view.state.selection.empty
+          && linkMark
+        ) {
+          const tokenFrom = Math.max(
+            $from.start(),
+            view.state.selection.from - (linkMatch[0].length - text.length),
+          );
           view.dispatch(
             view.state.tr
               .replaceWith(
@@ -824,7 +832,6 @@ function LabEditorSession() {
         }
 
         // 5. Classify and execute the clipboard intent.
-        const intent = classifyClipboardPaste({ plainText: text, html, insideCodeBlock: false });
         switch (intent.kind) {
           case "native":
             // Meaningful rich HTML: let Tiptap's schema-based parsing handle it.
@@ -842,9 +849,10 @@ function LabEditorSession() {
               view.dispatch(view.state.tr.insertText(text).scrollIntoView());
             } else {
               const { paragraph } = view.state.schema.nodes;
+              const marks = view.state.storedMarks ?? $from.marks();
               const blocks = lines
                 .filter((line) => line.length > 0)
-                .map((line) => paragraph.create(null, view.state.schema.text(line)));
+                .map((line) => paragraph.create(null, view.state.schema.text(line, marks)));
               view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.from(blocks), 0, 0)).scrollIntoView());
             }
             return true;
@@ -920,8 +928,16 @@ function LabEditorSession() {
             const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
             const linkMatch = (before + event.key).match(MARKDOWN_LINK_PATTERN);
             const linkMark = view.state.schema.marks.link;
-            if (linkMatch?.index !== undefined && linkMark) {
-              const tokenFrom = view.state.selection.from - (linkMatch[0].length - event.key.length);
+            if (
+              linkMatch?.index !== undefined
+              && linkMatch.index < before.length
+              && linkMatch[0].length > event.key.length
+              && linkMark
+            ) {
+              const tokenFrom = Math.max(
+                $from.start(),
+                view.state.selection.from - (linkMatch[0].length - event.key.length),
+              );
               view.dispatch(
                 view.state.tr.replaceWith(
                   tokenFrom,

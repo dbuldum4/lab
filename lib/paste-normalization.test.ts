@@ -59,7 +59,7 @@ test("ambiguous standalone tokens stay plain text", () => {
   ];
   for (const text of cases) {
     assert.equal(looksLikeMarkdown(text), false, JSON.stringify(text));
-    assert.equal(kind(classifyClipboardPaste({ plainText: text, html: "", insideCodeBlock: false })), "plain-text", JSON.stringify(text));
+    assert.equal(kind(classifyClipboardPaste({ plainText: text, html: "" })), "plain-text", JSON.stringify(text));
   }
 });
 
@@ -78,22 +78,17 @@ test("markdownScore gives block constructs more weight than inline ones", () => 
 });
 
 test("classifyClipboardPaste maps strong Markdown to the markdown intent", () => {
-  const intent = classifyClipboardPaste({ plainText: "# Title\n\nSome text", html: "", insideCodeBlock: false });
+  const intent = classifyClipboardPaste({ plainText: "# Title\n\nSome text", html: "" });
   assert.equal(intent.kind, "markdown");
   if (intent.kind === "markdown") assert.equal(intent.markdown, "# Title\n\nSome text");
 });
 
-test("inside a code block everything becomes literal plain text", () => {
-  const intent = classifyClipboardPaste({ plainText: "# Heading\n\n$$x^2$$", html: "<h1>Heading</h1>", insideCodeBlock: true });
-  assert.deepEqual(intent, { kind: "plain-text", text: "# Heading\n\n$$x^2$$" });
-});
-
 test("mixed line endings are normalized", () => {
-  const intent = classifyClipboardPaste({ plainText: "# Heading\r\n\r\n> quote\r\n", html: "", insideCodeBlock: false });
+  const intent = classifyClipboardPaste({ plainText: "# Heading\r\n\r\n> quote\r\n", html: "" });
   assert.equal(intent.kind, "markdown");
   if (intent.kind === "markdown") assert.equal(intent.markdown, "# Heading\n\n> quote\n");
-  const code = classifyClipboardPaste({ plainText: "a\r\nb\r\n", html: "", insideCodeBlock: true });
-  assert.deepEqual(code, { kind: "plain-text", text: "a\nb\n" });
+  const plain = classifyClipboardPaste({ plainText: "a\r\nb\r\n", html: "" });
+  assert.deepEqual(plain, { kind: "plain-text", text: "a\nb\n" });
 });
 
 test("rich HTML wins over Markdown-looking plain text", () => {
@@ -101,7 +96,6 @@ test("rich HTML wins over Markdown-looking plain text", () => {
   const intent = classifyClipboardPaste({
     plainText: "# Rich Title\n\nSome **bold** text",
     html,
-    insideCodeBlock: false,
   });
   assert.equal(kind(intent), "native");
 });
@@ -122,6 +116,7 @@ test("Markdown wrapped in structureless HTML is detected as a wrapper", () => {
   const cases: Array<[string, string, boolean]> = [
     ["<pre># Heading\n\nparagraph</pre>", "# Heading\n\nparagraph", true],
     ["<div># Heading</div>", "# Heading", true],
+    ["<div># Heading &#128512;</div>", "# Heading 😀", true],
     ["<span>- one\n- two</span>", "- one\n- two", true],
     ["<p># Heading</p>", "# Heading", true],
     ["<div><span># Heading</span></div>", "# Heading", true],
@@ -143,13 +138,12 @@ test("wrapped Markdown is parsed instead of inserted natively", () => {
   const intent = classifyClipboardPaste({
     plainText: "# Wrapped\n\nparagraph",
     html: "<pre># Wrapped\n\nparagraph</pre>",
-    insideCodeBlock: false,
   });
   assert.equal(kind(intent), "markdown");
 });
 
 test("empty anchors do not create visible text via the HTML path", () => {
-  assert.equal(kind(classifyClipboardPaste({ plainText: "", html: '<a id="section-name"></a>', insideCodeBlock: false })), "native");
+  assert.equal(kind(classifyClipboardPaste({ plainText: "", html: '<a id="section-name"></a>' })), "native");
   assert.equal(htmlHasSemanticStructure('<a id="section-name"></a>'), true);
 });
 
@@ -265,13 +259,12 @@ test("classifyStandaloneLatex rejects prose and false positives", () => {
 
 test("classification of a full payload never turns ordinary prose into math", () => {
   for (const text of ["The price is $5", "#hashtag", "-3", "1.2", "file_name", "hello world"]) {
-    assert.equal(kind(classifyClipboardPaste({ plainText: text, html: "", insideCodeBlock: false })), "plain-text", JSON.stringify(text));
+    assert.equal(kind(classifyClipboardPaste({ plainText: text, html: "" })), "plain-text", JSON.stringify(text));
   }
 });
 
 test("empty payloads are handled deterministically", () => {
-  assert.equal(kind(classifyClipboardPaste({ plainText: "", html: "", insideCodeBlock: false })), "plain-text");
-  assert.deepEqual(classifyClipboardPaste({ plainText: "", html: "", insideCodeBlock: true }), { kind: "plain-text", text: "" });
+  assert.equal(kind(classifyClipboardPaste({ plainText: "", html: "" })), "plain-text");
   assert.equal(classifyStandaloneLatex(""), null);
   assert.equal(looksLikeMarkdown(""), false);
   assert.equal(htmlIsPlainMarkdownWrapper("", ""), false);

@@ -37,20 +37,14 @@ function normalizeLineEndings(text: string) {
 /**
  * Ordered clipboard decision pipeline. Earlier rules take precedence:
  *
- * 1. Inside a code block the payload is always literal plain text.
+ * 1. HTML that merely wraps literal Markdown is parsed as Markdown.
  * 2. Rich HTML with meaningful semantic structure wins over plain text.
- * 3. HTML that merely wraps literal Markdown is parsed as Markdown.
- * 4. Otherwise the plain-text payload is classified on its own.
+ * 3. Otherwise the plain-text payload is classified on its own.
  */
 export function classifyClipboardPaste(input: {
   plainText: string;
   html: string;
-  insideCodeBlock: boolean;
 }): PasteIntent {
-  if (input.insideCodeBlock) {
-    return { kind: "plain-text", text: normalizeLineEndings(input.plainText) };
-  }
-
   const plainText = normalizeLineEndings(input.plainText);
   const html = input.html.trim();
 
@@ -139,8 +133,8 @@ function htmlTextContent(html: string): string {
     .replace(/&gt;/gi, ">")
     .replace(/&quot;/gi, "\"")
     .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(Number.parseInt(code, 16)));
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)));
 }
 
 function equivalentVisibleText(left: string, right: string) {
@@ -308,7 +302,7 @@ function katexValidates(latex: string, displayMode: boolean): boolean {
       throwOnError: true,
       strict: "warn",
       trust: false,
-      output: "htmlAndMathml",
+      output: "html",
     });
     return true;
   } catch {
