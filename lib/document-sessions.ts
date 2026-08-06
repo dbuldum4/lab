@@ -165,8 +165,9 @@ export function activeDocumentIdFromLocation(location: Pick<Location, "hash"> | 
 /**
  * Clear a bad `#session=…` hash so the address bar matches default storage.
  * Returns true when an invalid hash was present and rewritten.
- * The app only uses #session=; other hash fragments are intentionally not
- * preserved when an invalid session hash is rewritten.
+ * The app only uses #session= for routing; other hash fragments are not used
+ * and are intentionally not preserved when an invalid session hash is
+ * rewritten to avoid leaving a stale, misleading `#session=bad` in history.
  */
 export function clearInvalidDocumentSessionHash(
   location: Pick<Location, "hash" | "pathname" | "search"> | undefined = globalThis.location,
@@ -219,10 +220,23 @@ export async function ensureDocumentSession(id: string) {
 
 export async function createDocumentSession(name = "Untitled") {
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const fallbackId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`;
+    const fallbackId = (() => {
+      const time = Date.now().toString(36);
+      const bytes = (() => {
+        try {
+          const buf = new Uint8Array(12);
+          globalThis.crypto?.getRandomValues?.(buf);
+          // Hex is [0-9a-f] so already valid for isValidDocumentId.
+          return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
+        } catch {
+          return `${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`;
+        }
+      })();
+      return `${time}${bytes}`;
+    })();
     const raw = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ?? fallbackId;
-    // Sanitize fallback entropy (toString(36) is already [0-9a-z]) and cap length so
-    // isValidDocumentId stays cheap and the loop can retry on any invalid shape.
+    // Sanitize entropy (randomUUID without dashes is hex; fallback is [0-9a-z]) and cap
+    // length so isValidDocumentId stays cheap and the loop can retry on any invalid shape.
     const id = raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || fallbackId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
     if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
     const now = Date.now();
@@ -353,6 +367,8 @@ export function listDocumentSessions(): DocumentSession[] {
     sessions.push({ id: DEFAULT_DOCUMENT_ID, name: "Untitled", createdAt: 0, updatedAt: 0 });
   }
   return sessions.sort((left, right) => (
-    right.updatedAt - left.updatedAt || left.name.localeCompare(right.name) || left.id.localeCompare(right.id)
+    right.updatedAt - left.updatedAt
+    || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
+    || left.id.localeCompare(right.id)
   ));
 }

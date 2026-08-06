@@ -183,9 +183,26 @@ function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
 }
 
-/** Index just before the code point ending at `index` (handles surrogate pairs). */
-function previousCodePointIndex(text: string, index: number) {
+/** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
+function previousGraphemeIndex(text: string, index: number) {
   if (index <= 0) return 0;
+  const Segmenter = (globalThis as unknown as { Intl?: { Segmenter?: unknown } }).Intl?.Segmenter as
+    | (new (locale: string | undefined, opts: { granularity: string }) => { segment(input: string): Iterable<{ segment: string; index: number }> })
+    | undefined;
+  if (Segmenter) {
+    try {
+      const segmenter = new Segmenter(undefined, { granularity: "grapheme" });
+      let prev = 0;
+      for (const { segment } of segmenter.segment(text.slice(0, index))) {
+        const next = prev + segment.length;
+        if (next >= index) return prev;
+        prev = next;
+      }
+      return prev;
+    } catch {
+      // Fall through to code-unit fallback.
+    }
+  }
   if (index >= 2) {
     const low = text.charCodeAt(index - 1);
     const high = text.charCodeAt(index - 2);
@@ -199,17 +216,17 @@ function previousCodePointIndex(text: string, index: number) {
 function backwardWordStart(text: string) {
   let start = text.length;
   while (start > 0) {
-    const prev = previousCodePointIndex(text, start);
+    const prev = previousGraphemeIndex(text, start);
     if (!/\s/u.test(text.slice(prev, start))) break;
     start = prev;
   }
 
   if (start > 0) {
-    const prev = previousCodePointIndex(text, start);
+    const prev = previousGraphemeIndex(text, start);
     const unit = text.slice(prev, start);
     if (/[\p{L}\p{N}_]/u.test(unit)) {
       while (start > 0) {
-        const p = previousCodePointIndex(text, start);
+        const p = previousGraphemeIndex(text, start);
         if (!/[\p{L}\p{N}_]/u.test(text.slice(p, start))) break;
         start = p;
       }
@@ -406,7 +423,8 @@ function LabEditorSession() {
   // Vault scope must be bound synchronously at mount so the persistence
   // controller and first hydrate see the correct namespace. This initializer
   // runs once on the client (LabEditor is client-gated) and is safe to
-  // perform the scope side effect here.
+  // perform the scope side effect here — setLocalDocumentScope is idempotent
+  // (guards on activeDocumentId).
   const [documentId] = useState(() => {
     const id = activeDocumentIdFromLocation();
     setLocalDocumentScope(id);
@@ -427,6 +445,8 @@ function LabEditorSession() {
       delayMs: Number.isFinite(e2eDelay) ? e2eDelay : undefined,
       onHealth: (nextHealth) => {
         setHealth(nextHealth);
+        // documentId is stable for the mount lifetime (session switches reload),
+        // so capturing it here is intentional and avoids a ref.
         if (nextHealth.saved === true) void touchDocumentSession(documentId).catch(() => undefined);
       },
       onNotice: setNotice,
@@ -1689,6 +1709,7 @@ function LabEditorSession() {
                   key={session.id}
                   role="option"
                   aria-selected={index === selected}
+                  aria-current={session.id === documentId ? "true" : undefined}
                   onMouseDown={(event) => {
                     event.preventDefault();
                     if (session.id === documentId) {
