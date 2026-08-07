@@ -139,6 +139,18 @@ test("a Markdown document ending in a link is parsed without page errors", async
   expect(errors).toEqual([]);
 });
 
+test("a single-line paste ending in a Markdown link keeps its text and link", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(`${error.name}: ${error.message}`));
+  const editor = await openEditor(page);
+  await editor.click();
+  await paste(page, { text: "See [docs](https://x.com)" });
+
+  await expect(editor).toContainText("See");
+  await expect(editor.locator('a[href="https://x.com"]')).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
 test("pasting a URL completes a partially typed Markdown link", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(`${error.name}: ${error.message}`));

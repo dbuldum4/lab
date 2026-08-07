@@ -766,8 +766,6 @@ function LabEditorSession() {
           return true;
         }
 
-        const intent = classifyClipboardPaste({ plainText: text, html });
-
         // 2. Slash-fragment completion first because it interacts with
         // slash-command input and undo history.
         if ($from.parent.isTextblock && /^\/[a-z0-9-]*$/i.test(text)) {
@@ -832,6 +830,7 @@ function LabEditorSession() {
         }
 
         // 5. Classify and execute the clipboard intent.
+        const intent = classifyClipboardPaste({ plainText: text, html });
         switch (intent.kind) {
           case "native":
             // Meaningful rich HTML: let Tiptap's schema-based parsing handle it.
