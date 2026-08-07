@@ -6,6 +6,7 @@ import { TableKit } from "@tiptap/extension-table";
 import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
 import { BlockMath, InlineMath } from "@tiptap/extension-mathematics";
+import Image from "@tiptap/extension-image";
 import { Markdown } from "@tiptap/markdown";
 import { closeHistory } from "@tiptap/pm/history";
 import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
@@ -88,6 +89,7 @@ const COMMANDS: Command[] = [
   { id: "inline-math", label: "Inline equation", detail: "Write LaTeX within a line", terms: "math latex formula inline equation" },
   { id: "math", label: "Block equation", detail: "Write a centered LaTeX equation", terms: "math latex formula display equation" },
   { id: "link", label: "Link", detail: "Type a URL, then close with )", terms: "url href markdown" },
+  { id: "image", label: "Image", detail: "Insert a local image", terms: "photo picture upload paste" },
   { id: "undo", label: "Undo", detail: "Undo the last change", terms: "back history" },
   { id: "redo", label: "Redo", detail: "Redo the last change", terms: "forward history" },
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
@@ -327,6 +329,37 @@ function recoveryBundle(drafts: readonly LocalRecoveryDraft[]) {
   }).join("\n\n---\n\n");
 }
 
+function readFileAsDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function insertImageFiles(editor: Editor, files: FileList | readonly File[]) {
+  const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+  if (imageFiles.length === 0 || editor.isDestroyed) return;
+
+  const dataUrls = await Promise.all(
+    imageFiles.map(async (file) => ({ file, dataUrl: await readFileAsDataURL(file) })),
+  );
+  if (editor.isDestroyed) return;
+
+  const { schema } = editor;
+  const nodes: PMNode[] = [];
+  for (const { file, dataUrl } of dataUrls) {
+    const alt = file.name.replace(/\.[^/.]+$/, "");
+    nodes.push(schema.nodes.image.create({ src: dataUrl, alt }));
+    nodes.push(schema.nodes.paragraph.create());
+  }
+
+  editor.view.dispatch(
+    editor.state.tr.replaceSelection(new Slice(Fragment.from(nodes), 0, 0)).scrollIntoView(),
+  );
+}
+
 const PlainUrlInput = Extension.create({
   name: "plainUrlInput",
   addInputRules() {
@@ -407,6 +440,7 @@ function LabEditorSession() {
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
   const paletteRef = useRef<PaletteState | null>(null);
   const mathEditorRef = useRef<MathEditorState | null>(null);
@@ -744,6 +778,7 @@ function LabEditorSession() {
       TaskItem.configure({ nested: true }),
       TableKit.configure({ table: { resizable: false } }),
       Placeholder.configure({ placeholder: "" }),
+      Image.configure({ allowBase64: true, HTMLAttributes: { class: "lab-image" } }),
       ...mathExtensions,
       Markdown.configure({ markedOptions: { gfm: true } }),
       MarkdownLinkInput,
@@ -756,6 +791,16 @@ function LabEditorSession() {
     editable: false,
     editorProps: {
       handlePaste: (view, event) => {
+        const files = event.clipboardData?.files;
+        if (files && files.length > 0) {
+          const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+          if (imageFiles.length > 0 && editorRef.current) {
+            event.preventDefault();
+            void insertImageFiles(editorRef.current, imageFiles);
+            return true;
+          }
+        }
+
         const text = event.clipboardData?.getData("text/plain") ?? "";
         const html = event.clipboardData?.getData("text/html") ?? "";
         const { $from } = view.state.selection;
@@ -887,6 +932,31 @@ function LabEditorSession() {
             return true;
         }
         return false;
+      },
+      handleDrop: (view, event) => {
+        const files = (event as DragEvent).dataTransfer?.files;
+        if (files && files.length > 0) {
+          const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+          if (imageFiles.length > 0 && editorRef.current) {
+            event.preventDefault();
+            void insertImageFiles(editorRef.current, imageFiles);
+            return true;
+          }
+        }
+        return false;
+      },
+      handleDOMEvents: {
+        dragover: (view, event) => {
+          const dataTransfer = (event as DragEvent).dataTransfer;
+          if (!dataTransfer) return false;
+          const hasImageFile = Array.from(dataTransfer.items).some(
+            (item) => item.kind === "file" && item.type.startsWith("image/"),
+          );
+          if (!hasImageFile) return false;
+          event.preventDefault();
+          dataTransfer.dropEffect = "copy";
+          return true;
+        },
       },
       handleKeyDown: (view, event) => {
         if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e") {
@@ -1368,6 +1438,7 @@ function LabEditorSession() {
           break;
         }
         case "link": chain.insertContent("[label](https://").run(); break;
+        case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
           downloadMarkdown("lab.md", editor.getMarkdown());
@@ -1641,6 +1712,13 @@ function LabEditorSession() {
     event.target.value = "";
   };
 
+  const onImageImport = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || !editor || files.length === 0) return;
+    void insertImageFiles(editor, files).catch(() => setNotice("The selected image could not be inserted."));
+    event.target.value = "";
+  };
+
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1733,6 +1811,7 @@ function LabEditorSession() {
         <span ref={caretStrokeRef} className="lab-caret-stroke" data-blinking="true" />
       </div>
       <input ref={fileInputRef} hidden type="file" accept=".md,.markdown,text/markdown,text/plain" tabIndex={-1} aria-hidden="true" onChange={onImport} />
+      <input ref={imageInputRef} hidden type="file" accept="image/*" multiple tabIndex={-1} aria-hidden="true" onChange={onImageImport} />
 
       {palette ? (
         <>

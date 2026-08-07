@@ -351,6 +351,14 @@ img.ProseMirror-separator {
   border-top: 1px solid var(--line);
 }
 
+.lab-document img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 1.1em 0;
+  border-radius: 8px;
+}
+
 .lab-document .tableWrapper {
   margin: 1.25em 0;
   overflow-x: auto;
