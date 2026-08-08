@@ -1,81 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
-
-type Snapshot = {
-  markdown: string;
-  updatedAt: number;
-  checksum: string;
-  version: number;
-};
-
-type BackendState = {
-  local: Snapshot | null;
-  authority: { revision: number; snapshot: Snapshot } | null;
-  current: Snapshot | null;
-  opfs: Snapshot | null;
-  opfsSupported: boolean;
-};
-
-async function openEditor(page: Page) {
-  await page.goto("/");
-  const editor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
-  await expect(editor).toBeVisible();
-  await expect(editor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
-  return editor;
-}
-
-async function backendState(page: Page): Promise<BackendState> {
-  return page.evaluate(async () => {
-    const parse = (raw: string | null) => (raw ? JSON.parse(raw) as Snapshot : null);
-    const local = parse(localStorage.getItem("lab.document.v1"));
-    let authority: { revision: number; snapshot: Snapshot } | null = null;
-    let current: Snapshot | null = null;
-    try {
-      const db = await new Promise<IDBDatabase | null>((resolve) => {
-        const request = indexedDB.open("lab-private-vault");
-        request.onerror = () => resolve(null);
-        request.onsuccess = () => resolve(request.result);
-      });
-      if (db) {
-        const state = await new Promise<{ authority: unknown; current: unknown }>((resolve, reject) => {
-          const transaction = db.transaction("documents", "readonly");
-          const store = transaction.objectStore("documents");
-          let authorityRaw: unknown;
-          let currentRaw: unknown;
-          const authorityRequest = store.get("authority");
-          const currentRequest = store.get("current");
-          authorityRequest.onsuccess = () => { authorityRaw = authorityRequest.result; };
-          currentRequest.onsuccess = () => { currentRaw = currentRequest.result; };
-          transaction.oncomplete = () => resolve({ authority: authorityRaw, current: currentRaw });
-          transaction.onerror = () => reject(transaction.error);
-          transaction.onabort = () => reject(transaction.error);
-        });
-        authority = (state.authority ?? null) as typeof authority;
-        current = (state.current ?? null) as Snapshot | null;
-        db.close();
-      }
-    } catch {
-      // Not-found and unsupported IndexedDB are represented as null.
-    }
-    let opfs: Snapshot | null = null;
-    let opfsSupported = false;
-    try {
-      const root = await navigator.storage.getDirectory();
-      opfsSupported = true;
-      const handle = await root.getFileHandle("lab.md.snapshot");
-      opfs = JSON.parse(await (await handle.getFile()).text()) as Snapshot;
-    } catch {
-      // Not-found and unsupported OPFS are both represented as null.
-    }
-    return { local, authority, current, opfs, opfsSupported };
-  });
-}
-
-async function waitForAuthority(page: Page, markdownPattern: RegExp) {
-  await expect.poll(
-    async () => (await backendState(page)).authority?.snapshot.markdown ?? "",
-    { timeout: 15000, intervals: [50, 100, 250, 500] },
-  ).toMatch(markdownPattern);
-}
+import { expect, test } from "@playwright/test";
+import { openEditor, waitForAuthority } from "./helpers";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
@@ -147,7 +71,7 @@ test("dropping an image file inserts a base64 image", async ({ page }) => {
         dataTransfer,
       }),
     );
-  }, { x: box.x + box.width / 2, y: box.y + box.height / 2 })
+  }, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
 
   const img = editor.locator("img.lab-image");
   await expect(img).toBeVisible();
@@ -155,4 +79,106 @@ test("dropping an image file inserts a base64 image", async ({ page }) => {
   await expect(img).toHaveAttribute("src", /data:image\/png;base64,/);
 
   await waitForAuthority(page, /!\[dropped\]\(data:image\/png;base64,/);
+});
+
+test("pasting an image mid-paragraph does not insert a blank paragraph", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await page.keyboard.type("Hello world!");
+  // Place the caret after "Hello " (6 chars from start of the textblock).
+  await editor.evaluate((node) => {
+    const selection = window.getSelection();
+    const textNode = node.querySelector("p")?.firstChild;
+    if (!selection || !textNode || textNode.nodeType !== Node.TEXT_NODE) {
+      throw new Error("Expected a text node inside the editor paragraph");
+    }
+    const range = document.createRange();
+    range.setStart(textNode, 6);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+
+  await editor.evaluate((node) => {
+    const buffer = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+    const file = new File([buffer], "pasted.png", { type: "image/png" });
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    node.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dataTransfer,
+      }),
+    );
+  });
+
+  await expect(editor.locator("img.lab-image")).toBeVisible();
+  // Expect: <p>Hello </p><img>...<p>world!</p> — no empty paragraph between image and trailing text.
+  await expect.poll(async () => {
+    return editor.evaluate((node) => {
+      const blocks = Array.from(node.querySelectorAll(":scope > *")).map((el) => {
+        if (el.tagName === "IMG") return "img";
+        if (el.tagName === "P") {
+          const text = el.textContent ?? "";
+          return text.length === 0 || text === "\u200B" ? "p:empty" : `p:${text}`;
+        }
+        return el.tagName.toLowerCase();
+      });
+      return blocks;
+    });
+  }).toEqual(["p:Hello ", "img", "p:world!"]);
+
+  await waitForAuthority(page, /Hello\s*\n\n!\[pasted\]\(data:image\/png;base64,[^)]+\)\s*\n\nworld!/);
+});
+
+test("oversized images are rejected with a notice", async ({ page }) => {
+  const editor = await openEditor(page);
+  // Build the oversized File in the page so size is exact and we avoid multi-MB IPC payload flakiness.
+  await page.locator('input[type="file"][accept*="image/*"]').evaluate((input) => {
+    const file = new File([new Uint8Array(1_500_001)], "huge.png", { type: "image/png" });
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    const element = input as HTMLInputElement;
+    element.files = transfer.files;
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+
+  await expect(page.locator(".editor-notice")).toContainText(/too large to store locally/i, {
+    timeout: 10000,
+  });
+  await expect(editor.locator("img.lab-image")).toHaveCount(0);
+});
+
+test("rich HTML with a remote image URL does not insert a broken image", async ({ page }) => {
+  const editor = await openEditor(page);
+
+  await editor.evaluate((node) => {
+    const dataTransfer = new DataTransfer();
+    dataTransfer.setData("text/html", '<p>See <img src="https://example.com/remote.png" alt="remote"></p>');
+    dataTransfer.setData("text/plain", "See ");
+    node.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dataTransfer,
+      }),
+    );
+  });
+
+  await expect(editor.locator("img")).toHaveCount(0);
+  await expect(editor.locator('img[src*="example.com"]')).toHaveCount(0);
+});
+
+test("image alt with special characters is escaped in Markdown export", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("/image");
+  await page.keyboard.press("Enter");
+  await page.locator('input[type="file"][accept*="image/*"]').setInputFiles(pngFile("a]b.png"));
+
+  const img = editor.locator("img.lab-image");
+  await expect(img).toBeVisible();
+  await expect(img).toHaveAttribute("alt", "a]b");
+
+  await waitForAuthority(page, /!\[a\\\]b\]\(data:image\/png;base64,/);
 });

@@ -1,6 +1,13 @@
 "use client";
 
-import { Extension, InputRule, type Editor } from "@tiptap/core";
+import {
+  Extension,
+  InputRule,
+  type Editor,
+  type JSONContent,
+  type MarkdownParseHelpers,
+  type MarkdownToken,
+} from "@tiptap/core";
 import Placeholder from "@tiptap/extension-placeholder";
 import { TableKit } from "@tiptap/extension-table";
 import TaskItem from "@tiptap/extension-task-item";
@@ -329,36 +336,144 @@ function recoveryBundle(drafts: readonly LocalRecoveryDraft[]) {
   }).join("\n\n---\n\n");
 }
 
+/** Raw file cap before base64 (~4/3) so a single image stays under typical localStorage quotas. */
+const MAX_IMAGE_BYTES = 1_500_000;
+
 function readFileAsDataURL(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result ?? ""));
-    reader.onerror = () => reject(reader.error);
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read image file"));
     reader.readAsDataURL(file);
   });
 }
 
-async function insertImageFiles(editor: Editor, files: FileList | readonly File[]) {
+/** Local-first images only: data URLs, blob URLs, and same-origin paths. */
+function isAllowedImageSrc(src: string | null | undefined): boolean {
+  if (!src) return false;
+  const trimmed = src.trim();
+  if (trimmed.startsWith("data:image/")) return true;
+  if (trimmed.startsWith("blob:")) return true;
+  try {
+    if (typeof window === "undefined") {
+      return trimmed.startsWith("/") && !trimmed.startsWith("//");
+    }
+    const url = new URL(trimmed, window.location.href);
+    if (url.protocol === "blob:") return true;
+    if (url.protocol === "data:") return url.href.startsWith("data:image/");
+    return url.origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+function escapeMarkdownImageAlt(alt: string): string {
+  return alt.replace(/\\/g, "\\\\").replace(/]/g, "\\]").replace(/\r?\n/g, " ");
+}
+
+function escapeMarkdownImageTitle(title: string): string {
+  return title.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+}
+
+type InsertImageFilesOptions = {
+  onNotice?: (message: string) => void;
+};
+
+async function insertImageFiles(
+  editor: Editor,
+  files: FileList | readonly File[],
+  options: InsertImageFilesOptions = {},
+): Promise<void> {
   const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
   if (imageFiles.length === 0 || editor.isDestroyed) return;
 
-  const dataUrls = await Promise.all(
-    imageFiles.map(async (file) => ({ file, dataUrl: await readFileAsDataURL(file) })),
-  );
+  const accepted: File[] = [];
+  let rejectedLarge = 0;
+  for (const file of imageFiles) {
+    if (file.size > MAX_IMAGE_BYTES) {
+      rejectedLarge += 1;
+      continue;
+    }
+    accepted.push(file);
+  }
+
+  if (rejectedLarge > 0) {
+    options.onNotice?.(
+      rejectedLarge === 1
+        ? "That image is too large to store locally. Use an image under 1.5MB."
+        : `${rejectedLarge} images were too large to store locally. Use images under 1.5MB each.`,
+    );
+  }
+  if (accepted.length === 0 || editor.isDestroyed) return;
+
+  let dataUrls: { file: File; dataUrl: string }[];
+  try {
+    dataUrls = await Promise.all(
+      accepted.map(async (file) => ({ file, dataUrl: await readFileAsDataURL(file) })),
+    );
+  } catch {
+    options.onNotice?.("The selected image could not be inserted.");
+    return;
+  }
   if (editor.isDestroyed) return;
 
   const { schema } = editor;
-  const nodes: PMNode[] = [];
-  for (const { file, dataUrl } of dataUrls) {
+  const images = dataUrls.map(({ file, dataUrl }) => {
     const alt = file.name.replace(/\.[^/.]+$/, "");
-    nodes.push(schema.nodes.image.create({ src: dataUrl, alt }));
-    nodes.push(schema.nodes.paragraph.create());
-  }
+    return schema.nodes.image.create({ src: dataUrl, alt });
+  });
 
-  editor.view.dispatch(
-    editor.state.tr.replaceSelection(new Slice(Fragment.from(nodes), 0, 0)).scrollIntoView(),
-  );
+  // Only append a trailing empty paragraph when the caret is at the end of a
+  // textblock. Mid-paragraph inserts already leave the remaining text as the
+  // block after the image; an extra empty paragraph would create a blank line.
+  const { $to } = editor.state.selection;
+  const atEndOfTextblock = $to.parent.isTextblock && $to.parentOffset === $to.parent.content.size;
+  const nodes: PMNode[] = atEndOfTextblock
+    ? [...images, schema.nodes.paragraph.create()]
+    : images;
+
+  editor.commands.insertContent(Fragment.from(nodes));
 }
+
+/**
+ * Local-first image node: base64/blob/same-origin only, and safe Markdown alt.
+ */
+const LabImage = Image.extend({
+  parseHTML() {
+    return [
+      {
+        tag: "img[src]",
+        getAttrs: (node: HTMLElement | string) => {
+          if (typeof node === "string") return false;
+          const src = node.getAttribute("src");
+          return isAllowedImageSrc(src) ? null : false;
+        },
+      },
+    ];
+  },
+  parseMarkdown: (token: MarkdownToken, helpers: MarkdownParseHelpers) => {
+    const src = String(token.href ?? "");
+    if (!isAllowedImageSrc(src)) return [];
+    return helpers.createNode("image", {
+      src,
+      title: token.title,
+      alt: token.text,
+    });
+  },
+  renderMarkdown: (node: JSONContent) => {
+    const src = String(node.attrs?.src ?? "");
+    const alt = escapeMarkdownImageAlt(String(node.attrs?.alt ?? ""));
+    const title = node.attrs?.title != null && node.attrs.title !== ""
+      ? String(node.attrs.title)
+      : "";
+    return title
+      ? `![${alt}](${src} "${escapeMarkdownImageTitle(title)}")`
+      : `![${alt}](${src})`;
+  },
+}).configure({
+  allowBase64: true,
+  HTMLAttributes: { class: "lab-image" },
+});
 
 const PlainUrlInput = Extension.create({
   name: "plainUrlInput",
@@ -442,6 +557,8 @@ function LabEditorSession() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
+  // useEditor freezes editorProps on first create; keep notices current via ref.
+  const setNoticeRef = useRef<(message: string | null) => void>(() => undefined);
   const paletteRef = useRef<PaletteState | null>(null);
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const paletteVersionRef = useRef(0);
@@ -495,6 +612,10 @@ function LabEditorSession() {
     mathEditorRef.current = value;
     setMathEditorState(value);
   }, []);
+
+  useEffect(() => {
+    setNoticeRef.current = setNotice;
+  }, [setNotice]);
 
   const mathAnchor = useCallback((instance: Editor, pos: number, kind: MathKind) => {
     const shell = shellRef.current;
@@ -778,7 +899,7 @@ function LabEditorSession() {
       TaskItem.configure({ nested: true }),
       TableKit.configure({ table: { resizable: false } }),
       Placeholder.configure({ placeholder: "" }),
-      Image.configure({ allowBase64: true, HTMLAttributes: { class: "lab-image" } }),
+      LabImage,
       ...mathExtensions,
       Markdown.configure({ markedOptions: { gfm: true } }),
       MarkdownLinkInput,
@@ -796,7 +917,9 @@ function LabEditorSession() {
           const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
           if (imageFiles.length > 0 && editorRef.current) {
             event.preventDefault();
-            void insertImageFiles(editorRef.current, imageFiles);
+            void insertImageFiles(editorRef.current, imageFiles, {
+              onNotice: (message) => setNoticeRef.current(message),
+            });
             return true;
           }
         }
@@ -939,7 +1062,9 @@ function LabEditorSession() {
           const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
           if (imageFiles.length > 0 && editorRef.current) {
             event.preventDefault();
-            void insertImageFiles(editorRef.current, imageFiles);
+            void insertImageFiles(editorRef.current, imageFiles, {
+              onNotice: (message) => setNoticeRef.current(message),
+            });
             return true;
           }
         }
@@ -1715,7 +1840,9 @@ function LabEditorSession() {
   const onImageImport = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || !editor || files.length === 0) return;
-    void insertImageFiles(editor, files).catch(() => setNotice("The selected image could not be inserted."));
+    void insertImageFiles(editor, files, {
+      onNotice: (message) => setNotice(message),
+    });
     event.target.value = "";
   };
 

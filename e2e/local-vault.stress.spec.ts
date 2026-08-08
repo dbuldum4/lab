@@ -1,6 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-
-const PENDING_PREFIX = "lab.document.pending.v2.";
+import { PENDING_PREFIX, openEditor } from "./helpers";
 
 type PendingRecord = {
   storageKey: string;
@@ -39,14 +38,6 @@ function parseSeed(raw: string | undefined) {
 function boundedIterations(raw: string | undefined) {
   const value = Number.parseInt(raw ?? "8", 10);
   return Math.min(24, Math.max(1, Number.isFinite(value) ? value : 8));
-}
-
-async function openEditor(page: Page) {
-  await page.goto("/");
-  const editor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
-  await expect(editor).toBeVisible();
-  await expect(editor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
-  return editor;
 }
 
 async function authorityMarkdown(page: Page) {
