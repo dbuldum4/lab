@@ -377,6 +377,13 @@ function escapeMarkdownImageTitle(title: string): string {
 
 type InsertImageFilesOptions = {
   onNotice?: (message: string) => void;
+  /**
+   * Document position to insert at (e.g. drop coords via posAtCoords).
+   * When omitted, replaces the current selection.
+   */
+  pos?: number;
+  /** Selection captured before an asynchronous file read started. */
+  selection?: { from: number; to: number };
 };
 
 async function insertImageFiles(
@@ -417,22 +424,46 @@ async function insertImageFiles(
   }
   if (editor.isDestroyed) return;
 
-  const { schema } = editor;
+  const { schema, state } = editor;
   const images = dataUrls.map(({ file, dataUrl }) => {
     const alt = file.name.replace(/\.[^/.]+$/, "");
     return schema.nodes.image.create({ src: dataUrl, alt });
   });
 
-  // Only append a trailing empty paragraph when the caret is at the end of a
+  // Prefer an explicit drop/insert position; otherwise replace the selection.
+  let from: number;
+  let to: number;
+  let $insert = state.selection.$to;
+  const clampDocPosition = (value: number) => Math.max(
+    0,
+    Math.min(Math.round(value), state.doc.content.size),
+  );
+  if (typeof options.pos === "number" && Number.isFinite(options.pos)) {
+    const pos = clampDocPosition(options.pos);
+    from = pos;
+    to = pos;
+    $insert = state.doc.resolve(pos);
+  } else if (options.selection) {
+    from = clampDocPosition(options.selection.from);
+    to = clampDocPosition(options.selection.to);
+    if (from > to) [from, to] = [to, from];
+    $insert = state.doc.resolve(to);
+  } else {
+    from = state.selection.from;
+    to = state.selection.to;
+  }
+
+  // Only append a trailing empty paragraph when inserting at the end of a
   // textblock. Mid-paragraph inserts already leave the remaining text as the
   // block after the image; an extra empty paragraph would create a blank line.
-  const { $to } = editor.state.selection;
-  const atEndOfTextblock = $to.parent.isTextblock && $to.parentOffset === $to.parent.content.size;
+  const atEndOfTextblock = $insert.parent.isTextblock && $insert.parentOffset === $insert.parent.content.size;
   const nodes: PMNode[] = atEndOfTextblock
     ? [...images, schema.nodes.paragraph.create()]
     : images;
 
-  editor.commands.insertContent(Fragment.from(nodes));
+  editor.commands.insertContentAt({ from, to }, Fragment.from(nodes), {
+    updateSelection: true,
+  });
 }
 
 /**
@@ -469,6 +500,18 @@ const LabImage = Image.extend({
     return title
       ? `![${alt}](${src} "${escapeMarkdownImageTitle(title)}")`
       : `![${alt}](${src})`;
+  },
+  addInputRules() {
+    // The inherited rule creates an image directly from typed Markdown and
+    // therefore bypasses parseHTML/parseMarkdown source validation.
+    return (this.parent?.() ?? []).map((rule) => new InputRule({
+      find: rule.find,
+      undoable: rule.undoable,
+      handler: (props) => {
+        if (!isAllowedImageSrc(props.match[3])) return null;
+        return rule.handler(props);
+      },
+    }));
   },
 }).configure({
   allowBase64: true,
@@ -919,6 +962,10 @@ function LabEditorSession() {
             event.preventDefault();
             void insertImageFiles(editorRef.current, imageFiles, {
               onNotice: (message) => setNoticeRef.current(message),
+              selection: {
+                from: view.state.selection.from,
+                to: view.state.selection.to,
+              },
             });
             return true;
           }
@@ -1057,13 +1104,20 @@ function LabEditorSession() {
         return false;
       },
       handleDrop: (view, event) => {
-        const files = (event as DragEvent).dataTransfer?.files;
+        const dragEvent = event as DragEvent;
+        const files = dragEvent.dataTransfer?.files;
         if (files && files.length > 0) {
           const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
           if (imageFiles.length > 0 && editorRef.current) {
             event.preventDefault();
+            // Insert under the pointer, not at the current caret.
+            const dropPos = view.posAtCoords({
+              left: dragEvent.clientX,
+              top: dragEvent.clientY,
+            })?.pos;
             void insertImageFiles(editorRef.current, imageFiles, {
               onNotice: (message) => setNoticeRef.current(message),
+              pos: dropPos,
             });
             return true;
           }
@@ -1842,6 +1896,10 @@ function LabEditorSession() {
     if (!files || !editor || files.length === 0) return;
     void insertImageFiles(editor, files, {
       onNotice: (message) => setNotice(message),
+      selection: {
+        from: editor.state.selection.from,
+        to: editor.state.selection.to,
+      },
     });
     event.target.value = "";
   };
