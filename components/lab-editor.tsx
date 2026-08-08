@@ -13,7 +13,7 @@ import { TableKit } from "@tiptap/extension-table";
 import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
 import { BlockMath, InlineMath } from "@tiptap/extension-mathematics";
-import Image from "@tiptap/extension-image";
+import Image, { type ImageOptions } from "@tiptap/extension-image";
 import { Markdown } from "@tiptap/markdown";
 import { closeHistory } from "@tiptap/pm/history";
 import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
@@ -80,6 +80,40 @@ type MathEditorState = {
   left: number;
   top: number;
 };
+
+type ImageCropTarget = {
+  pos: number;
+  src: string;
+  alt: string;
+};
+
+type CropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type CropPoint = { x: number; y: number };
+type CropHandle = "top-left" | "top" | "top-right" | "right" | "bottom-right" | "bottom" | "bottom-left" | "left";
+type CropInteraction = {
+  mode: "draw" | "move" | "resize";
+  pointerId: number;
+  start: CropPoint;
+  initial: CropRect;
+  handle?: CropHandle;
+};
+
+const CROP_HANDLES: CropHandle[] = [
+  "top-left",
+  "top",
+  "top-right",
+  "right",
+  "bottom-right",
+  "bottom",
+  "bottom-left",
+  "left",
+];
 
 const COMMANDS: Command[] = [
   { id: "text", label: "Text", detail: "Plain paragraph", terms: "paragraph normal" },
@@ -375,6 +409,50 @@ function escapeMarkdownImageTitle(title: string): string {
   return title.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
 }
 
+function imageDimension(value: unknown): number | null {
+  const number = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(number) || number <= 0) return null;
+  return Math.max(1, Math.round(number));
+}
+
+function parseImageMarkdownTitle(title: unknown) {
+  const value = String(title ?? "");
+  const parts = value.split(";");
+  const sizeMatch = parts[0]?.match(/^lab-size:(\d+)?x(\d+)?$/);
+  const align = parts.includes("align=center") ? "center" : null;
+  const titlePart = parts.find((part) => part.startsWith("title="));
+  if (!sizeMatch && !align) return { title: value || null, width: null, height: null, align: null };
+
+  let imageTitle: string | null = null;
+  if (titlePart) {
+    try {
+      imageTitle = decodeURIComponent(titlePart.slice("title=".length));
+    } catch {
+      imageTitle = titlePart.slice("title=".length);
+    }
+  }
+  return {
+    title: imageTitle,
+    width: imageDimension(sizeMatch?.[1]),
+    height: imageDimension(sizeMatch?.[2]),
+    align,
+  };
+}
+
+function imageMarkdownTitle(title: unknown, width: unknown, height: unknown, align: unknown) {
+  const rawTitle = String(title ?? "");
+  const normalizedWidth = imageDimension(width);
+  const normalizedHeight = imageDimension(height);
+  const normalizedAlign = align === "center" ? "center" : null;
+  if (!normalizedWidth && !normalizedHeight && !normalizedAlign) return rawTitle;
+
+  const metadata = [
+    normalizedWidth || normalizedHeight ? `lab-size:${normalizedWidth ?? ""}x${normalizedHeight ?? ""}` : null,
+    normalizedAlign ? "align=center" : null,
+  ].filter(Boolean).join(";");
+  return rawTitle ? `${metadata};title=${encodeURIComponent(rawTitle)}` : metadata;
+}
+
 type InsertImageFilesOptions = {
   onNotice?: (message: string) => void;
   /**
@@ -469,7 +547,27 @@ async function insertImageFiles(
 /**
  * Local-first image node: base64/blob/same-origin only, and safe Markdown alt.
  */
+type ImageCropHandler = (node: PMNode, pos: number) => void;
+
 const LabImage = Image.extend({
+  addOptions() {
+    return {
+      ...this.parent?.(),
+      onCrop: null as ImageCropHandler | null,
+    } as ImageOptions & { onCrop: ImageCropHandler | null };
+  },
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      align: {
+        default: null,
+        parseHTML: (node: HTMLElement) => node.getAttribute("data-image-align") === "center" ? "center" : null,
+        renderHTML: (attributes: { align?: string | null }) => attributes.align === "center"
+          ? { "data-image-align": "center" }
+          : {},
+      },
+    };
+  },
   parseHTML() {
     return [
       {
@@ -477,7 +575,15 @@ const LabImage = Image.extend({
         getAttrs: (node: HTMLElement | string) => {
           if (typeof node === "string") return false;
           const src = node.getAttribute("src");
-          return isAllowedImageSrc(src) ? null : false;
+          if (!isAllowedImageSrc(src)) return false;
+          return {
+            src,
+            alt: node.getAttribute("alt"),
+            title: node.getAttribute("title"),
+            width: imageDimension(node.getAttribute("width") ?? node.style.width.replace(/px$/, "")),
+            height: imageDimension(node.getAttribute("height") ?? node.style.height.replace(/px$/, "")),
+            align: node.getAttribute("data-image-align") === "center" ? "center" : null,
+          };
         },
       },
     ];
@@ -485,21 +591,353 @@ const LabImage = Image.extend({
   parseMarkdown: (token: MarkdownToken, helpers: MarkdownParseHelpers) => {
     const src = String(token.href ?? "");
     if (!isAllowedImageSrc(src)) return [];
+    const imageTitle = parseImageMarkdownTitle(token.title);
     return helpers.createNode("image", {
       src,
-      title: token.title,
+      title: imageTitle.title,
       alt: token.text,
+      width: imageTitle.width,
+      height: imageTitle.height,
+      align: imageTitle.align,
     });
   },
   renderMarkdown: (node: JSONContent) => {
     const src = String(node.attrs?.src ?? "");
     const alt = escapeMarkdownImageAlt(String(node.attrs?.alt ?? ""));
-    const title = node.attrs?.title != null && node.attrs.title !== ""
-      ? String(node.attrs.title)
-      : "";
+    const title = imageMarkdownTitle(node.attrs?.title, node.attrs?.width, node.attrs?.height, node.attrs?.align);
     return title
       ? `![${alt}](${src} "${escapeMarkdownImageTitle(title)}")`
       : `![${alt}](${src})`;
+  },
+  addNodeView() {
+    return (props) => {
+      const image = document.createElement("img");
+      image.className = String(props.HTMLAttributes.class ?? "lab-image");
+      image.draggable = false;
+      image.setAttribute("contenteditable", "false");
+      let centerButton: HTMLButtonElement | null = null;
+      let alignmentAnimationFrame: number | null = null;
+
+      const stopAlignmentAnimation = () => {
+        if (alignmentAnimationFrame !== null) {
+          cancelAnimationFrame(alignmentAnimationFrame);
+          alignmentAnimationFrame = null;
+        }
+        image.style.removeProperty("will-change");
+      };
+
+      const setImageAlignment = (align: string | null) => {
+        if (align === "center") image.dataset.imageAlign = "center";
+        else delete image.dataset.imageAlign;
+      };
+
+      const animateImageAlignment = (align: string | null) => {
+        if (!image.isConnected) {
+          setImageAlignment(align);
+          return;
+        }
+
+        const startRect = image.getBoundingClientRect();
+        stopAlignmentAnimation();
+        image.style.removeProperty("transform");
+        setImageAlignment(align);
+        const targetRect = image.getBoundingClientRect();
+        const startOffset = startRect.left - targetRect.left;
+        if (!Number.isFinite(startOffset) || Math.abs(startOffset) < 0.5) {
+          updateOverlay();
+          return;
+        }
+
+        const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+        if (reduceMotion) {
+          updateOverlay();
+          return;
+        }
+
+        image.style.willChange = "transform";
+        let position = startOffset;
+        let velocity = 0;
+        let previousTime = performance.now();
+        const stiffness = 250;
+        const damping = 2 * Math.sqrt(stiffness);
+
+        const step = (time: number) => {
+          const deltaTime = Math.min(32, Math.max(1, time - previousTime)) / 1000;
+          previousTime = time;
+          const acceleration = -stiffness * position - damping * velocity;
+          velocity += acceleration * deltaTime;
+          position += velocity * deltaTime;
+          image.style.transform = `translate3d(${position}px, 0, 0)`;
+          updateOverlay();
+
+          if (Math.abs(position) < 0.25 && Math.abs(velocity) < 0.25) {
+            image.style.removeProperty("transform");
+            stopAlignmentAnimation();
+            updateOverlay();
+            return;
+          }
+          alignmentAnimationFrame = requestAnimationFrame(step);
+        };
+
+        image.style.transform = `translate3d(${position}px, 0, 0)`;
+        updateOverlay();
+        alignmentAnimationFrame = requestAnimationFrame(step);
+      };
+
+      const syncCenterButton = (node: PMNode) => {
+        if (!centerButton) return;
+        const action = node.attrs.align === "center" ? "Uncenter" : "Center";
+        centerButton.textContent = action;
+        centerButton.setAttribute("aria-label", `${action} image`);
+      };
+
+      const syncImage = (node: PMNode) => {
+        const src = String(node.attrs.src ?? "");
+        if (image.getAttribute("src") !== src) image.src = src;
+        const alt = node.attrs.alt == null ? "" : String(node.attrs.alt);
+        if (image.getAttribute("alt") !== alt) image.setAttribute("alt", alt);
+        const title = node.attrs.title == null || node.attrs.title === "" ? null : String(node.attrs.title);
+        if (title == null) image.removeAttribute("title");
+        else if (image.getAttribute("title") !== title) image.setAttribute("title", title);
+
+        const width = imageDimension(node.attrs.width);
+        const height = imageDimension(node.attrs.height);
+        if (width) image.style.width = `${width}px`;
+        else image.style.removeProperty("width");
+        if (height) image.style.height = `${height}px`;
+        else image.style.removeProperty("height");
+        const nextAlign = node.attrs.align === "center" ? "center" : null;
+        const currentAlign = image.dataset.imageAlign === "center" ? "center" : null;
+        if (currentAlign === nextAlign) setImageAlignment(nextAlign);
+        else animateImageAlignment(nextAlign);
+        syncCenterButton(node);
+      };
+      syncImage(props.node);
+
+      const overlay = document.createElement("div");
+      overlay.className = "image-selection-overlay";
+      overlay.setAttribute("contenteditable", "false");
+      overlay.setAttribute("data-image-overlay", "true");
+      overlay.setAttribute("aria-hidden", "true");
+
+      const toolbar = document.createElement("div");
+      toolbar.className = "image-edit-toolbar";
+      toolbar.setAttribute("contenteditable", "false");
+      toolbar.setAttribute("role", "toolbar");
+      toolbar.setAttribute("aria-label", "Image actions");
+
+      const getCurrentImage = () => {
+        const pos = props.getPos();
+        if (typeof pos !== "number") return null;
+        const node = props.editor.state.doc.nodeAt(pos);
+        return node?.type.name === "image" ? { node, pos } : null;
+      };
+
+      let selected = false;
+      let resizing: {
+        pointerId: number;
+        direction: CropHandle;
+        startX: number;
+        startY: number;
+        startWidth: number;
+        startHeight: number;
+        aspectRatio: number;
+        width: number;
+        height: number;
+      } | null = null;
+
+      const updateOverlay = () => {
+        if (!selected) return;
+        const rect = image.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        overlay.style.left = `${rect.left}px`;
+        overlay.style.top = `${rect.top}px`;
+        overlay.style.width = `${rect.width}px`;
+        overlay.style.height = `${rect.height}px`;
+      };
+
+      const makeButton = (label: string, action: () => void) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "image-edit-button";
+        button.textContent = label;
+        button.setAttribute("aria-label", `${label} image`);
+        button.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          action();
+        });
+        return button;
+      };
+
+      const cropButton = makeButton("Crop", () => {
+        const current = getCurrentImage();
+        if (!current) return;
+        props.editor.commands.setNodeSelection(current.pos);
+        (this.options as ImageOptions & { onCrop?: ImageCropHandler }).onCrop?.(current.node, current.pos);
+      });
+      const deleteButton = makeButton("Delete", () => {
+        const current = getCurrentImage();
+        if (!current) return;
+        props.editor.commands.setNodeSelection(current.pos);
+        props.editor.commands.deleteSelection();
+        props.editor.commands.focus();
+      });
+      centerButton = makeButton("Center", () => {
+        const current = getCurrentImage();
+        if (!current) return;
+        props.editor.commands.setNodeSelection(current.pos);
+        props.editor.commands.updateAttributes("image", {
+          align: current.node.attrs.align === "center" ? null : "center",
+        });
+        props.editor.commands.focus();
+      });
+      syncCenterButton(props.node);
+      toolbar.append(cropButton, centerButton, deleteButton);
+      overlay.append(toolbar);
+
+      const resizeHandles = CROP_HANDLES
+        .map((direction) => {
+          const handle = document.createElement("button");
+          handle.type = "button";
+          handle.className = `image-resize-handle image-resize-handle-${direction}`;
+          handle.setAttribute("data-image-resize-handle", direction);
+          handle.setAttribute("aria-label", `Resize image ${direction}`);
+          handle.tabIndex = -1;
+          overlay.append(handle);
+          return { direction, handle };
+        });
+
+      const finishResize = () => {
+        if (!resizing) return;
+        const current = resizing;
+        resizing = null;
+        document.removeEventListener("pointermove", moveResize);
+        document.removeEventListener("pointerup", finishResize);
+        document.removeEventListener("pointercancel", finishResize);
+        const pos = props.getPos();
+        if (typeof pos !== "number") return;
+        props.editor.commands.setNodeSelection(pos);
+        props.editor.commands.updateAttributes("image", {
+          width: imageDimension(current.width),
+          height: imageDimension(current.height),
+        });
+      };
+
+      const moveResize = (event: PointerEvent) => {
+        if (!resizing) return;
+        const deltaX = event.clientX - resizing.startX;
+        const deltaY = event.clientY - resizing.startY;
+        const horizontalDelta = resizing.direction.includes("left") ? -deltaX : deltaX;
+        const verticalDelta = resizing.direction.includes("top") ? -deltaY : deltaY;
+        const startWidth = Math.max(1, resizing.startWidth);
+        const startHeight = Math.max(1, resizing.startHeight);
+        const horizontalScale = (startWidth + horizontalDelta) / startWidth;
+        const verticalScale = (startHeight + verticalDelta) / startHeight;
+        const requestedScale = resizing.direction === "top" || resizing.direction === "bottom"
+          ? verticalScale
+          : resizing.direction === "left" || resizing.direction === "right"
+            ? horizontalScale
+            : Math.max(horizontalScale, verticalScale);
+        const scale = Math.max(
+          48 / startWidth,
+          48 / startHeight,
+          requestedScale,
+        );
+        const maxWidth = Math.max(48, props.editor.view.dom.clientWidth || Number.POSITIVE_INFINITY);
+        const width = Math.min(maxWidth, startWidth * scale);
+        const height = width / resizing.aspectRatio;
+        resizing.width = width;
+        resizing.height = height;
+        image.style.width = `${width}px`;
+        image.style.height = `${height}px`;
+        updateOverlay();
+      };
+
+      const startResize = (event: PointerEvent, direction: CropHandle) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const rect = image.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const pos = props.getPos();
+        if (typeof pos === "number") props.editor.commands.setNodeSelection(pos);
+        resizing = {
+          pointerId: event.pointerId,
+          direction,
+          startX: event.clientX,
+          startY: event.clientY,
+          startWidth: rect.width,
+          startHeight: rect.height,
+          aspectRatio: rect.width / Math.max(1, rect.height),
+          width: rect.width,
+          height: rect.height,
+        };
+        document.addEventListener("pointermove", moveResize);
+        document.addEventListener("pointerup", finishResize);
+        document.addEventListener("pointercancel", finishResize);
+      };
+
+      resizeHandles.forEach(({ direction, handle }) => {
+        handle.addEventListener("pointerdown", (event) => startResize(event, direction));
+      });
+
+      const selectNode = () => {
+        selected = true;
+        image.classList.add("ProseMirror-selectednode");
+        overlay.style.display = "block";
+        overlay.setAttribute("aria-hidden", "false");
+        updateOverlay();
+      };
+      const deselectNode = () => {
+        selected = false;
+        resizing = null;
+        image.classList.remove("ProseMirror-selectednode");
+        overlay.style.display = "none";
+        overlay.setAttribute("aria-hidden", "true");
+      };
+      const onImageClick = (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const pos = props.getPos();
+        if (typeof pos === "number") props.editor.commands.setNodeSelection(pos);
+      };
+      const onImageLoad = () => updateOverlay();
+      const onWindowChange = () => updateOverlay();
+
+      image.addEventListener("click", onImageClick);
+      image.addEventListener("load", onImageLoad);
+      window.addEventListener("resize", onWindowChange, { passive: true });
+      window.addEventListener("scroll", onWindowChange, { passive: true });
+      document.body.append(overlay);
+      deselectNode();
+
+      return {
+        dom: image,
+        update: (updatedNode: PMNode) => {
+          if (updatedNode.type !== props.node.type) return false;
+          syncImage(updatedNode);
+          updateOverlay();
+          return true;
+        },
+        selectNode,
+        deselectNode,
+        destroy: () => {
+          stopAlignmentAnimation();
+          document.removeEventListener("pointermove", moveResize);
+          document.removeEventListener("pointerup", finishResize);
+          document.removeEventListener("pointercancel", finishResize);
+          image.removeEventListener("click", onImageClick);
+          image.removeEventListener("load", onImageLoad);
+          window.removeEventListener("resize", onWindowChange);
+          window.removeEventListener("scroll", onWindowChange);
+          overlay.remove();
+        },
+      };
+    };
   },
   addInputRules() {
     // The inherited rule creates an image directly from typed Markdown and
@@ -515,8 +953,240 @@ const LabImage = Image.extend({
   },
 }).configure({
   allowBase64: true,
+  resize: false,
   HTMLAttributes: { class: "lab-image" },
 });
+
+type ImageCropDialogProps = {
+  src: string;
+  alt: string;
+  onCancel: () => void;
+  onApply: (dataUrl: string) => void;
+};
+
+function cropPointFromEvent(event: { clientX: number; clientY: number }, stage: HTMLElement): CropPoint {
+  const bounds = stage.getBoundingClientRect();
+  return {
+    x: clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1),
+    y: clamp((event.clientY - bounds.top) / Math.max(1, bounds.height), 0, 1),
+  };
+}
+
+function cropRectFromPoints(start: CropPoint, end: CropPoint): CropRect {
+  return {
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    width: Math.abs(end.x - start.x),
+    height: Math.abs(end.y - start.y),
+  };
+}
+
+function resizeCropRect(initial: CropRect, handle: CropHandle, delta: CropPoint): CropRect {
+  const minimum = 0.04;
+  let left = initial.x;
+  let top = initial.y;
+  let right = initial.x + initial.width;
+  let bottom = initial.y + initial.height;
+
+  if (handle.includes("left")) left = clamp(initial.x + delta.x, 0, right - minimum);
+  if (handle.includes("right")) right = clamp(initial.x + initial.width + delta.x, left + minimum, 1);
+  if (handle.includes("top")) top = clamp(initial.y + delta.y, 0, bottom - minimum);
+  if (handle.includes("bottom")) bottom = clamp(initial.y + initial.height + delta.y, top + minimum, 1);
+
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+  const interactionRef = useRef<CropInteraction | null>(null);
+  const rectRef = useRef<CropRect>({ x: 0, y: 0, width: 1, height: 1 });
+  const [rect, setRect] = useState<CropRect>({ x: 0, y: 0, width: 1, height: 1 });
+  const [imageReady, setImageReady] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
+  const updateRect = useCallback((next: CropRect) => {
+    rectRef.current = next;
+    setRect(next);
+  }, []);
+
+  const finishPointer = useCallback((pointerId: number) => {
+    const stage = stageRef.current;
+    if (stage?.hasPointerCapture(pointerId)) stage.releasePointerCapture(pointerId);
+    interactionRef.current = null;
+    const current = rectRef.current;
+    if (current.width < 0.04 || current.height < 0.04) {
+      updateRect({ x: 0, y: 0, width: 1, height: 1 });
+    }
+  }, [updateRect]);
+
+  const onPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (busy || !stageRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = cropPointFromEvent(event, stageRef.current);
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const handleValue = target?.closest<HTMLElement>("[data-crop-handle]")?.dataset.cropHandle;
+    const handle = CROP_HANDLES.includes(handleValue as CropHandle)
+      ? handleValue as CropHandle
+      : undefined;
+    const selection = rectRef.current;
+    const insideSelection = Boolean(target?.closest("[data-crop-selection]"));
+    const selectionIsFull = selection.x <= 0 && selection.y <= 0 && selection.width >= 0.999 && selection.height >= 0.999;
+    const mode: CropInteraction["mode"] = handle
+      ? "resize"
+      : insideSelection && !selectionIsFull
+        ? "move"
+        : "draw";
+    interactionRef.current = {
+      mode,
+      pointerId: event.pointerId,
+      start: point,
+      initial: mode === "draw" ? { x: point.x, y: point.y, width: 0, height: 0 } : selection,
+      handle,
+    };
+    try {
+      stageRef.current.setPointerCapture(event.pointerId);
+    } catch {
+      // Synthetic events and a few older browsers do not expose an active pointer.
+      // The stage listeners still receive the interaction without capture.
+    }
+  }, [busy]);
+
+  const onPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const interaction = interactionRef.current;
+    const stage = stageRef.current;
+    if (!interaction || interaction.pointerId !== event.pointerId || !stage) return;
+    event.preventDefault();
+    const point = cropPointFromEvent(event, stage);
+    const delta = { x: point.x - interaction.start.x, y: point.y - interaction.start.y };
+    let next: CropRect;
+    if (interaction.mode === "draw") {
+      next = cropRectFromPoints(interaction.start, point);
+    } else if (interaction.mode === "move") {
+      next = {
+        ...interaction.initial,
+        x: clamp(interaction.initial.x + delta.x, 0, 1 - interaction.initial.width),
+        y: clamp(interaction.initial.y + delta.y, 0, 1 - interaction.initial.height),
+      };
+    } else if (interaction.handle) {
+      next = resizeCropRect(interaction.initial, interaction.handle, delta);
+    } else {
+      return;
+    }
+    updateRect(next);
+  }, [updateRect]);
+
+  const onPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (interactionRef.current?.pointerId !== event.pointerId) return;
+    finishPointer(event.pointerId);
+  }, [finishPointer]);
+
+  const applyCrop = useCallback(() => {
+    const image = imageRef.current;
+    const selection = rectRef.current;
+    if (!image || !imageReady || !image.naturalWidth || !image.naturalHeight) return;
+
+    setBusy(true);
+    setError(null);
+    try {
+      const sourceX = Math.max(0, Math.floor(selection.x * image.naturalWidth));
+      const sourceY = Math.max(0, Math.floor(selection.y * image.naturalHeight));
+      const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, Math.round(selection.width * image.naturalWidth)));
+      const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, Math.round(selection.height * image.naturalHeight)));
+      const canvas = document.createElement("canvas");
+      canvas.width = sourceWidth;
+      canvas.height = sourceHeight;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Canvas is unavailable");
+      context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, sourceWidth, sourceHeight);
+      const sourceType = src.match(/^data:(image\/(?:png|jpeg|webp))/i)?.[1] ?? "image/png";
+      onApply(canvas.toDataURL(sourceType));
+    } catch {
+      setBusy(false);
+      setError("This image could not be cropped in the browser.");
+    }
+  }, [imageReady, onApply, src]);
+
+  return (
+    <div className="image-crop-backdrop" role="presentation">
+      <section
+        ref={dialogRef}
+        className="image-crop-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="image-crop-title"
+        tabIndex={-1}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          }
+        }}
+      >
+        <div className="image-crop-header">
+          <div>
+            <h2 id="image-crop-title">Crop image</h2>
+            <p>Drag to choose the visible area.</p>
+          </div>
+          <button type="button" className="image-crop-close" aria-label="Close crop editor" onClick={onCancel}>×</button>
+        </div>
+        <div
+          ref={stageRef}
+          className="image-crop-stage"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            ref={imageRef}
+            src={src}
+            alt={alt}
+            draggable={false}
+            onLoad={() => setImageReady(true)}
+            onError={() => setError("This image could not be loaded for cropping.")}
+          />
+          <div
+            className="image-crop-selection"
+            data-crop-selection="true"
+            style={{
+              left: `${rect.x * 100}%`,
+              top: `${rect.y * 100}%`,
+              width: `${rect.width * 100}%`,
+              height: `${rect.height * 100}%`,
+            }}
+          >
+            {CROP_HANDLES.map((handle) => (
+              <button
+                key={handle}
+                type="button"
+                className={`image-crop-handle image-crop-handle-${handle}`}
+                data-crop-handle={handle}
+                aria-label={`Adjust crop ${handle}`}
+                tabIndex={-1}
+              />
+            ))}
+          </div>
+        </div>
+        <div className="image-crop-footer">
+          <span className="image-crop-status" role="status" aria-live="polite">{error ?? ""}</span>
+          <div className="image-crop-actions">
+            <button type="button" className="image-crop-button image-crop-button-muted" aria-label="Cancel crop" onClick={onCancel}>Cancel</button>
+            <button type="button" className="image-crop-button" aria-label="Apply crop" onClick={applyCrop} disabled={!imageReady || busy}>Apply crop</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
 
 const PlainUrlInput = Extension.create({
   name: "plainUrlInput",
@@ -608,6 +1278,7 @@ function LabEditorSession() {
   const selectedRef = useRef(0);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
+  const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [selected, setSelectedState] = useState(0);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
@@ -654,6 +1325,16 @@ function LabEditorSession() {
   const setMathEditor = useCallback((value: MathEditorState | null) => {
     mathEditorRef.current = value;
     setMathEditorState(value);
+  }, []);
+
+  const openImageCrop = useCallback((node: PMNode, pos: number) => {
+    const src = String(node.attrs.src ?? "");
+    if (!src || !isAllowedImageSrc(src)) return;
+    setImageCropTarget({
+      pos,
+      src,
+      alt: String(node.attrs.alt ?? "Image"),
+    });
   }, []);
 
   useEffect(() => {
@@ -804,6 +1485,11 @@ function LabEditorSession() {
   ], [openMathEditor]);
   /* eslint-enable react-hooks/refs */
 
+  const imageExtension = useMemo(
+    () => LabImage.configure({ onCrop: openImageCrop } as Partial<ImageOptions>),
+    [openImageCrop],
+  );
+
   const stopCaretBlink = useCallback(() => {
     caretStrokeRef.current?.removeAttribute("data-blinking");
   }, []);
@@ -942,7 +1628,7 @@ function LabEditorSession() {
       TaskItem.configure({ nested: true }),
       TableKit.configure({ table: { resizable: false } }),
       Placeholder.configure({ placeholder: "" }),
-      LabImage,
+      imageExtension,
       ...mathExtensions,
       Markdown.configure({ markedOptions: { gfm: true } }),
       MarkdownLinkInput,
@@ -954,18 +1640,66 @@ function LabEditorSession() {
     autofocus: false,
     editable: false,
     editorProps: {
+      handleClickOn: (view, _pos, node, nodePos, event) => {
+        const target = event.target instanceof HTMLElement ? event.target : null;
+        if (target?.closest("[data-resize-handle], .image-edit-toolbar")) return false;
+        if (node.type.name !== "image") return false;
+        view.dispatch(view.state.tr.setSelection(new NodeSelection(view.state.doc.resolve(nodePos))));
+        return true;
+      },
+      handleClick: (view, pos, event) => {
+        const target = event.target instanceof HTMLElement ? event.target : null;
+        if (target?.closest("[data-resize-handle], .image-edit-toolbar")) return false;
+
+        const candidates = [pos, pos - 1, pos + 1, pos - 2, pos + 2];
+        const image = target?.closest("img.lab-image");
+        if (image) {
+          try {
+            candidates.unshift(view.posAtDOM(image, 0));
+          } catch {
+            // Fall back to the position ProseMirror calculated for the click.
+          }
+        }
+        const imagePos = candidates.find((candidate) => (
+          Number.isFinite(candidate)
+          && candidate >= 0
+          && candidate <= view.state.doc.content.size
+          && view.state.doc.nodeAt(candidate)?.type.name === "image"
+        ));
+        const node = imagePos === undefined ? null : view.state.doc.nodeAt(imagePos);
+        if (imagePos === undefined || node?.type.name !== "image") return false;
+        view.dispatch(view.state.tr.setSelection(new NodeSelection(view.state.doc.resolve(imagePos))));
+        return true;
+      },
       handlePaste: (view, event) => {
         const files = event.clipboardData?.files;
         if (files && files.length > 0) {
           const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
           if (imageFiles.length > 0 && editorRef.current) {
             event.preventDefault();
+            let pasteSelection = {
+              from: view.state.selection.from,
+              to: view.state.selection.to,
+            };
+            const domSelection = window.getSelection();
+            if (
+              domSelection?.anchorNode
+              && domSelection.focusNode
+              && view.dom.contains(domSelection.anchorNode)
+              && view.dom.contains(domSelection.focusNode)
+            ) {
+              try {
+                pasteSelection = {
+                  from: view.posAtDOM(domSelection.anchorNode, domSelection.anchorOffset),
+                  to: view.posAtDOM(domSelection.focusNode, domSelection.focusOffset),
+                };
+              } catch {
+                // Keep the ProseMirror selection if the DOM selection is transient.
+              }
+            }
             void insertImageFiles(editorRef.current, imageFiles, {
               onNotice: (message) => setNoticeRef.current(message),
-              selection: {
-                from: view.state.selection.from,
-                to: view.state.selection.to,
-              },
+              selection: pasteSelection,
             });
             return true;
           }
@@ -1158,6 +1892,12 @@ function LabEditorSession() {
 
         if (view.state.selection instanceof NodeSelection) {
           const selectedNode = view.state.selection.node;
+          if (selectedNode.type.name === "image" && (event.key === "Backspace" || event.key === "Delete")) {
+            event.preventDefault();
+            const { from, to } = view.state.selection;
+            view.dispatch(closeHistory(view.state.tr.delete(from, to).scrollIntoView()));
+            return true;
+          }
           const kind = selectedNode.type.name === "inlineMath"
             ? "inline"
             : selectedNode.type.name === "blockMath"
@@ -1904,6 +2644,21 @@ function LabEditorSession() {
     event.target.value = "";
   };
 
+  const applyImageCrop = useCallback((dataUrl: string) => {
+    const target = imageCropTarget;
+    const instance = editorRef.current;
+    if (!target || !instance) return;
+    const node = instance.state.doc.nodeAt(target.pos);
+    if (!node || node.type.name !== "image") {
+      setImageCropTarget(null);
+      return;
+    }
+    instance.commands.setNodeSelection(target.pos);
+    instance.commands.updateAttributes("image", { src: dataUrl, width: null, height: null });
+    instance.commands.focus();
+    setImageCropTarget(null);
+  }, [imageCropTarget]);
+
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1932,6 +2687,14 @@ function LabEditorSession() {
   return (
     <div className="lab-shell" ref={shellRef} onKeyDownCapture={onKeyDownCapture}>
       <EditorContent editor={editor} aria-busy={hydrating} />
+      {imageCropTarget ? (
+        <ImageCropDialog
+          src={imageCropTarget.src}
+          alt={imageCropTarget.alt}
+          onCancel={() => setImageCropTarget(null)}
+          onApply={applyImageCrop}
+        />
+      ) : null}
       {mathEditorState ? (
         <div
           ref={mathEditorElementRef}

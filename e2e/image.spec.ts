@@ -11,6 +11,16 @@ function pngFile(name = "red.png") {
   };
 }
 
+function svgFile(name = "sample.svg") {
+  return {
+    name,
+    mimeType: "image/svg+xml",
+    buffer: Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="240"><rect width="200" height="240" fill="#e85d75"/><rect x="200" width="200" height="240" fill="#4e79a7"/></svg>',
+    ),
+  };
+}
+
 test("the /image slash command inserts a base64 image", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.type("/image");
@@ -277,4 +287,73 @@ test("image alt with special characters is escaped in Markdown export", async ({
   await expect(img).toHaveAttribute("alt", "a]b");
 
   await waitForAuthority(page, /!\[a\\\]b\]\(data:image\/png;base64,/);
+});
+
+test("clicking an image exposes resize, crop, and delete actions", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.locator('input[type="file"][accept*="image/*"]').setInputFiles(svgFile());
+
+  const image = editor.locator("img.lab-image");
+  await expect(image).toBeVisible();
+  await image.click();
+  await expect(page.getByRole("button", { name: "Crop image" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Center image" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resize image bottom-right" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resize image left" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Center image" }).click();
+  await expect(image).toHaveAttribute("data-image-align", "center");
+  await expect(page.getByRole("button", { name: "Uncenter image" })).toBeVisible();
+  await waitForAuthority(page, /align=center/);
+
+  await page.getByRole("button", { name: "Uncenter image" }).click();
+  await expect(image).not.toHaveAttribute("data-image-align");
+  await expect(page.getByRole("button", { name: "Center image" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Delete image" }).click();
+  await expect(editor.locator("img.lab-image")).toHaveCount(0);
+});
+
+test("resizing an image preserves its aspect ratio and persists its size", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.locator('input[type="file"][accept*="image/*"]').setInputFiles(svgFile());
+
+  const image = editor.locator("img.lab-image");
+  await expect(image).toBeVisible();
+  await image.click();
+  const handle = page.getByRole("button", { name: "Resize image bottom-right" });
+  const handleBox = await handle.boundingBox();
+  if (!handleBox) throw new Error("Resize handle was not laid out");
+  const startX = handleBox.x + handleBox.width / 2;
+  const startY = handleBox.y + handleBox.height / 2;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  await page.mouse.move(startX + 100, startY + 60);
+  await page.mouse.up();
+
+  await expect.poll(() => image.getAttribute("style")).toMatch(/width: \d+px/);
+  await waitForAuthority(page, /lab-size:\d+x\d+/);
+});
+
+test("cropping an image creates a local cropped data URL", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.locator('input[type="file"][accept*="image/*"]').setInputFiles(svgFile());
+
+  const image = editor.locator("img.lab-image");
+  await expect(image).toBeVisible();
+  await image.click();
+  await page.getByRole("button", { name: "Crop image" }).click();
+
+  const stage = page.locator(".image-crop-stage");
+  await expect(stage).toBeVisible();
+  const stageBox = await stage.boundingBox();
+  if (!stageBox) throw new Error("Crop stage was not laid out");
+  await page.mouse.move(stageBox.x + 24, stageBox.y + 20);
+  await page.mouse.down();
+  await page.mouse.move(stageBox.x + stageBox.width * 0.7, stageBox.y + stageBox.height * 0.75);
+  await page.mouse.up();
+  await page.getByRole("button", { name: "Apply crop" }).click();
+
+  await expect(image).toHaveAttribute("src", /^data:image\/png;base64,/);
+  await waitForAuthority(page, /!\[sample\]\(data:image\/png;base64,/);
 });
