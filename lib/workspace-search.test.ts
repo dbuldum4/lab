@@ -38,3 +38,8 @@ test("searchWorkspace tolerates one inaccessible document", async () => {
   assert.equal(results[0].session.id, "a");
   assert.equal(results[0].snippet, "Session name match");
 });
+
+test("searchWorkspace obeys the result limit", async () => {
+  const results = await searchWorkspace(sessions, "alpha", async (id) => markdown.get(id) ?? "", 2);
+  assert.equal(results.length, 2);
+});
