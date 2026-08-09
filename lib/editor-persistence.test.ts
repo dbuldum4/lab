@@ -308,3 +308,25 @@ test("save outcomes distinguish conflict, degraded replicas, recovery drafts, an
   assert.equal(notices[2], "Saved, but one or more local copies could not be updated.");
   assert.equal(notices[3], "2 conflicting local drafts are available. Use /recover to export.");
 });
+
+
+test("onPersisted reports the exact Markdown accepted by durable storage", async () => {
+  const persisted: string[] = [];
+  const state = dependencies({ onPersisted: (markdown) => persisted.push(markdown) });
+  const controller = createEditorPersistenceController(state.options);
+  controller.markLoaded("");
+  controller.onEdit("saved checkpoint");
+  assert.equal(await controller.flush(), true);
+  assert.deepEqual(persisted, ["saved checkpoint"]);
+
+  const failedPersisted: string[] = [];
+  const failed = dependencies({
+    save: async () => health(false, ["IndexedDB authority is unavailable; the candidate was not written."]),
+    onPersisted: (markdown) => failedPersisted.push(markdown),
+  });
+  const failedController = createEditorPersistenceController(failed.options);
+  failedController.markLoaded("");
+  failedController.onEdit("not durable");
+  assert.equal(await failedController.flush(), false);
+  assert.deepEqual(failedPersisted, []);
+});
