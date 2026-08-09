@@ -106,8 +106,12 @@ export function recordDocumentVersion(
 
 export function clearDocumentVersions(documentId: string) {
   const key = historyKey(documentId);
+  if (!key) return false;
   const local = storage();
-  if (!key || !local) return false;
+  // If localStorage itself is unavailable, this history backend could not have
+  // persisted readable checkpoints in the current environment, so deletion is
+  // already satisfied rather than blocking document deletion forever.
+  if (!local) return true;
   try {
     local.removeItem(key);
     return true;
