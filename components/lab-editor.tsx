@@ -42,9 +42,10 @@ import {
   type DocumentSession,
 } from "@/lib/document-sessions";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import { clearSessionSeed, readSessionSeed, stageSessionSeed } from "@/lib/session-seeds";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions" | "templates";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -61,6 +62,14 @@ type Command = {
   detail: string;
   terms: string;
 };
+
+type NoteTemplate = { id: string; name: string; detail: string; markdown: string };
+
+const NOTE_TEMPLATES: NoteTemplate[] = [
+  { id: "daily", name: "Daily note", detail: "Focus, tasks, and notes", markdown: "# Daily note\n\n## Focus\n\n- [ ] \n\n## Notes\n\n" },
+  { id: "meeting", name: "Meeting note", detail: "Agenda, decisions, and actions", markdown: "# Meeting\n\n## Agenda\n\n- \n\n## Decisions\n\n- \n\n## Actions\n\n- [ ] \n" },
+  { id: "experiment", name: "Experiment log", detail: "Hypothesis, method, and result", markdown: "# Experiment\n\n## Hypothesis\n\n\n## Method\n\n\n## Result\n\n" },
+];
 
 type MathKind = "inline" | "block";
 type MathEditorState = {
@@ -94,6 +103,8 @@ const COMMANDS: Command[] = [
   { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
   { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
+  { id: "duplicate", label: "Duplicate session", detail: "Copy this note into a new session", terms: "copy clone document note" },
+  { id: "template", label: "New from template", detail: "Start from a local note template", terms: "daily meeting experiment starter" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
@@ -439,7 +450,10 @@ function LabEditorSession() {
         setHealth(nextHealth);
         // documentId is stable for the mount lifetime (session switches reload),
         // so capturing it here is intentional and avoids a ref.
-        if (nextHealth.saved === true) void touchDocumentSession(documentId).catch(() => undefined);
+        if (nextHealth.saved === true) {
+          clearSessionSeed(documentId);
+          void touchDocumentSession(documentId).catch(() => undefined);
+        }
       },
       onNotice: setNotice,
       onStageFailure: () => setNotice("This edit could not be staged locally. Please export a copy before closing the page."),
@@ -1208,6 +1222,26 @@ function LabEditorSession() {
     return true;
   }, [documentId, editor, persistence]);
 
+  const createSeededSession = useCallback(async (name: string, markdown: string) => {
+    const flushResult = await flushBeforeSessionSwitch();
+    if (flushResult === "cancel") return false;
+    if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return false;
+    let created: DocumentSession | null = null;
+    try {
+      created = await createDocumentSession(name);
+      if (!stageSessionSeed(created.id, markdown)) {
+        await purgeDocumentSession(created.id).catch(() => undefined);
+        throw new Error("Session seed storage is unavailable.");
+      }
+      navigateToSession(created);
+      return true;
+    } catch {
+      setNotice("The new session could not be prepared locally. Reloading…");
+      window.location.reload();
+      return false;
+    }
+  }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
+
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
     if (!nextName) {
@@ -1303,6 +1337,17 @@ function LabEditorSession() {
         })();
         return;
       }
+      if (command.id === "duplicate") {
+        const markdown = editor.getMarkdown();
+        const copyName = savedSessionName === "Untitled" ? "Untitled copy" : `${savedSessionName} copy`;
+        void createSeededSession(copyName, markdown);
+        return;
+      }
+      if (command.id === "template") {
+        setSelected(0);
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "templates" });
+        return;
+      }
       if (command.id === "name") {
         setSessionName(savedSessionName);
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "name" });
@@ -1375,7 +1420,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
+    [createSeededSession, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
   );
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
@@ -1470,6 +1515,8 @@ function LabEditorSession() {
           if (active) setNotice("Session names are unavailable, but this note can still be loaded.");
         }
         const markdown = await persistence.hydrate();
+        const seed = markdown ? null : readSessionSeed(documentId);
+        const initialMarkdown = seed ?? markdown;
         // loadLocalDocument can discover an IndexedDB-only tombstone and write the
         // local marker during hydrate; re-check so we take the same recovery path.
         if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
@@ -1478,8 +1525,9 @@ function LabEditorSession() {
           return;
         }
         if (!active) return;
-        editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
-        persistence.markLoaded(markdown);
+        editor.commands.setContent(initialMarkdown, { contentType: "markdown", emitUpdate: false });
+        persistence.markLoaded(initialMarkdown);
+        if (seed !== null) persistence.onEdit(initialMarkdown);
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);
@@ -1560,6 +1608,21 @@ function LabEditorSession() {
     }
 
     if (current.mode === "name") return;
+
+    if (current.mode === "templates") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = NOTE_TEMPLATES.length;
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && NOTE_TEMPLATES.length > 0) {
+        event.preventDefault();
+        const template = NOTE_TEMPLATES[selectedRef.current] ?? NOTE_TEMPLATES[0];
+        setPalette(null);
+        void createSeededSession(template.name, template.markdown);
+      }
+      return;
+    }
 
     if (current.mode === "sessions") {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -1740,8 +1803,8 @@ function LabEditorSession() {
             ref={paletteElementRef}
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "templates" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "templates" ? "Note templates" : "Slash commands"}
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
@@ -1813,6 +1876,28 @@ function LabEditorSession() {
                 >
                   <span>{session.name}</span>
                   <small>{session.id === documentId ? "Current session" : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}</small>
+                </div>
+              ))}
+            </div>
+          ) : palette.mode === "templates" ? (
+            <div className="command-list session-list" data-testid="template-list">
+              {NOTE_TEMPLATES.map((template, index) => (
+                <div
+                  className="command-item"
+                  data-selected={index === selected}
+                  id={`${PALETTE_ID}-template-${template.id}`}
+                  key={template.id}
+                  role="option"
+                  aria-selected={index === selected}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    setPalette(null);
+                    void createSeededSession(template.name, template.markdown);
+                  }}
+                  onMouseEnter={() => setSelected(index)}
+                >
+                  <span>{template.name}</span>
+                  <small>{template.detail}</small>
                 </div>
               ))}
             </div>
