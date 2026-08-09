@@ -1,0 +1,57 @@
+name: Fix slash selection drift
+
+on:
+  push:
+    branches:
+      - agent/local-history
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/local-history
+      - name: Reset slash selection when filtering changes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('components/lab-editor.tsx')
+          text = path.read_text()
+          old = '''  const filtered = useMemo(() => {
+    if (!palette || palette.mode !== "commands") return [];
+    const query = palette.query.toLowerCase();
+    return COMMANDS
+      .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
+      .sort((left, right) => {
+        const score = (command: Command) => command.id === query
+          ? 0
+          : command.label.toLowerCase().startsWith(query)
+            ? 1
+            : 2;
+        return score(left) - score(right);
+      });
+  }, [palette]);
+'''
+          new = old + '''
+  useEffect(() => {
+    if (palette?.mode !== "commands") return;
+    setSelected(0);
+  }, [palette?.mode, palette?.query, setSelected]);
+'''
+          if old not in text:
+            raise SystemExit('filtered command anchor not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Commit fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/agent-fix-history-selection.yml
+          git add components/lab-editor.tsx
+          git commit -m 'fix(editor): reset slash selection while filtering'
+          git push
