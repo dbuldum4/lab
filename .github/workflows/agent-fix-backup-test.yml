@@ -1,0 +1,38 @@
+name: Fix workspace backup test selector
+
+on:
+  push:
+    branches:
+      - agent/workspace-backup
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/workspace-backup
+      - name: Tighten Markdown file selector
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('e2e/local-vault.spec.ts')
+          text = path.read_text()
+          old = 'page.locator(\'input[type="file"]\').setInputFiles({'
+          new = 'page.locator(\'input[type="file"][accept*="text/markdown"]\').setInputFiles({'
+          if old not in text:
+            raise SystemExit('Markdown import selector anchor not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Commit fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/agent-fix-backup-test.yml
+          git add e2e/local-vault.spec.ts
+          git commit -m 'test: target Markdown import input explicitly'
+          git push
