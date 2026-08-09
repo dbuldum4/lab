@@ -17,15 +17,14 @@ test("history restores an earlier local checkpoint and persists the restore", as
   await editor.click();
   await editor.fill("first saved version");
   let history = await openHistory(page);
-  await expect(history).toContainText("first saved version");
+  await expect(history).toContainText("No earlier checkpoints yet");
   await page.keyboard.press("Escape");
 
   await editor.fill("second saved version");
   history = await openHistory(page);
-  await expect(history).toContainText("second saved version");
   await expect(history).toContainText("first saved version");
+  await expect(history).not.toContainText("second saved version");
 
-  await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
   await expect(editor).toContainText("first saved version");
   await expect(page.getByRole("status")).toContainText("Restored a local history checkpoint");
@@ -41,7 +40,7 @@ test("clear removes history before erasing the note", async ({ page }) => {
   await editor.click();
   await editor.fill("private checkpoint");
   let history = await openHistory(page);
-  await expect(history).toContainText("private checkpoint");
+  await expect(history).toContainText("No earlier checkpoints yet");
   await page.keyboard.press("Escape");
 
   await editor.click();
