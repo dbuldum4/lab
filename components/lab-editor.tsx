@@ -1,18 +1,28 @@
 "use client";
 
-import { Extension, InputRule, type Editor } from "@tiptap/core";
+import {
+  Extension,
+  InputRule,
+  type Editor,
+  type JSONContent,
+  type MarkdownParseHelpers,
+  type MarkdownToken,
+} from "@tiptap/core";
 import Placeholder from "@tiptap/extension-placeholder";
 import { TableKit } from "@tiptap/extension-table";
 import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
 import { BlockMath, InlineMath } from "@tiptap/extension-mathematics";
+import Image, { type ImageOptions } from "@tiptap/extension-image";
 import { Markdown } from "@tiptap/markdown";
 import { closeHistory } from "@tiptap/pm/history";
 import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
 import { NodeSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { BorderBeam } from "border-beam";
 import katex from "katex";
+import { LayoutGroup, motion, type Transition } from "motion/react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   createEditorPersistenceController,
@@ -73,6 +83,57 @@ type MathEditorState = {
   top: number;
 };
 
+type ImageCropTarget = {
+  pos: number;
+  src: string;
+  alt: string;
+};
+
+type CropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type CropPoint = { x: number; y: number };
+type CropHandle = "top-left" | "top" | "top-right" | "right" | "bottom-right" | "bottom" | "bottom-left" | "left";
+type CropInteraction = {
+  mode: "draw" | "move" | "resize";
+  pointerId: number;
+  start: CropPoint;
+  initial: CropRect;
+  handle?: CropHandle;
+};
+
+const CROP_HANDLES: CropHandle[] = [
+  "top-left",
+  "top",
+  "top-right",
+  "right",
+  "bottom-right",
+  "bottom",
+  "bottom-left",
+  "left",
+];
+
+const SLASH_PALETTE_INITIAL = {
+  opacity: 0,
+  transform: "translateY(0px) scale(0.93)",
+};
+const SLASH_PALETTE_TRANSITION: Transition = {
+  type: "spring",
+  stiffness: 560,
+  damping: 34,
+  mass: 0.62,
+};
+const SLASH_SELECTION_TRANSITION: Transition = {
+  type: "spring",
+  stiffness: 480,
+  damping: 35,
+  mass: 0.58,
+};
+
 const COMMANDS: Command[] = [
   { id: "text", label: "Text", detail: "Plain paragraph", terms: "paragraph normal" },
   { id: "h1", label: "Heading 1", detail: "Large section title", terms: "title h1" },
@@ -88,6 +149,7 @@ const COMMANDS: Command[] = [
   { id: "inline-math", label: "Inline equation", detail: "Write LaTeX within a line", terms: "math latex formula inline equation" },
   { id: "math", label: "Block equation", detail: "Write a centered LaTeX equation", terms: "math latex formula display equation" },
   { id: "link", label: "Link", detail: "Type a URL, then close with )", terms: "url href markdown" },
+  { id: "image", label: "Image", detail: "Insert a local image", terms: "photo picture upload paste" },
   { id: "undo", label: "Undo", detail: "Undo the last change", terms: "back history" },
   { id: "redo", label: "Redo", detail: "Redo the last change", terms: "forward history" },
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
@@ -248,6 +310,22 @@ function useIsClient() {
   );
 }
 
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+
+function subscribeToReducedMotion(callback: () => void) {
+  const mediaQuery = window.matchMedia(REDUCED_MOTION_QUERY);
+  mediaQuery.addEventListener("change", callback);
+  return () => mediaQuery.removeEventListener("change", callback);
+}
+
+function usePrefersReducedMotion() {
+  return useSyncExternalStore(
+    subscribeToReducedMotion,
+    () => window.matchMedia(REDUCED_MOTION_QUERY).matches,
+    () => true,
+  );
+}
+
 function migrateInlineMath(instance: Editor) {
   const matches: Array<{ from: number; to: number; latex: string }> = [];
   instance.state.doc.descendants((node, pos) => {
@@ -325,6 +403,867 @@ function recoveryBundle(drafts: readonly LocalRecoveryDraft[]) {
     const stagedAt = Number.isNaN(date.getTime()) ? String(draft.updatedAt) : date.toISOString();
     return `<!-- lab recovery draft ${index + 1}; staged ${stagedAt} -->\n\n${draft.markdown}`;
   }).join("\n\n---\n\n");
+}
+
+/** Raw file cap before base64 (~4/3) so a single image stays under typical localStorage quotas. */
+const MAX_IMAGE_BYTES = 1_500_000;
+
+function readFileAsDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read image file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Local-first images only: data URLs and same-origin paths. */
+function isAllowedImageSrc(src: string | null | undefined): boolean {
+  if (!src) return false;
+  const trimmed = src.trim();
+  if (trimmed.startsWith("data:image/")) return true;
+  try {
+    if (typeof window === "undefined") {
+      return trimmed.startsWith("/") && !trimmed.startsWith("//");
+    }
+    const url = new URL(trimmed, window.location.href);
+    if (url.protocol === "data:") return url.href.startsWith("data:image/");
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    return url.origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+function escapeMarkdownImageAlt(alt: string): string {
+  return alt.replace(/\\/g, "\\\\").replace(/]/g, "\\]").replace(/\r?\n/g, " ");
+}
+
+function escapeMarkdownImageTitle(title: string): string {
+  return title.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+}
+
+function imageDimension(value: unknown): number | null {
+  const number = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(number) || number <= 0) return null;
+  return Math.max(1, Math.round(number));
+}
+
+function parseImageMarkdownTitle(title: unknown) {
+  const value = String(title ?? "");
+  const parts = value.split(";");
+  const sizeMatch = parts[0]?.match(/^lab-size:(\d+)?x(\d+)?$/);
+  const align = parts.includes("align=center") ? "center" : null;
+  const titlePart = parts.find((part) => part.startsWith("title="));
+  if (!sizeMatch && !align) return { title: value || null, width: null, height: null, align: null };
+
+  let imageTitle: string | null = null;
+  if (titlePart) {
+    try {
+      imageTitle = decodeURIComponent(titlePart.slice("title=".length));
+    } catch {
+      imageTitle = titlePart.slice("title=".length);
+    }
+  }
+  return {
+    title: imageTitle,
+    width: imageDimension(sizeMatch?.[1]),
+    height: imageDimension(sizeMatch?.[2]),
+    align,
+  };
+}
+
+function imageMarkdownTitle(title: unknown, width: unknown, height: unknown, align: unknown) {
+  const rawTitle = String(title ?? "");
+  const normalizedWidth = imageDimension(width);
+  const normalizedHeight = imageDimension(height);
+  const normalizedAlign = align === "center" ? "center" : null;
+  if (!normalizedWidth && !normalizedHeight && !normalizedAlign) return rawTitle;
+
+  const metadata = [
+    normalizedWidth || normalizedHeight ? `lab-size:${normalizedWidth ?? ""}x${normalizedHeight ?? ""}` : null,
+    normalizedAlign ? "align=center" : null,
+  ].filter(Boolean).join(";");
+  return rawTitle ? `${metadata};title=${encodeURIComponent(rawTitle)}` : metadata;
+}
+
+type InsertImageFilesOptions = {
+  onNotice?: (message: string) => void;
+  /**
+   * Document position to insert at (e.g. drop coords via posAtCoords).
+   * When omitted, replaces the current selection.
+   */
+  pos?: number;
+  /** Selection captured before an asynchronous file read started. */
+  selection?: { from: number; to: number };
+};
+
+async function insertImageFiles(
+  editor: Editor,
+  files: FileList | readonly File[],
+  options: InsertImageFilesOptions = {},
+): Promise<void> {
+  const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+  if (imageFiles.length === 0 || editor.isDestroyed) return;
+
+  const accepted: File[] = [];
+  let rejectedLarge = 0;
+  for (const file of imageFiles) {
+    if (file.size > MAX_IMAGE_BYTES) {
+      rejectedLarge += 1;
+      continue;
+    }
+    accepted.push(file);
+  }
+
+  if (rejectedLarge > 0) {
+    options.onNotice?.(
+      rejectedLarge === 1
+        ? "That image is too large to store locally. Use an image under 1.5MB."
+        : `${rejectedLarge} images were too large to store locally. Use images under 1.5MB each.`,
+    );
+  }
+  if (accepted.length === 0 || editor.isDestroyed) return;
+
+  // FileReader yields to the event loop. Keep the numeric anchor only when
+  // the editor state is unchanged; otherwise it may point into a different
+  // document after a concurrent edit. The current selection is a safe fallback.
+  const anchorState = editor.state;
+  let dataUrls: { file: File; dataUrl: string }[];
+  try {
+    dataUrls = await Promise.all(
+      accepted.map(async (file) => ({ file, dataUrl: await readFileAsDataURL(file) })),
+    );
+  } catch {
+    options.onNotice?.("The selected image could not be inserted.");
+    return;
+  }
+  if (editor.isDestroyed) return;
+
+  const { schema, state } = editor;
+  const anchorIsCurrent = editor.state === anchorState;
+  const images = dataUrls.map(({ file, dataUrl }) => {
+    const alt = file.name.replace(/\.[^/.]+$/, "");
+    return schema.nodes.image.create({ src: dataUrl, alt });
+  });
+
+  // Prefer an explicit drop/insert position; otherwise replace the selection.
+  // Do not use either captured value after a transaction has changed the doc.
+  const insertionPos = anchorIsCurrent ? options.pos : undefined;
+  const insertionSelection = anchorIsCurrent ? options.selection : undefined;
+  let from: number;
+  let to: number;
+  let $insert = state.selection.$to;
+  const clampDocPosition = (value: number) => Math.max(
+    0,
+    Math.min(Math.round(value), state.doc.content.size),
+  );
+  if (typeof insertionPos === "number" && Number.isFinite(insertionPos)) {
+    const pos = clampDocPosition(insertionPos);
+    from = pos;
+    to = pos;
+    $insert = state.doc.resolve(pos);
+  } else if (insertionSelection) {
+    from = clampDocPosition(insertionSelection.from);
+    to = clampDocPosition(insertionSelection.to);
+    if (from > to) [from, to] = [to, from];
+    $insert = state.doc.resolve(to);
+  } else {
+    from = state.selection.from;
+    to = state.selection.to;
+  }
+
+  // Only append a trailing empty paragraph when inserting at the end of a
+  // textblock. Mid-paragraph inserts already leave the remaining text as the
+  // block after the image; an extra empty paragraph would create a blank line.
+  const atEndOfTextblock = $insert.parent.isTextblock && $insert.parentOffset === $insert.parent.content.size;
+  const nodes: PMNode[] = atEndOfTextblock
+    ? [...images, schema.nodes.paragraph.create()]
+    : images;
+
+  editor.commands.insertContentAt({ from, to }, Fragment.from(nodes), {
+    updateSelection: true,
+  });
+}
+
+/**
+ * Local-first image node: base64/same-origin only, and safe Markdown alt.
+ */
+type ImageCropHandler = (node: PMNode, pos: number) => void;
+
+const LabImage = Image.extend({
+  addOptions() {
+    return {
+      ...this.parent?.(),
+      onCrop: null as ImageCropHandler | null,
+    } as ImageOptions & { onCrop: ImageCropHandler | null };
+  },
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      align: {
+        default: null,
+        parseHTML: (node: HTMLElement) => node.getAttribute("data-image-align") === "center" ? "center" : null,
+        renderHTML: (attributes: { align?: string | null }) => attributes.align === "center"
+          ? { "data-image-align": "center" }
+          : {},
+      },
+    };
+  },
+  parseHTML() {
+    return [
+      {
+        tag: "img[src]",
+        getAttrs: (node: HTMLElement | string) => {
+          if (typeof node === "string") return false;
+          const src = node.getAttribute("src");
+          if (!isAllowedImageSrc(src)) return false;
+          return {
+            src,
+            alt: node.getAttribute("alt"),
+            title: node.getAttribute("title"),
+            width: imageDimension(node.getAttribute("width") ?? node.style.width.replace(/px$/, "")),
+            height: imageDimension(node.getAttribute("height") ?? node.style.height.replace(/px$/, "")),
+            align: node.getAttribute("data-image-align") === "center" ? "center" : null,
+          };
+        },
+      },
+    ];
+  },
+  parseMarkdown: (token: MarkdownToken, helpers: MarkdownParseHelpers) => {
+    const src = String(token.href ?? "");
+    if (!isAllowedImageSrc(src)) return [];
+    const imageTitle = parseImageMarkdownTitle(token.title);
+    return helpers.createNode("image", {
+      src,
+      title: imageTitle.title,
+      alt: token.text,
+      width: imageTitle.width,
+      height: imageTitle.height,
+      align: imageTitle.align,
+    });
+  },
+  renderMarkdown: (node: JSONContent) => {
+    const src = String(node.attrs?.src ?? "");
+    const alt = escapeMarkdownImageAlt(String(node.attrs?.alt ?? ""));
+    const title = imageMarkdownTitle(node.attrs?.title, node.attrs?.width, node.attrs?.height, node.attrs?.align);
+    return title
+      ? `![${alt}](${src} "${escapeMarkdownImageTitle(title)}")`
+      : `![${alt}](${src})`;
+  },
+  addNodeView() {
+    return (props) => {
+      const image = document.createElement("img");
+      image.className = String(props.HTMLAttributes.class ?? "lab-image");
+      image.draggable = false;
+      image.setAttribute("contenteditable", "false");
+      let centerButton: HTMLButtonElement | null = null;
+      let alignmentAnimationFrame: number | null = null;
+
+      const stopAlignmentAnimation = () => {
+        if (alignmentAnimationFrame !== null) {
+          cancelAnimationFrame(alignmentAnimationFrame);
+          alignmentAnimationFrame = null;
+        }
+        image.style.removeProperty("will-change");
+      };
+
+      const setImageAlignment = (align: string | null) => {
+        if (align === "center") image.dataset.imageAlign = "center";
+        else delete image.dataset.imageAlign;
+      };
+
+      const animateImageAlignment = (align: string | null) => {
+        if (!image.isConnected) {
+          setImageAlignment(align);
+          return;
+        }
+
+        const startRect = image.getBoundingClientRect();
+        stopAlignmentAnimation();
+        image.style.removeProperty("transform");
+        setImageAlignment(align);
+        const targetRect = image.getBoundingClientRect();
+        const startOffset = startRect.left - targetRect.left;
+        if (!Number.isFinite(startOffset) || Math.abs(startOffset) < 0.5) {
+          updateOverlay();
+          return;
+        }
+
+        const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+        if (reduceMotion) {
+          updateOverlay();
+          return;
+        }
+
+        image.style.willChange = "transform";
+        let position = startOffset;
+        let velocity = 0;
+        let previousTime = performance.now();
+        const stiffness = 250;
+        const damping = 2 * Math.sqrt(stiffness);
+
+        const step = (time: number) => {
+          const deltaTime = Math.min(32, Math.max(1, time - previousTime)) / 1000;
+          previousTime = time;
+          const acceleration = -stiffness * position - damping * velocity;
+          velocity += acceleration * deltaTime;
+          position += velocity * deltaTime;
+          image.style.transform = `translate3d(${position}px, 0, 0)`;
+          updateOverlay();
+
+          if (Math.abs(position) < 0.25 && Math.abs(velocity) < 0.25) {
+            image.style.removeProperty("transform");
+            stopAlignmentAnimation();
+            updateOverlay();
+            return;
+          }
+          alignmentAnimationFrame = requestAnimationFrame(step);
+        };
+
+        image.style.transform = `translate3d(${position}px, 0, 0)`;
+        updateOverlay();
+        alignmentAnimationFrame = requestAnimationFrame(step);
+      };
+
+      const syncCenterButton = (node: PMNode) => {
+        if (!centerButton) return;
+        const action = node.attrs.align === "center" ? "Uncenter" : "Center";
+        centerButton.textContent = action;
+        centerButton.setAttribute("aria-label", `${action} image`);
+      };
+
+      const syncImage = (node: PMNode) => {
+        const src = String(node.attrs.src ?? "");
+        if (image.getAttribute("src") !== src) image.src = src;
+        const alt = node.attrs.alt == null ? "" : String(node.attrs.alt);
+        if (image.getAttribute("alt") !== alt) image.setAttribute("alt", alt);
+        const title = node.attrs.title == null || node.attrs.title === "" ? null : String(node.attrs.title);
+        if (title == null) image.removeAttribute("title");
+        else if (image.getAttribute("title") !== title) image.setAttribute("title", title);
+
+        const width = imageDimension(node.attrs.width);
+        const height = imageDimension(node.attrs.height);
+        if (width) image.style.width = `${width}px`;
+        else image.style.removeProperty("width");
+        if (width && height) {
+          // Let max-width shrink both dimensions together on narrow screens.
+          image.style.aspectRatio = `${width} / ${height}`;
+          image.style.removeProperty("height");
+        } else {
+          image.style.removeProperty("aspect-ratio");
+          if (height) image.style.height = `${height}px`;
+          else image.style.removeProperty("height");
+        }
+        const nextAlign = node.attrs.align === "center" ? "center" : null;
+        const currentAlign = image.dataset.imageAlign === "center" ? "center" : null;
+        if (currentAlign === nextAlign) setImageAlignment(nextAlign);
+        else animateImageAlignment(nextAlign);
+        syncCenterButton(node);
+      };
+      syncImage(props.node);
+
+      const overlay = document.createElement("div");
+      overlay.className = "image-selection-overlay";
+      overlay.setAttribute("contenteditable", "false");
+      overlay.setAttribute("data-image-overlay", "true");
+      overlay.setAttribute("aria-hidden", "true");
+
+      const toolbar = document.createElement("div");
+      toolbar.className = "image-edit-toolbar";
+      toolbar.setAttribute("contenteditable", "false");
+      toolbar.setAttribute("role", "toolbar");
+      toolbar.setAttribute("aria-label", "Image actions");
+
+      const getCurrentImage = () => {
+        const pos = props.getPos();
+        if (typeof pos !== "number") return null;
+        const node = props.editor.state.doc.nodeAt(pos);
+        return node?.type.name === "image" ? { node, pos } : null;
+      };
+
+      let selected = false;
+      let resizing: {
+        pointerId: number;
+        direction: CropHandle;
+        startX: number;
+        startY: number;
+        startWidth: number;
+        startHeight: number;
+        aspectRatio: number;
+        width: number;
+        height: number;
+      } | null = null;
+
+      const updateOverlay = () => {
+        if (!selected) return;
+        const rect = image.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        overlay.style.left = `${rect.left}px`;
+        overlay.style.top = `${rect.top}px`;
+        overlay.style.width = `${rect.width}px`;
+        overlay.style.height = `${rect.height}px`;
+      };
+
+      const makeButton = (label: string, action: () => void) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "image-edit-button";
+        button.textContent = label;
+        button.setAttribute("aria-label", `${label} image`);
+        button.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          action();
+        });
+        return button;
+      };
+
+      const cropButton = makeButton("Crop", () => {
+        const current = getCurrentImage();
+        if (!current) return;
+        props.editor.commands.setNodeSelection(current.pos);
+        (this.options as ImageOptions & { onCrop?: ImageCropHandler }).onCrop?.(current.node, current.pos);
+      });
+      const deleteButton = makeButton("Delete", () => {
+        const current = getCurrentImage();
+        if (!current) return;
+        props.editor.commands.setNodeSelection(current.pos);
+        props.editor.commands.deleteSelection();
+        props.editor.commands.focus();
+      });
+      centerButton = makeButton("Center", () => {
+        const current = getCurrentImage();
+        if (!current) return;
+        props.editor.commands.setNodeSelection(current.pos);
+        props.editor.commands.updateAttributes("image", {
+          align: current.node.attrs.align === "center" ? null : "center",
+        });
+        props.editor.commands.focus();
+      });
+      syncCenterButton(props.node);
+      toolbar.append(cropButton, centerButton, deleteButton);
+      overlay.append(toolbar);
+
+      const resizeHandles = CROP_HANDLES
+        .map((direction) => {
+          const handle = document.createElement("button");
+          handle.type = "button";
+          handle.className = `image-resize-handle image-resize-handle-${direction}`;
+          handle.setAttribute("data-image-resize-handle", direction);
+          handle.setAttribute("aria-label", `Resize image ${direction}`);
+          handle.tabIndex = -1;
+          overlay.append(handle);
+          return { direction, handle };
+        });
+
+      const finishResize = () => {
+        if (!resizing) return;
+        const current = resizing;
+        resizing = null;
+        document.removeEventListener("pointermove", moveResize);
+        document.removeEventListener("pointerup", finishResize);
+        document.removeEventListener("pointercancel", finishResize);
+        const pos = props.getPos();
+        if (typeof pos !== "number") return;
+        props.editor.commands.setNodeSelection(pos);
+        props.editor.commands.updateAttributes("image", {
+          width: imageDimension(current.width),
+          height: imageDimension(current.height),
+        });
+      };
+
+      const moveResize = (event: PointerEvent) => {
+        if (!resizing) return;
+        const deltaX = event.clientX - resizing.startX;
+        const deltaY = event.clientY - resizing.startY;
+        const horizontalDelta = resizing.direction.includes("left") ? -deltaX : deltaX;
+        const verticalDelta = resizing.direction.includes("top") ? -deltaY : deltaY;
+        const startWidth = Math.max(1, resizing.startWidth);
+        const startHeight = Math.max(1, resizing.startHeight);
+        const horizontalScale = (startWidth + horizontalDelta) / startWidth;
+        const verticalScale = (startHeight + verticalDelta) / startHeight;
+        const requestedScale = resizing.direction === "top" || resizing.direction === "bottom"
+          ? verticalScale
+          : resizing.direction === "left" || resizing.direction === "right"
+            ? horizontalScale
+            : Math.max(horizontalScale, verticalScale);
+        const scale = Math.max(
+          48 / startWidth,
+          48 / startHeight,
+          requestedScale,
+        );
+        const maxWidth = Math.max(48, props.editor.view.dom.clientWidth || Number.POSITIVE_INFINITY);
+        const width = Math.min(maxWidth, startWidth * scale);
+        const height = width / resizing.aspectRatio;
+        resizing.width = width;
+        resizing.height = height;
+        image.style.width = `${width}px`;
+        image.style.height = `${height}px`;
+        updateOverlay();
+      };
+
+      const startResize = (event: PointerEvent, direction: CropHandle) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const rect = image.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const pos = props.getPos();
+        if (typeof pos === "number") props.editor.commands.setNodeSelection(pos);
+        resizing = {
+          pointerId: event.pointerId,
+          direction,
+          startX: event.clientX,
+          startY: event.clientY,
+          startWidth: rect.width,
+          startHeight: rect.height,
+          aspectRatio: rect.width / Math.max(1, rect.height),
+          width: rect.width,
+          height: rect.height,
+        };
+        document.addEventListener("pointermove", moveResize);
+        document.addEventListener("pointerup", finishResize);
+        document.addEventListener("pointercancel", finishResize);
+      };
+
+      resizeHandles.forEach(({ direction, handle }) => {
+        handle.addEventListener("pointerdown", (event) => startResize(event, direction));
+      });
+
+      const selectNode = () => {
+        selected = true;
+        image.classList.add("ProseMirror-selectednode");
+        overlay.style.display = "block";
+        overlay.setAttribute("aria-hidden", "false");
+        updateOverlay();
+      };
+      const deselectNode = () => {
+        selected = false;
+        resizing = null;
+        image.classList.remove("ProseMirror-selectednode");
+        overlay.style.display = "none";
+        overlay.setAttribute("aria-hidden", "true");
+      };
+      const onImageClick = (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const pos = props.getPos();
+        if (typeof pos === "number") props.editor.commands.setNodeSelection(pos);
+      };
+      const onImageLoad = () => updateOverlay();
+      const onWindowChange = () => updateOverlay();
+
+      image.addEventListener("click", onImageClick);
+      image.addEventListener("load", onImageLoad);
+      window.addEventListener("resize", onWindowChange, { passive: true });
+      window.addEventListener("scroll", onWindowChange, { passive: true });
+      document.body.append(overlay);
+      deselectNode();
+
+      return {
+        dom: image,
+        update: (updatedNode: PMNode) => {
+          if (updatedNode.type !== props.node.type) return false;
+          syncImage(updatedNode);
+          updateOverlay();
+          return true;
+        },
+        selectNode,
+        deselectNode,
+        destroy: () => {
+          stopAlignmentAnimation();
+          document.removeEventListener("pointermove", moveResize);
+          document.removeEventListener("pointerup", finishResize);
+          document.removeEventListener("pointercancel", finishResize);
+          image.removeEventListener("click", onImageClick);
+          image.removeEventListener("load", onImageLoad);
+          window.removeEventListener("resize", onWindowChange);
+          window.removeEventListener("scroll", onWindowChange);
+          overlay.remove();
+        },
+      };
+    };
+  },
+  addInputRules() {
+    // The inherited rule creates an image directly from typed Markdown and
+    // therefore bypasses parseHTML/parseMarkdown source validation.
+    return (this.parent?.() ?? []).map((rule) => new InputRule({
+      find: rule.find,
+      undoable: rule.undoable,
+      handler: (props) => {
+        if (!isAllowedImageSrc(props.match[3])) return null;
+        return rule.handler(props);
+      },
+    }));
+  },
+}).configure({
+  allowBase64: true,
+  resize: false,
+  HTMLAttributes: { class: "lab-image" },
+});
+
+type ImageCropDialogProps = {
+  src: string;
+  alt: string;
+  onCancel: () => void;
+  onApply: (dataUrl: string) => void;
+};
+
+function cropPointFromEvent(event: { clientX: number; clientY: number }, stage: HTMLElement): CropPoint {
+  const bounds = stage.getBoundingClientRect();
+  return {
+    x: clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1),
+    y: clamp((event.clientY - bounds.top) / Math.max(1, bounds.height), 0, 1),
+  };
+}
+
+function cropRectFromPoints(start: CropPoint, end: CropPoint): CropRect {
+  return {
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    width: Math.abs(end.x - start.x),
+    height: Math.abs(end.y - start.y),
+  };
+}
+
+function resizeCropRect(initial: CropRect, handle: CropHandle, delta: CropPoint): CropRect {
+  const minimum = 0.04;
+  let left = initial.x;
+  let top = initial.y;
+  let right = initial.x + initial.width;
+  let bottom = initial.y + initial.height;
+
+  if (handle.includes("left")) left = clamp(initial.x + delta.x, 0, right - minimum);
+  if (handle.includes("right")) right = clamp(initial.x + initial.width + delta.x, left + minimum, 1);
+  if (handle.includes("top")) top = clamp(initial.y + delta.y, 0, bottom - minimum);
+  if (handle.includes("bottom")) bottom = clamp(initial.y + initial.height + delta.y, top + minimum, 1);
+
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+  const interactionRef = useRef<CropInteraction | null>(null);
+  const rectRef = useRef<CropRect>({ x: 0, y: 0, width: 1, height: 1 });
+  const [rect, setRect] = useState<CropRect>({ x: 0, y: 0, width: 1, height: 1 });
+  const [imageReady, setImageReady] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
+  const updateRect = useCallback((next: CropRect) => {
+    rectRef.current = next;
+    setRect(next);
+  }, []);
+
+  const finishPointer = useCallback((pointerId: number) => {
+    const stage = stageRef.current;
+    if (stage?.hasPointerCapture(pointerId)) stage.releasePointerCapture(pointerId);
+    interactionRef.current = null;
+    const current = rectRef.current;
+    if (current.width < 0.04 || current.height < 0.04) {
+      updateRect({ x: 0, y: 0, width: 1, height: 1 });
+    }
+  }, [updateRect]);
+
+  const onPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (busy || !stageRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = cropPointFromEvent(event, stageRef.current);
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const handleValue = target?.closest<HTMLElement>("[data-crop-handle]")?.dataset.cropHandle;
+    const handle = CROP_HANDLES.includes(handleValue as CropHandle)
+      ? handleValue as CropHandle
+      : undefined;
+    const selection = rectRef.current;
+    const insideSelection = Boolean(target?.closest("[data-crop-selection]"));
+    const selectionIsFull = selection.x <= 0 && selection.y <= 0 && selection.width >= 0.999 && selection.height >= 0.999;
+    const mode: CropInteraction["mode"] = handle
+      ? "resize"
+      : insideSelection && !selectionIsFull
+        ? "move"
+        : "draw";
+    interactionRef.current = {
+      mode,
+      pointerId: event.pointerId,
+      start: point,
+      initial: mode === "draw" ? { x: point.x, y: point.y, width: 0, height: 0 } : selection,
+      handle,
+    };
+    try {
+      stageRef.current.setPointerCapture(event.pointerId);
+    } catch {
+      // Synthetic events and a few older browsers do not expose an active pointer.
+      // The stage listeners still receive the interaction without capture.
+    }
+  }, [busy]);
+
+  const onPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const interaction = interactionRef.current;
+    const stage = stageRef.current;
+    if (!interaction || interaction.pointerId !== event.pointerId || !stage) return;
+    event.preventDefault();
+    const point = cropPointFromEvent(event, stage);
+    const delta = { x: point.x - interaction.start.x, y: point.y - interaction.start.y };
+    let next: CropRect;
+    if (interaction.mode === "draw") {
+      next = cropRectFromPoints(interaction.start, point);
+    } else if (interaction.mode === "move") {
+      next = {
+        ...interaction.initial,
+        x: clamp(interaction.initial.x + delta.x, 0, 1 - interaction.initial.width),
+        y: clamp(interaction.initial.y + delta.y, 0, 1 - interaction.initial.height),
+      };
+    } else if (interaction.handle) {
+      next = resizeCropRect(interaction.initial, interaction.handle, delta);
+    } else {
+      return;
+    }
+    updateRect(next);
+  }, [updateRect]);
+
+  const onPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (interactionRef.current?.pointerId !== event.pointerId) return;
+    finishPointer(event.pointerId);
+  }, [finishPointer]);
+
+  const applyCrop = useCallback(() => {
+    const image = imageRef.current;
+    const selection = rectRef.current;
+    if (!image || !imageReady || !image.naturalWidth || !image.naturalHeight) return;
+
+    setBusy(true);
+    setError(null);
+    try {
+      const sourceX = Math.max(0, Math.floor(selection.x * image.naturalWidth));
+      const sourceY = Math.max(0, Math.floor(selection.y * image.naturalHeight));
+      const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, Math.round(selection.width * image.naturalWidth)));
+      const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, Math.round(selection.height * image.naturalHeight)));
+      const canvas = document.createElement("canvas");
+      canvas.width = sourceWidth;
+      canvas.height = sourceHeight;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Canvas is unavailable");
+      context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, sourceWidth, sourceHeight);
+      const sourceType = src.match(/^data:(image\/(?:png|jpeg|webp))/i)?.[1] ?? "image/png";
+      onApply(canvas.toDataURL(sourceType));
+    } catch {
+      setBusy(false);
+      setError("This image could not be cropped in the browser.");
+    }
+  }, [imageReady, onApply, src]);
+
+  return (
+    <div className="image-crop-backdrop" role="presentation">
+      <section
+        ref={dialogRef}
+        className="image-crop-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="image-crop-title"
+        tabIndex={-1}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+            return;
+          }
+          if (event.key !== "Tab") return;
+
+          const dialog = dialogRef.current;
+          if (!dialog) return;
+          const focusable = Array.from(
+            dialog.querySelectorAll<HTMLElement>(
+              "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
+            ),
+          ).filter((element) => element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
+          if (focusable.length === 0) {
+            event.preventDefault();
+            dialog.focus();
+            return;
+          }
+
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          const active = document.activeElement;
+          const movingBackward = event.shiftKey;
+          if (
+            active === dialog
+            || !dialog.contains(active)
+            || (movingBackward && active === first)
+            || (!movingBackward && active === last)
+          ) {
+            event.preventDefault();
+            (movingBackward ? last : first).focus();
+          }
+        }}
+      >
+        <div className="image-crop-header">
+          <div>
+            <h2 id="image-crop-title">Crop image</h2>
+            <p>Drag to choose the visible area.</p>
+          </div>
+          <button type="button" className="image-crop-close" aria-label="Close crop editor" onClick={onCancel}>×</button>
+        </div>
+        <div
+          ref={stageRef}
+          className="image-crop-stage"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            ref={imageRef}
+            src={src}
+            alt={alt}
+            draggable={false}
+            onLoad={() => setImageReady(true)}
+            onError={() => setError("This image could not be loaded for cropping.")}
+          />
+          <div
+            className="image-crop-selection"
+            data-crop-selection="true"
+            style={{
+              left: `${rect.x * 100}%`,
+              top: `${rect.y * 100}%`,
+              width: `${rect.width * 100}%`,
+              height: `${rect.height * 100}%`,
+            }}
+          >
+            {CROP_HANDLES.map((handle) => (
+              <button
+                key={handle}
+                type="button"
+                className={`image-crop-handle image-crop-handle-${handle}`}
+                data-crop-handle={handle}
+                aria-label={`Adjust crop ${handle}`}
+                tabIndex={-1}
+              />
+            ))}
+          </div>
+        </div>
+        <div className="image-crop-footer">
+          <span className="image-crop-status" role="status" aria-live="polite">{error ?? ""}</span>
+          <div className="image-crop-actions">
+            <button type="button" className="image-crop-button image-crop-button-muted" aria-label="Cancel crop" onClick={onCancel}>Cancel</button>
+            <button type="button" className="image-crop-button" aria-label="Apply crop" onClick={applyCrop} disabled={!imageReady || busy}>Apply crop</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 const PlainUrlInput = Extension.create({
@@ -407,13 +1346,17 @@ function LabEditorSession() {
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
+  // useEditor freezes editorProps on first create; keep notices current via ref.
+  const setNoticeRef = useRef<(message: string | null) => void>(() => undefined);
   const paletteRef = useRef<PaletteState | null>(null);
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
+  const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [selected, setSelectedState] = useState(0);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
@@ -428,6 +1371,7 @@ function LabEditorSession() {
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
+  const prefersReducedMotion = usePrefersReducedMotion();
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -461,6 +1405,20 @@ function LabEditorSession() {
     mathEditorRef.current = value;
     setMathEditorState(value);
   }, []);
+
+  const openImageCrop = useCallback((node: PMNode, pos: number) => {
+    const src = String(node.attrs.src ?? "");
+    if (!src || !isAllowedImageSrc(src)) return;
+    setImageCropTarget({
+      pos,
+      src,
+      alt: String(node.attrs.alt ?? "Image"),
+    });
+  }, []);
+
+  useEffect(() => {
+    setNoticeRef.current = setNotice;
+  }, [setNotice]);
 
   const mathAnchor = useCallback((instance: Editor, pos: number, kind: MathKind) => {
     const shell = shellRef.current;
@@ -606,6 +1564,11 @@ function LabEditorSession() {
   ], [openMathEditor]);
   /* eslint-enable react-hooks/refs */
 
+  const imageExtension = useMemo(
+    () => LabImage.configure({ onCrop: openImageCrop } as Partial<ImageOptions>),
+    [openImageCrop],
+  );
+
   const stopCaretBlink = useCallback(() => {
     caretStrokeRef.current?.removeAttribute("data-blinking");
   }, []);
@@ -744,6 +1707,7 @@ function LabEditorSession() {
       TaskItem.configure({ nested: true }),
       TableKit.configure({ table: { resizable: false } }),
       Placeholder.configure({ placeholder: "" }),
+      imageExtension,
       ...mathExtensions,
       Markdown.configure({ markedOptions: { gfm: true } }),
       MarkdownLinkInput,
@@ -755,20 +1719,84 @@ function LabEditorSession() {
     autofocus: false,
     editable: false,
     editorProps: {
+      handleClickOn: (view, _pos, node, nodePos, event) => {
+        const target = event.target instanceof HTMLElement ? event.target : null;
+        if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
+        if (node.type.name !== "image") return false;
+        view.dispatch(view.state.tr.setSelection(new NodeSelection(view.state.doc.resolve(nodePos))));
+        return true;
+      },
+      handleClick: (view, pos, event) => {
+        const target = event.target instanceof HTMLElement ? event.target : null;
+        if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
+
+        const candidates = [pos, pos - 1, pos + 1, pos - 2, pos + 2];
+        const image = target?.closest("img.lab-image");
+        if (image) {
+          try {
+            candidates.unshift(view.posAtDOM(image, 0));
+          } catch {
+            // Fall back to the position ProseMirror calculated for the click.
+          }
+        }
+        const imagePos = candidates.find((candidate) => (
+          Number.isFinite(candidate)
+          && candidate >= 0
+          && candidate <= view.state.doc.content.size
+          && view.state.doc.nodeAt(candidate)?.type.name === "image"
+        ));
+        const node = imagePos === undefined ? null : view.state.doc.nodeAt(imagePos);
+        if (imagePos === undefined || node?.type.name !== "image") return false;
+        view.dispatch(view.state.tr.setSelection(new NodeSelection(view.state.doc.resolve(imagePos))));
+        return true;
+      },
       handlePaste: (view, event) => {
         const text = event.clipboardData?.getData("text/plain") ?? "";
         const html = event.clipboardData?.getData("text/html") ?? "";
         const { $from } = view.state.selection;
         const insideCodeBlock = isCodeBlock($from.parent);
 
-        // 1. Inside a code block every paste is literal plain text: no Markdown
-        // or LaTeX interpretation, whitespace and line endings preserved.
+        // Code blocks must never be split by an image node. Preserve the
+        // clipboard's text representation and ignore its file payload.
         if (insideCodeBlock) {
-          if (!text) return false;
+          event.preventDefault();
+          if (!text) return true;
           view.dispatch(view.state.tr.insertText(text).scrollIntoView());
           return true;
         }
 
+        const files = event.clipboardData?.files;
+        if (files && files.length > 0) {
+          const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+          if (imageFiles.length > 0 && editorRef.current) {
+            event.preventDefault();
+            let pasteSelection = {
+              from: view.state.selection.from,
+              to: view.state.selection.to,
+            };
+            const domSelection = window.getSelection();
+            if (
+              domSelection?.anchorNode
+              && domSelection.focusNode
+              && view.dom.contains(domSelection.anchorNode)
+              && view.dom.contains(domSelection.focusNode)
+            ) {
+              try {
+                pasteSelection = {
+                  from: view.posAtDOM(domSelection.anchorNode, domSelection.anchorOffset),
+                  to: view.posAtDOM(domSelection.focusNode, domSelection.focusOffset),
+                };
+              } catch {
+                // Keep the ProseMirror selection if the DOM selection is transient.
+              }
+            }
+            void insertImageFiles(editorRef.current, imageFiles, {
+              onNotice: (message) => setNoticeRef.current(message),
+              selection: pasteSelection,
+            });
+            return true;
+          }
+        }
         // 2. Slash-fragment completion first because it interacts with
         // slash-command input and undo history.
         if ($from.parent.isTextblock && /^\/[a-z0-9-]*$/i.test(text)) {
@@ -809,8 +1837,17 @@ function LabEditorSession() {
           : "";
         const linkMatch = (before + text).match(MARKDOWN_LINK_PATTERN);
         const linkMark = view.state.schema.marks.link;
-        if (linkMatch && linkMark) {
-          const tokenFrom = view.state.selection.from - (linkMatch[0].length - text.length);
+        if (
+          linkMatch?.index !== undefined
+          && linkMatch.index < before.length
+          && linkMatch[0].length > text.length
+          && view.state.selection.empty
+          && linkMark
+        ) {
+          const tokenFrom = Math.max(
+            $from.start(),
+            view.state.selection.from - (linkMatch[0].length - text.length),
+          );
           view.dispatch(
             view.state.tr
               .replaceWith(
@@ -824,7 +1861,7 @@ function LabEditorSession() {
         }
 
         // 5. Classify and execute the clipboard intent.
-        const intent = classifyClipboardPaste({ plainText: text, html, insideCodeBlock: false });
+        const intent = classifyClipboardPaste({ plainText: text, html, insideCodeBlock });
         switch (intent.kind) {
           case "native":
             // Meaningful rich HTML: let Tiptap's schema-based parsing handle it.
@@ -842,9 +1879,10 @@ function LabEditorSession() {
               view.dispatch(view.state.tr.insertText(text).scrollIntoView());
             } else {
               const { paragraph } = view.state.schema.nodes;
+              const marks = view.state.storedMarks ?? $from.marks();
               const blocks = lines
                 .filter((line) => line.length > 0)
-                .map((line) => paragraph.create(null, view.state.schema.text(line)));
+                .map((line) => paragraph.create(null, view.state.schema.text(line, marks)));
               view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.from(blocks), 0, 0)).scrollIntoView());
             }
             return true;
@@ -881,6 +1919,47 @@ function LabEditorSession() {
         }
         return false;
       },
+      handleDrop: (view, event) => {
+        const dragEvent = event as DragEvent;
+        const files = dragEvent.dataTransfer?.files;
+        if (files && files.length > 0) {
+          const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+          if (imageFiles.length > 0 && editorRef.current) {
+            // Insert under the pointer, not at the current caret.
+            const dropPos = view.posAtCoords({
+              left: dragEvent.clientX,
+              top: dragEvent.clientY,
+            })?.pos;
+            if (
+              typeof dropPos === "number"
+              && isCodeBlock(view.state.doc.resolve(dropPos).parent)
+            ) {
+              event.preventDefault();
+              return true;
+            }
+            event.preventDefault();
+            void insertImageFiles(editorRef.current, imageFiles, {
+              onNotice: (message) => setNoticeRef.current(message),
+              pos: dropPos,
+            });
+            return true;
+          }
+        }
+        return false;
+      },
+      handleDOMEvents: {
+        dragover: (view, event) => {
+          const dataTransfer = (event as DragEvent).dataTransfer;
+          if (!dataTransfer) return false;
+          const hasImageFile = Array.from(dataTransfer.items).some(
+            (item) => item.kind === "file" && item.type.startsWith("image/"),
+          );
+          if (!hasImageFile) return false;
+          event.preventDefault();
+          dataTransfer.dropEffect = "copy";
+          return true;
+        },
+      },
       handleKeyDown: (view, event) => {
         if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e") {
           if (isCodeBlock(view.state.selection.$from.parent)) return false;
@@ -902,6 +1981,12 @@ function LabEditorSession() {
 
         if (view.state.selection instanceof NodeSelection) {
           const selectedNode = view.state.selection.node;
+          if (selectedNode.type.name === "image" && (event.key === "Backspace" || event.key === "Delete")) {
+            event.preventDefault();
+            const { from, to } = view.state.selection;
+            view.dispatch(closeHistory(view.state.tr.delete(from, to).scrollIntoView()));
+            return true;
+          }
           const kind = selectedNode.type.name === "inlineMath"
             ? "inline"
             : selectedNode.type.name === "blockMath"
@@ -920,8 +2005,16 @@ function LabEditorSession() {
             const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
             const linkMatch = (before + event.key).match(MARKDOWN_LINK_PATTERN);
             const linkMark = view.state.schema.marks.link;
-            if (linkMatch?.index !== undefined && linkMark) {
-              const tokenFrom = view.state.selection.from - (linkMatch[0].length - event.key.length);
+            if (
+              linkMatch?.index !== undefined
+              && linkMatch.index < before.length
+              && linkMatch[0].length > event.key.length
+              && linkMark
+            ) {
+              const tokenFrom = Math.max(
+                $from.start(),
+                view.state.selection.from - (linkMatch[0].length - event.key.length),
+              );
               view.dispatch(
                 view.state.tr.replaceWith(
                   tokenFrom,
@@ -1353,6 +2446,7 @@ function LabEditorSession() {
           break;
         }
         case "link": chain.insertContent("[label](https://").run(); break;
+        case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
           downloadMarkdown("lab.md", editor.getMarkdown());
@@ -1626,6 +2720,39 @@ function LabEditorSession() {
     event.target.value = "";
   };
 
+  const onImageImport = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || !editor || files.length === 0) return;
+    void insertImageFiles(editor, files, {
+      onNotice: (message) => setNotice(message),
+      selection: {
+        from: editor.state.selection.from,
+        to: editor.state.selection.to,
+      },
+    });
+    event.target.value = "";
+  };
+
+  const applyImageCrop = useCallback((dataUrl: string) => {
+    const target = imageCropTarget;
+    const instance = editorRef.current;
+    if (!target || !instance) return;
+    const node = instance.state.doc.nodeAt(target.pos);
+    if (!node || node.type.name !== "image") {
+      setImageCropTarget(null);
+      return;
+    }
+    instance.commands.setNodeSelection(target.pos);
+    instance.commands.updateAttributes("image", { src: dataUrl, width: null, height: null });
+    instance.commands.focus();
+    setImageCropTarget(null);
+  }, [imageCropTarget]);
+
+  const cancelImageCrop = useCallback(() => {
+    setImageCropTarget(null);
+    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+  }, []);
+
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1654,6 +2781,14 @@ function LabEditorSession() {
   return (
     <div className="lab-shell" ref={shellRef} onKeyDownCapture={onKeyDownCapture}>
       <EditorContent editor={editor} aria-busy={hydrating} />
+      {imageCropTarget ? (
+        <ImageCropDialog
+          src={imageCropTarget.src}
+          alt={imageCropTarget.alt}
+          onCancel={cancelImageCrop}
+          onApply={applyImageCrop}
+        />
+      ) : null}
       {mathEditorState ? (
         <div
           ref={mathEditorElementRef}
@@ -1718,39 +2853,72 @@ function LabEditorSession() {
         <span ref={caretStrokeRef} className="lab-caret-stroke" data-blinking="true" />
       </div>
       <input ref={fileInputRef} hidden type="file" accept=".md,.markdown,text/markdown,text/plain" tabIndex={-1} aria-hidden="true" onChange={onImport} />
+      <input ref={imageInputRef} hidden type="file" accept="image/*" multiple tabIndex={-1} aria-hidden="true" onChange={onImageImport} />
 
       {palette ? (
-        <>
+        <div
+          ref={paletteElementRef}
+          className="command-palette-positioner"
+          style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
+        >
+          <motion.div
+            className="command-palette-motion"
+            initial={prefersReducedMotion ? { opacity: 0, transform: "none" } : SLASH_PALETTE_INITIAL}
+            animate={{ opacity: 1, transform: "translateY(0px) scale(1)" }}
+            transition={prefersReducedMotion ? { duration: 0.08, ease: [0.23, 1, 0.32, 1] } : SLASH_PALETTE_TRANSITION}
+          >
+          <BorderBeam
+            className="command-palette-frame"
+            size="line"
+            colorVariant="mono"
+            theme="dark"
+            staticColors
+            duration={3.2}
+            active={palette.mode === "commands" && !prefersReducedMotion}
+            strength={0.42}
+            brightness={1.05}
+            saturation={0}
+            borderRadius={13}
+          >
           <div
-            ref={paletteElementRef}
             id={PALETTE_ID}
             className="command-palette"
             role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
             aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
-            style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
-              <div className="command-list">
-                {filtered.map((command, index) => (
-                  <div
-                    className="command-item"
-                    data-selected={index === selected}
-                    id={`${PALETTE_ID}-${command.id}`}
-                    key={command.id}
-                    role="option"
-                    aria-selected={index === selected}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      runCommand(command);
-                    }}
-                    onMouseEnter={() => setSelected(index)}
-                  >
-                    <span>{command.label}</span>
-                    <small>{command.detail}</small>
-                  </div>
-                ))}
-              </div>
+              <LayoutGroup id="slash-command-selection">
+                <div className="command-list">
+                  {filtered.map((command, index) => (
+                    <div
+                      className="command-item"
+                      data-motion-selection="true"
+                      data-selected={index === selected}
+                      id={`${PALETTE_ID}-${command.id}`}
+                      key={command.id}
+                      role="option"
+                      aria-selected={index === selected}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        runCommand(command);
+                      }}
+                      onMouseEnter={() => setSelected(index)}
+                    >
+                      {index === selected ? (
+                        <motion.div
+                          className="command-selection-motion"
+                          layoutId="slash-command-selection"
+                          transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
+                          aria-hidden="true"
+                        />
+                      ) : null}
+                      <span>{command.label}</span>
+                      <small>{command.detail}</small>
+                    </div>
+                  ))}
+                </div>
+              </LayoutGroup>
             ) : (
               <div className="palette-message">No command</div>
             )
@@ -1820,7 +2988,9 @@ function LabEditorSession() {
             </div>
           )}
           </div>
-        </>
+          </BorderBeam>
+          </motion.div>
+        </div>
       ) : null}
       {notice ? <p className="editor-notice" role="status">{notice}</p> : null}
     </div>

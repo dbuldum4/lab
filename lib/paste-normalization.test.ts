@@ -122,6 +122,10 @@ test("Markdown wrapped in structureless HTML is detected as a wrapper", () => {
   const cases: Array<[string, string, boolean]> = [
     ["<pre># Heading\n\nparagraph</pre>", "# Heading\n\nparagraph", true],
     ["<div># Heading</div>", "# Heading", true],
+    ["<div># Heading &#128512;</div>", "# Heading 😀", true],
+    ["<div># Heading &#1114112;</div>", "# Heading &#1114112;", true],
+    ["<div># Heading &#x110000;</div>", "# Heading &#x110000;", true],
+    ["<div># Heading &#99999999;</div>", "# Heading &#99999999;", true],
     ["<span>- one\n- two</span>", "- one\n- two", true],
     ["<p># Heading</p>", "# Heading", true],
     ["<div><span># Heading</span></div>", "# Heading", true],

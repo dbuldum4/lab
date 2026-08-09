@@ -125,6 +125,13 @@ export function htmlHasSemanticStructure(html: string): boolean {
   return htmlTags(html).some((tag) => SEMANTIC_TAGS.has(tag));
 }
 
+function decodeNumericEntity(match: string, code: string, radix: number) {
+  const value = Number.parseInt(code, radix);
+  return Number.isInteger(value) && value >= 0 && value <= 0x10ffff
+    ? String.fromCodePoint(value)
+    : match;
+}
+
 function htmlTextContent(html: string): string {
   const text = html
     .replace(/<!--[\s\S]*?-->/g, "")
@@ -139,8 +146,8 @@ function htmlTextContent(html: string): string {
     .replace(/&gt;/gi, ">")
     .replace(/&quot;/gi, "\"")
     .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(Number.parseInt(code, 16)));
+    .replace(/&#(\d+);/g, (match, code) => decodeNumericEntity(match, code, 10))
+    .replace(/&#x([0-9a-f]+);/gi, (match, code) => decodeNumericEntity(match, code, 16));
 }
 
 function equivalentVisibleText(left: string, right: string) {
