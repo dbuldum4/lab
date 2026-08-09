@@ -968,6 +968,7 @@ test("document scopes isolate durable snapshots and pending recovery drafts", as
   setLocalDocumentScope("alpha");
   assert.equal(await loadLocalDocument(), "alpha note");
   setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument("alpha"), "alpha note");
   assert.equal(await loadLocalDocument(), "original note");
 
   assert.ok(environment.local.values.has("lab.document.v1"));

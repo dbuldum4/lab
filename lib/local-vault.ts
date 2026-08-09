@@ -1262,8 +1262,7 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
   };
 }
 
-export function loadLocalDocument() {
-  return serializeVaultOperation(async () => {
+async function loadLocalDocumentNow() {
     if (await refreshDeletedFromIndexedDb()) return "";
 
     const reads = await readSnapshots();
@@ -1310,7 +1309,11 @@ export function loadLocalDocument() {
     }
     // If verification was unavailable, deliberately do not clear its pending record.
     return actualWinner.markdown;
-  });
+}
+
+/** Load a verified local document, optionally from an explicit session namespace. */
+export function loadLocalDocument(documentId: string = activeDocumentId) {
+  return serializeVaultOperation(loadLocalDocumentNow, documentId);
 }
 
 export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {

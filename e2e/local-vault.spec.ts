@@ -225,6 +225,66 @@ test("new, name, and sessions keep independent documents resumable across tabs",
   await expect(newEditor).toContainText("separate session note");
 });
 
+test("search finds session names and verified note excerpts, then opens the result", async ({ page }) => {
+  const editor = await openEditor(page);
+  const originalNote = "Q3 launch planning notes with the final checklist.";
+  await editor.fill(originalNote);
+  await waitForAuthority(page, originalNote);
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/name");
+  await page.keyboard.press("Enter");
+  const originalName = page.getByLabel("Session name");
+  await originalName.fill("Planning");
+  await originalName.press("Enter");
+  await expect(originalName).toBeHidden();
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/new");
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const sessionId = new URL(page.url()).hash.replace("#session=", "");
+  const secondEditor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(secondEditor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  const secondNote = "Dinner recipe: coconut curry for Friday.";
+  await secondEditor.fill(secondNote);
+  await expect.poll(() => page.evaluate((key) => (
+    JSON.parse(localStorage.getItem(key) ?? "null")?.markdown?.trim() ?? null
+  ), `lab.document.v2.${sessionId}`), { timeout: 15000 }).toBe(secondNote);
+
+  await secondEditor.press("End");
+  await secondEditor.press("Enter");
+  await secondEditor.type("/name");
+  await page.keyboard.press("Enter");
+  const secondName = page.getByLabel("Session name");
+  await secondName.fill("Recipes");
+  await secondName.press("Enter");
+  await expect(secondName).toBeHidden();
+
+  await secondEditor.press("End");
+  await secondEditor.press("Enter");
+  await secondEditor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("searchbox", { name: "Search local notes" });
+  await expect(searchInput).toBeVisible();
+
+  await searchInput.fill("launch");
+  const launchResult = page.getByTestId("search-result").filter({ hasText: "Planning" });
+  await expect(launchResult).toContainText("final checklist");
+  await expect(launchResult).toContainText("Note text");
+
+  await searchInput.fill("recipes");
+  const nameResult = page.getByTestId("search-result").filter({ hasText: "Recipes" });
+  await expect(nameResult).toContainText("Session name");
+
+  await searchInput.fill("launch");
+  await searchInput.press("Enter");
+  await expect(page).not.toHaveURL(/#session=/);
+  await expect(page.getByRole("textbox", { name: "lab local-only Markdown note" })).toContainText(originalNote);
+});
+
 test("delete removes an extra session and returns to the original note", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.fill("keep the original note");
