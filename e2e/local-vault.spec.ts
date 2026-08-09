@@ -577,7 +577,7 @@ test("escaped-dollar LaTeX survives persistence and reload", async ({ page }) =>
 test("Markdown import restores inline and block equations", async ({ page }) => {
   const editor = await openEditor(page);
   const markdown = "Price: $$\\$5$$\n\n$$\n\\int_0^1 x\\,dx\n$$";
-  await page.locator('input[type="file"]').setInputFiles({
+  await page.locator('input[type="file"][accept*="text/markdown"]').setInputFiles({
     name: "equations.md",
     mimeType: "text/markdown",
     buffer: Buffer.from(markdown),
