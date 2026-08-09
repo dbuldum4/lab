@@ -44,7 +44,7 @@ import {
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "help" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -97,6 +97,7 @@ const COMMANDS: Command[] = [
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
+  { id: "help", label: "Help", detail: "Show commands and keyboard syntax", terms: "guide shortcuts cheatsheet reference" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
 ];
@@ -1316,6 +1317,10 @@ function LabEditorSession() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
         return;
       }
+      if (command.id === "help") {
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "help" });
+        return;
+      }
       if (command.id === "undo") {
         editor.commands.undo();
         return;
@@ -1603,7 +1608,7 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "status") {
+    if (current.mode === "status" || current.mode === "help") {
       if (event.key === "Enter") event.preventDefault();
       if (event.key.length === 1 || event.key === "Enter") setPalette(null);
       return;
@@ -1815,6 +1820,15 @@ function LabEditorSession() {
                   <small>{session.id === documentId ? "Current session" : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}</small>
                 </div>
               ))}
+            </div>
+          ) : palette.mode === "help" ? (
+            <div className="palette-message storage-message" data-testid="help-panel">
+              <span>Keyboard-first local Markdown</span>
+              <small>/new · /name · /sessions · /delete</small>
+              <small>/import · /export · /recover · /status</small>
+              <small>Headings, lists, tasks, quotes, code, tables, and links live in /</small>
+              <small>$$…$$ for inline math · /math for a block equation</small>
+              <small>Esc closes panels · no accounts, analytics, or network note storage</small>
             </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
