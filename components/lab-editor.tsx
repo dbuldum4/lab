@@ -1022,11 +1022,6 @@ function LabEditorSession() {
       });
   }, [palette]);
 
-  useEffect(() => {
-    if (palette?.mode !== "commands") return;
-    setSelected(0);
-  }, [palette?.mode, palette?.query, setSelected]);
-
   const mathError = useMemo(() => {
     if (!mathEditorState) return null;
     if (!mathEditorState.latex.trim()) return "Enter a LaTeX expression.";
@@ -1691,7 +1686,8 @@ function LabEditorSession() {
 
     if ((event.key === "Enter" || event.key === "Tab") && filtered.length > 0) {
       event.preventDefault();
-      runCommand(filtered[selectedRef.current] ?? filtered[0]);
+      const exact = filtered.find((command) => command.id === current.query.trim().toLowerCase());
+      runCommand(exact ?? filtered[selectedRef.current] ?? filtered[0]);
     }
   };
 
