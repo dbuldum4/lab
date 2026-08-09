@@ -44,7 +44,7 @@ import {
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "stats" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -97,6 +97,7 @@ const COMMANDS: Command[] = [
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
+  { id: "stats", label: "Note stats", detail: "Count words, characters, and reading time", terms: "words characters reading count metrics" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
 ];
@@ -428,6 +429,7 @@ function LabEditorSession() {
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
+  const [stats, setStats] = useState({ words: 0, characters: 0, minutes: 0, sessions: 1 });
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -1238,6 +1240,21 @@ function LabEditorSession() {
       editor.commands.focus();
       setPalette(null);
 
+      if (command.id === "stats") {
+        const note = editor.getText().trim();
+        const words = note ? (note.match(/\S+/gu)?.length ?? 0) : 0;
+        const available = listDocumentSessions();
+        setSessions(available);
+        setStats({
+          words,
+          characters: note.length,
+          minutes: words === 0 ? 0 : Math.max(1, Math.ceil(words / 220)),
+          sessions: available.length,
+        });
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "stats" });
+        void inspectLocalStorage().then(setHealth).catch(() => setNotice("Could not refresh storage status."));
+        return;
+      }
       if (command.id === "status") {
         const requestVersion = paletteVersionRef.current;
         void inspectLocalStorage()
@@ -1603,7 +1620,7 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "status") {
+    if (current.mode === "status" || current.mode === "stats") {
       if (event.key === "Enter") event.preventDefault();
       if (event.key.length === 1 || event.key === "Enter") setPalette(null);
       return;
@@ -1815,6 +1832,13 @@ function LabEditorSession() {
                   <small>{session.id === documentId ? "Current session" : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}</small>
                 </div>
               ))}
+            </div>
+          ) : palette.mode === "stats" ? (
+            <div className="palette-message storage-message" data-testid="note-stats">
+              <span>{stats.words} {stats.words === 1 ? "word" : "words"} · {stats.characters} characters</span>
+              <small>Estimated reading: {stats.minutes === 0 ? "under a minute" : `~${stats.minutes} min`}</small>
+              <small>{stats.sessions} local {stats.sessions === 1 ? "session" : "sessions"} · {health.copies} durable {health.copies === 1 ? "copy" : "copies"}</small>
+              <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"}</small>
             </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
