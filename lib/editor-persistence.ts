@@ -17,6 +17,7 @@ export type EditorPersistenceDependencies = {
   schedule?: (callback: () => void, delayMs: number) => TimerHandle;
   cancel?: (handle: TimerHandle) => void;
   onHealth?: (health: StorageHealth) => void;
+  onPersisted?: (markdown: string, health: StorageHealth) => void;
   onNotice?: (notice: string | null) => void;
   onStageFailure?: () => void;
 };
@@ -123,6 +124,7 @@ export function createEditorPersistenceController(
     const promise = (async () => {
       try {
         const health = await save(markdown);
+        if (health.saved === true) dependencies.onPersisted?.(markdown, health);
         reportHealth(health, revision);
         if (!disposed && health.saved === true && revision === editRevision) persistedRevision = revision;
         return health.saved === true;

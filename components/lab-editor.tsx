@@ -42,9 +42,10 @@ import {
   type DocumentSession,
 } from "@/lib/document-sessions";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import { clearDocumentVersions, listDocumentVersions, recordDocumentVersion, type DocumentVersion } from "@/lib/version-history";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions" | "history";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -93,6 +94,7 @@ const COMMANDS: Command[] = [
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
   { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
   { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
+  { id: "history", label: "Version history", detail: "Restore an earlier local checkpoint", terms: "versions timeline restore previous snapshots" },
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
@@ -428,6 +430,7 @@ function LabEditorSession() {
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
+  const [historyVersions, setHistoryVersions] = useState<DocumentVersion[]>([]);
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -435,6 +438,9 @@ function LabEditorSession() {
       : (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__;
     return createEditorPersistenceController({
       delayMs: Number.isFinite(e2eDelay) ? e2eDelay : undefined,
+      onPersisted: (markdown) => {
+        recordDocumentVersion(documentId, markdown);
+      },
       onHealth: (nextHealth) => {
         setHealth(nextHealth);
         // documentId is stable for the mount lifetime (session switches reload),
@@ -1092,6 +1098,17 @@ function LabEditorSession() {
       }
       return;
     }
+    if (palette?.mode === "history") {
+      const activeVersion = historyVersions[selected];
+      documentElement.setAttribute("aria-expanded", "true");
+      documentElement.setAttribute("aria-controls", PALETTE_ID);
+      if (activeVersion) {
+        documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-history-${activeVersion.id}`);
+      } else {
+        documentElement.removeAttribute("aria-activedescendant");
+      }
+      return;
+    }
     if (palette?.mode === "sessions") {
       const activeSession = sessions[selected];
       documentElement.setAttribute("aria-expanded", "true");
@@ -1109,7 +1126,7 @@ function LabEditorSession() {
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [editor, filtered, palette, selected, sessions]);
+  }, [editor, filtered, historyVersions, palette, selected, sessions]);
 
   /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
   const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
@@ -1284,6 +1301,24 @@ function LabEditorSession() {
             setNotice(`Exported ${drafts.length} recovery ${drafts.length === 1 ? "draft" : "drafts"}.`);
           })
           .catch(() => setNotice("Could not export the local recovery drafts."));
+        return;
+      }
+      if (command.id === "history") {
+        void (async () => {
+          if (!(await persistence.flush())) {
+            setNotice("This note could not be fully saved, so version history was not opened.");
+            return;
+          }
+          const currentMarkdown = editor.getMarkdown();
+          if (!recordDocumentVersion(documentId, currentMarkdown, { force: true })) {
+            setNotice("Local version history is unavailable in this browser.");
+            return;
+          }
+          const versions = listDocumentVersions(documentId);
+          setHistoryVersions(versions);
+          setSelected(0);
+          setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "history" });
+        })();
         return;
       }
       if (command.id === "new") {
@@ -1478,6 +1513,7 @@ function LabEditorSession() {
           return;
         }
         if (!active) return;
+        recordDocumentVersion(documentId, markdown, { force: true });
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
         persistence.markLoaded(markdown);
         const nextHealth = await inspectLocalStorage();
@@ -1547,6 +1583,22 @@ function LabEditorSession() {
     };
   }, [persistence]);
 
+  const restoreHistoryVersion = useCallback((version: DocumentVersion) => {
+    if (!editor) return;
+    const currentMarkdown = editor.getMarkdown();
+    if (version.markdown === currentMarkdown) {
+      setPalette(null);
+      editor.commands.focus();
+      return;
+    }
+    recordDocumentVersion(documentId, currentMarkdown, { force: true });
+    editor.commands.setContent(version.markdown, { contentType: "markdown", emitUpdate: false });
+    persistence.onEdit(version.markdown);
+    setPalette(null);
+    setNotice("Restored a local history checkpoint. The previous state remains in /history.");
+    editor.commands.focus("start");
+  }, [documentId, editor, persistence, setPalette]);
+
   const onKeyDownCapture = (event: React.KeyboardEvent) => {
     const current = paletteRef.current;
     if (!current) return;
@@ -1560,6 +1612,19 @@ function LabEditorSession() {
     }
 
     if (current.mode === "name") return;
+
+    if (current.mode === "history") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, historyVersions.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && historyVersions.length > 0) {
+        event.preventDefault();
+        restoreHistoryVersion(historyVersions[selectedRef.current] ?? historyVersions[0]);
+      }
+      return;
+    }
 
     if (current.mode === "sessions") {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -1583,6 +1648,11 @@ function LabEditorSession() {
     if (current.mode === "confirm-clear") {
       if (event.key === "Enter") {
         event.preventDefault();
+        if (!clearDocumentVersions(documentId)) {
+          setNotice("Local version history could not be erased, so the note was not cleared.");
+          setPalette(null);
+          return;
+        }
         editor?.commands.clearContent(true);
         setPalette(null);
         editor?.commands.focus("start");
@@ -1740,8 +1810,8 @@ function LabEditorSession() {
             ref={paletteElementRef}
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "history" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "history" ? "Version history" : "Slash commands"}
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
@@ -1815,6 +1885,30 @@ function LabEditorSession() {
                   <small>{session.id === documentId ? "Current session" : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}</small>
                 </div>
               ))}
+            </div>
+          ) : palette.mode === "history" ? (
+            <div className="command-list session-list" data-testid="history-list">
+              {historyVersions.length > 0 ? historyVersions.map((version, index) => {
+                const preview = version.markdown.replace(/\s+/g, " ").trim().slice(0, 100) || "Empty note";
+                return (
+                  <div
+                    className="command-item"
+                    data-selected={index === selected}
+                    id={`${PALETTE_ID}-history-${version.id}`}
+                    key={version.id}
+                    role="option"
+                    aria-selected={index === selected}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      restoreHistoryVersion(version);
+                    }}
+                    onMouseEnter={() => setSelected(index)}
+                  >
+                    <span>{index === 0 ? "Current checkpoint" : new Date(version.createdAt).toLocaleString()}</span>
+                    <small>{preview}</small>
+                  </div>
+                );
+              }) : <div className="palette-message">No local checkpoints yet</div>}
             </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">

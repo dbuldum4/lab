@@ -4,6 +4,7 @@ import {
   ensureDocumentNotDeleted,
   isLocalDocumentDeleted,
 } from "./local-vault.ts";
+import { clearDocumentVersions } from "./version-history.ts";
 
 const SESSION_KEY_PREFIX = "lab.session.v1.";
 const SESSION_ACTIVITY_KEY_PREFIX = "lab.session.activity.v1.";
@@ -341,6 +342,9 @@ export async function purgeDocumentSession(id: string) {
   const normalized = normalizeId(id);
   if (normalized === DEFAULT_DOCUMENT_ID) {
     throw new Error("The original session cannot be deleted.");
+  }
+  if (!clearDocumentVersions(normalized)) {
+    throw new Error("Local version history could not be deleted.");
   }
   await deleteLocalDocument(normalized);
   return deleteDocumentSession(normalized);
