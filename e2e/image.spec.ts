@@ -357,3 +357,19 @@ test("cropping an image creates a local cropped data URL", async ({ page }) => {
   await expect(image).toHaveAttribute("src", /^data:image\/png;base64,/);
   await waitForAuthority(page, /!\[sample\]\(data:image\/png;base64,/);
 });
+
+test("cancelling crop returns focus to the editor", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.locator('input[type="file"][accept*="image/*"]').setInputFiles(svgFile());
+
+  const image = editor.locator("img.lab-image");
+  await expect(image).toBeVisible();
+  await image.click();
+  await page.getByRole("button", { name: "Crop image" }).click();
+  await expect(page.getByRole("dialog", { name: "Crop image" })).toBeVisible();
+
+  await page.keyboard.press("Escape");
+
+  await expect(page.getByRole("dialog", { name: "Crop image" })).toHaveCount(0);
+  await expect(editor).toBeFocused();
+});

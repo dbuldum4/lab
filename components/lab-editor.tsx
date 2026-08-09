@@ -1127,6 +1127,35 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
           if (event.key === "Escape") {
             event.preventDefault();
             onCancel();
+            return;
+          }
+          if (event.key !== "Tab") return;
+
+          const dialog = dialogRef.current;
+          if (!dialog) return;
+          const focusable = Array.from(
+            dialog.querySelectorAll<HTMLElement>(
+              "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
+            ),
+          ).filter((element) => element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
+          if (focusable.length === 0) {
+            event.preventDefault();
+            dialog.focus();
+            return;
+          }
+
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          const active = document.activeElement;
+          const movingBackward = event.shiftKey;
+          if (
+            active === dialog
+            || !dialog.contains(active)
+            || (movingBackward && active === first)
+            || (!movingBackward && active === last)
+          ) {
+            event.preventDefault();
+            (movingBackward ? last : first).focus();
           }
         }}
       >
@@ -1642,14 +1671,14 @@ function LabEditorSession() {
     editorProps: {
       handleClickOn: (view, _pos, node, nodePos, event) => {
         const target = event.target instanceof HTMLElement ? event.target : null;
-        if (target?.closest("[data-resize-handle], .image-edit-toolbar")) return false;
+        if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
         if (node.type.name !== "image") return false;
         view.dispatch(view.state.tr.setSelection(new NodeSelection(view.state.doc.resolve(nodePos))));
         return true;
       },
       handleClick: (view, pos, event) => {
         const target = event.target instanceof HTMLElement ? event.target : null;
-        if (target?.closest("[data-resize-handle], .image-edit-toolbar")) return false;
+        if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
 
         const candidates = [pos, pos - 1, pos + 1, pos - 2, pos + 2];
         const image = target?.closest("img.lab-image");
@@ -2659,6 +2688,11 @@ function LabEditorSession() {
     setImageCropTarget(null);
   }, [imageCropTarget]);
 
+  const cancelImageCrop = useCallback(() => {
+    setImageCropTarget(null);
+    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+  }, []);
+
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -2691,7 +2725,7 @@ function LabEditorSession() {
         <ImageCropDialog
           src={imageCropTarget.src}
           alt={imageCropTarget.alt}
-          onCancel={() => setImageCropTarget(null)}
+          onCancel={cancelImageCrop}
           onApply={applyImageCrop}
         />
       ) : null}
