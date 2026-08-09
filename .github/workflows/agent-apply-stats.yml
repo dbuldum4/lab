@@ -1,0 +1,65 @@
+name: Apply note stats feature patch
+
+on:
+  push:
+    branches:
+      - agent/note-stats
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/note-stats
+      - name: Apply feature patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('components/lab-editor.tsx')
+          text = path.read_text()
+          replacements = [
+            (
+              'type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";',
+              'type PaletteMode = "commands" | "status" | "stats" | "confirm-clear" | "confirm-delete" | "name" | "sessions";',
+            ),
+            (
+              '  { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },',
+              '  { id: "stats", label: "Note stats", detail: "Count words, characters, and reading time", terms: "words characters reading count metrics" },\n  { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },',
+            ),
+            (
+              '  const [sessions, setSessions] = useState<DocumentSession[]>([]);',
+              '  const [sessions, setSessions] = useState<DocumentSession[]>([]);\n  const [stats, setStats] = useState({ words: 0, characters: 0, minutes: 0, sessions: 1 });',
+            ),
+            (
+              '      if (command.id === "status") {',
+              '      if (command.id === "stats") {\n        const note = editor.getText().trim();\n        const words = note ? (note.match(/\\S+/gu)?.length ?? 0) : 0;\n        const available = listDocumentSessions();\n        setSessions(available);\n        setStats({\n          words,\n          characters: note.length,\n          minutes: words === 0 ? 0 : Math.max(1, Math.ceil(words / 220)),\n          sessions: available.length,\n        });\n        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "stats" });\n        void inspectLocalStorage().then(setHealth).catch(() => setNotice("Could not refresh storage status."));\n        return;\n      }\n      if (command.id === "status") {',
+            ),
+            (
+              '    if (current.mode === "status") {',
+              '    if (current.mode === "status" || current.mode === "stats") {',
+            ),
+            (
+              '          ) : palette.mode === "confirm-clear" ? (',
+              '          ) : palette.mode === "stats" ? (\n            <div className="palette-message storage-message" data-testid="note-stats">\n              <span>{stats.words} {stats.words === 1 ? "word" : "words"} · {stats.characters} characters</span>\n              <small>Estimated reading: {stats.minutes === 0 ? "under a minute" : `~${stats.minutes} min`}</small>\n              <small>{stats.sessions} local {stats.sessions === 1 ? "session" : "sessions"} · {health.copies} durable {health.copies === 1 ? "copy" : "copies"}</small>\n              <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"}</small>\n            </div>\n          ) : palette.mode === "confirm-clear" ? (',
+            ),
+          ]
+          for old, new in replacements:
+            if old not in text:
+              raise SystemExit(f'missing patch anchor: {old[:100]}')
+            text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+      - name: Commit feature
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/agent-apply-stats.yml
+          git add components/lab-editor.tsx
+          git commit -m 'feat(editor): add note stats command'
+          git push
