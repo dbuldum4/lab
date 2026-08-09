@@ -52,6 +52,12 @@ import {
   type DocumentSession,
 } from "@/lib/document-sessions";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import {
+  activeOutlineIndex,
+  buildOutline,
+  type HeadingLevel,
+  type OutlineItem,
+} from "@/lib/outline";
 
 type SlashRange = { from: number; to: number };
 type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
@@ -139,6 +145,7 @@ const COMMANDS: Command[] = [
   { id: "h1", label: "Heading 1", detail: "Large section title", terms: "title h1" },
   { id: "h2", label: "Heading 2", detail: "Medium section title", terms: "subtitle h2" },
   { id: "h3", label: "Heading 3", detail: "Small section title", terms: "subtitle h3" },
+  { id: "outline", label: "Outline", detail: "Toggle document headings", terms: "toc table of contents navigation sidebar" },
   { id: "bullet", label: "Bulleted list", detail: "Create an unordered list", terms: "ul list bullets" },
   { id: "number", label: "Numbered list", detail: "Create an ordered list", terms: "ol list numbers" },
   { id: "todo", label: "To-do list", detail: "Create a checklist", terms: "task check checkbox" },
@@ -244,6 +251,21 @@ const BLOCK_MATH_PATTERN = /^\$\$\n([\s\S]*?)\n\$\$(?:\n)?$/;
 
 function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
+}
+
+function outlineFromEditor(instance: Editor): OutlineItem[] {
+  const headings: Array<{ level: HeadingLevel; title: string; position: number }> = [];
+  instance.state.doc.descendants((node, position) => {
+    if (node.type.name !== "heading") return;
+    const level = Number(node.attrs.level);
+    if (level !== 1 && level !== 2 && level !== 3) return;
+    headings.push({
+      level,
+      title: node.textContent,
+      position,
+    });
+  });
+  return buildOutline(headings);
 }
 
 /** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
@@ -1354,10 +1376,14 @@ function LabEditorSession() {
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const outlineOpenRef = useRef(false);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [selected, setSelectedState] = useState(0);
+  const [outlineOpen, setOutlineOpenState] = useState(false);
+  const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
+  const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
@@ -1405,6 +1431,30 @@ function LabEditorSession() {
     mathEditorRef.current = value;
     setMathEditorState(value);
   }, []);
+
+  const setOutlineOpen = useCallback((value: boolean) => {
+    outlineOpenRef.current = value;
+    setOutlineOpenState(value);
+  }, []);
+
+  const syncOutline = useCallback((instance: Editor) => {
+    const nextItems = outlineFromEditor(instance);
+    const nextActiveIndex = activeOutlineIndex(nextItems, instance.state.selection.from);
+    const nextActiveId = nextItems[nextActiveIndex]?.id ?? null;
+    setOutlineItemsState(nextItems);
+    setActiveOutlineIdState(nextActiveId);
+  }, []);
+
+  const toggleOutline = useCallback(() => {
+    setOutlineOpen(!outlineOpenRef.current);
+  }, [setOutlineOpen]);
+
+  const closeOutline = useCallback((focusEditor = true) => {
+    setOutlineOpen(false);
+    if (focusEditor) {
+      window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+    }
+  }, [setOutlineOpen]);
 
   const openImageCrop = useCallback((node: PMNode, pos: number) => {
     const src = String(node.attrs.src ?? "");
@@ -1677,12 +1727,13 @@ function LabEditorSession() {
   const syncInterface = useCallback(
     (instance: Editor) => {
       requestAnimationFrame(() => positionCaret(instance));
+      syncOutline(instance);
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
       setSelected(0);
     },
-    [findSlash, positionCaret, setPalette, setSelected],
+    [findSlash, positionCaret, setPalette, setSelected, syncOutline],
   );
 
   const editor = useEditor({
@@ -1961,6 +2012,12 @@ function LabEditorSession() {
         },
       },
       handleKeyDown: (view, event) => {
+        if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "o") {
+          event.preventDefault();
+          toggleOutline();
+          return true;
+        }
+
         if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e") {
           if (isCodeBlock(view.state.selection.$from.parent)) return false;
           event.preventDefault();
@@ -2394,6 +2451,10 @@ function LabEditorSession() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
         return;
       }
+      if (command.id === "outline") {
+        toggleOutline();
+        return;
+      }
       if (command.id === "undo") {
         editor.commands.undo();
         return;
@@ -2454,8 +2515,26 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected, toggleOutline],
   );
+
+  const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
+    const instance = editorRef.current;
+    if (!instance || instance.isDestroyed) return;
+    const node = instance.state.doc.nodeAt(item.position);
+    if (!node || node.type.name !== "heading") {
+      syncOutline(instance);
+      return;
+    }
+
+    const targetPosition = Math.min(item.position + 1, instance.state.doc.content.size);
+    instance.chain().focus().setTextSelection(targetPosition).scrollIntoView().run();
+    setActiveOutlineIdState(item.id);
+
+    if (window.matchMedia("(max-width: 640px)").matches) {
+      closeOutline(false);
+    }
+  }, [closeOutline, syncOutline]);
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
   // run before the passive hydration effect, so the persistence controller's
@@ -2628,7 +2707,13 @@ function LabEditorSession() {
 
   const onKeyDownCapture = (event: React.KeyboardEvent) => {
     const current = paletteRef.current;
-    if (!current) return;
+    if (!current) {
+      if (outlineOpenRef.current && event.key === "Escape") {
+        event.preventDefault();
+        closeOutline();
+      }
+      return;
+    }
 
     if (event.key === "Escape") {
       event.preventDefault();
@@ -2781,6 +2866,62 @@ function LabEditorSession() {
   return (
     <div className="lab-shell" ref={shellRef} onKeyDownCapture={onKeyDownCapture}>
       <EditorContent editor={editor} aria-busy={hydrating} />
+      {outlineOpen ? (
+        <>
+          <div
+            className="outline-backdrop"
+            aria-hidden="true"
+            onClick={() => closeOutline()}
+          />
+          <aside
+            className="outline-panel"
+            data-testid="document-outline"
+            aria-labelledby="document-outline-title"
+          >
+            <div className="outline-header">
+              <div>
+                <h2 id="document-outline-title">Outline</h2>
+                <p>{outlineItems.length === 0 ? "No sections yet" : `${outlineItems.length} ${outlineItems.length === 1 ? "section" : "sections"}`}</p>
+              </div>
+              <button
+                type="button"
+                className="outline-close"
+                aria-label="Close outline"
+                onClick={() => closeOutline()}
+              >
+                ×
+              </button>
+            </div>
+            {outlineItems.length > 0 ? (
+              <nav className="outline-navigation" aria-label="Document headings">
+                <ol className="outline-list">
+                  {outlineItems.map((item) => {
+                    const active = item.id === activeOutlineId;
+                    return (
+                      <li key={item.id} data-depth={item.depth}>
+                        <button
+                          type="button"
+                          className="outline-item"
+                          data-active={active}
+                          data-level={item.level}
+                          aria-current={active ? "location" : undefined}
+                          title={item.title}
+                          onClick={() => navigateToOutlineHeading(item)}
+                        >
+                          <span className="outline-item-marker" aria-hidden="true" />
+                          <span className="outline-item-label">{item.title}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </nav>
+            ) : (
+              <p className="outline-empty">Type a heading with <code>#</code> to build your outline.</p>
+            )}
+          </aside>
+        </>
+      ) : null}
       {imageCropTarget ? (
         <ImageCropDialog
           src={imageCropTarget.src}
