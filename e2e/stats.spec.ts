@@ -15,4 +15,8 @@ test("slash stats summarizes the current local note", async ({ page }) => {
   await expect(stats).toContainText("13 characters");
   await expect(stats).toContainText("Estimated reading");
   await expect(stats).toContainText("1 local session");
+  await expect(page.getByRole("status", { name: "Note statistics" })).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(stats).toBeHidden();
 });

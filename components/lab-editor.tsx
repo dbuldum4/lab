@@ -1252,7 +1252,19 @@ function LabEditorSession() {
           sessions: available.length,
         });
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "stats" });
-        void inspectLocalStorage().then(setHealth).catch(() => setNotice("Could not refresh storage status."));
+        const requestVersion = paletteVersionRef.current;
+        void inspectLocalStorage()
+          .then((result) => {
+            // Do not let a slow storage inspection overwrite a later palette
+            // state or update the stats panel after the user has dismissed it.
+            if (paletteVersionRef.current !== requestVersion || paletteRef.current?.mode !== "stats") return;
+            setHealth(result);
+          })
+          .catch(() => {
+            if (paletteVersionRef.current === requestVersion && paletteRef.current?.mode === "stats") {
+              setNotice("Could not refresh storage status.");
+            }
+          });
         return;
       }
       if (command.id === "status") {
@@ -1758,7 +1770,7 @@ function LabEditorSession() {
             id={PALETTE_ID}
             className="command-palette"
             role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "stats" ? "Note statistics" : "Slash commands"}
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
