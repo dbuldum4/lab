@@ -1262,8 +1262,7 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
   };
 }
 
-export function loadLocalDocument() {
-  return serializeVaultOperation(async () => {
+async function loadLocalDocumentInScope() {
     if (await refreshDeletedFromIndexedDb()) return "";
 
     const reads = await readSnapshots();
@@ -1310,7 +1309,19 @@ export function loadLocalDocument() {
     }
     // If verification was unavailable, deliberately do not clear its pending record.
     return actualWinner.markdown;
-  });
+}
+
+export function loadLocalDocument() {
+  return serializeVaultOperation(loadLocalDocumentInScope);
+}
+
+/**
+ * Read a document without changing this page's active scope. Backup and
+ * restore use this explicit form so a whole-vault operation cannot redirect
+ * the mounted editor while it is working.
+ */
+export function loadLocalDocumentForDocument(documentId: string) {
+  return serializeVaultOperation(loadLocalDocumentInScope, normalizedDocumentId(documentId));
 }
 
 export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
@@ -1339,8 +1350,7 @@ export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
   });
 }
 
-export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
-  return serializeVaultOperation(async () => {
+async function saveLocalDocumentInScope(markdown: string): Promise<StorageHealth> {
     if (await refreshDeletedFromIndexedDb()) {
       const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
       return { ...health, saved: false };
@@ -1442,7 +1452,15 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
     // the exact pending record until load/reconciliation proves it was consumed.
     const health = await inspectLocalStorageNow([...extraErrors, ...writeErrors]);
     return { ...health, saved: candidateSaved };
-  });
+}
+
+export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
+  return serializeVaultOperation(() => saveLocalDocumentInScope(markdown));
+}
+
+/** Save a document without changing this page's active scope. */
+export function saveLocalDocumentForDocument(documentId: string, markdown: string): Promise<StorageHealth> {
+  return serializeVaultOperation(() => saveLocalDocumentInScope(markdown), normalizedDocumentId(documentId));
 }
 
 export async function requestPersistentStorage() {

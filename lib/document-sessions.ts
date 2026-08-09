@@ -218,26 +218,31 @@ export async function ensureDocumentSession(id: string) {
   });
 }
 
+function randomDocumentSessionId() {
+  const fallbackId = (() => {
+    const time = Date.now().toString(36);
+    const bytes = (() => {
+      try {
+        const buf = new Uint8Array(12);
+        globalThis.crypto?.getRandomValues?.(buf);
+        // Hex is [0-9a-f] so already valid for isValidDocumentId.
+        return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
+      } catch {
+        return `${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`;
+      }
+    })();
+    return `${time}${bytes}`;
+  })();
+  const raw = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ?? fallbackId;
+  // Sanitize entropy (randomUUID without dashes is hex; fallback is [0-9a-z]) and cap
+  // length so isValidDocumentId stays cheap and the loop can retry on any invalid shape.
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32)
+    || fallbackId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
+}
+
 export async function createDocumentSession(name = "Untitled") {
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const fallbackId = (() => {
-      const time = Date.now().toString(36);
-      const bytes = (() => {
-        try {
-          const buf = new Uint8Array(12);
-          globalThis.crypto?.getRandomValues?.(buf);
-          // Hex is [0-9a-f] so already valid for isValidDocumentId.
-          return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
-        } catch {
-          return `${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`;
-        }
-      })();
-      return `${time}${bytes}`;
-    })();
-    const raw = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ?? fallbackId;
-    // Sanitize entropy (randomUUID without dashes is hex; fallback is [0-9a-z]) and cap
-    // length so isValidDocumentId stays cheap and the loop can retry on any invalid shape.
-    const id = raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || fallbackId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
+    const id = randomDocumentSessionId();
     if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
     const now = Date.now();
     // null means the id became unusable under the lock (tombstone or live
@@ -255,6 +260,35 @@ export async function createDocumentSession(name = "Untitled") {
     if (created) return created;
   }
   throw new Error("A new session id could not be allocated.");
+}
+
+/**
+ * Add session metadata without overwriting an existing id. When the preferred
+ * id is already occupied or tombstoned, allocate a fresh id instead. This is
+ * the metadata half of a non-destructive vault restore.
+ */
+export async function restoreDocumentSession(
+  session: DocumentSession,
+  preferredId: string | null = session.id,
+): Promise<DocumentSession> {
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const id = attempt === 0 && preferredId !== null
+      ? normalizeId(preferredId)
+      : randomDocumentSessionId();
+    if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
+    const created = await withSessionLock(id, () => {
+      if (id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(id)) return null;
+      if (readSession(id)) return null;
+      return writeSession({
+        id,
+        name: normalizeName(session.name),
+        createdAt: Number.isFinite(session.createdAt) ? session.createdAt : 0,
+        updatedAt: Number.isFinite(session.updatedAt) ? session.updatedAt : 0,
+      });
+    });
+    if (created) return created;
+  }
+  throw new Error("A restored session id could not be allocated.");
 }
 
 export async function renameDocumentSession(id: string, name: string) {
