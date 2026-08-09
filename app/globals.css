@@ -771,10 +771,29 @@ img.ProseMirror-separator {
   }
 }
 
-.command-palette {
+.command-palette-positioner {
   position: absolute;
   z-index: 30;
   width: min(384px, calc(100vw - 48px));
+  border-radius: 13px;
+}
+
+.command-palette-motion {
+  width: 100%;
+  border-radius: 13px;
+  transform-origin: top left;
+  will-change: transform, opacity;
+}
+
+.command-palette-frame {
+  display: block;
+  width: 100%;
+  border-radius: 13px;
+}
+
+.command-palette {
+  position: relative;
+  width: 100%;
   max-height: min(316px, calc(100dvh - 16px));
   overflow: hidden;
   border: 1px solid #282826;
@@ -885,6 +904,7 @@ img.ProseMirror-separator {
 }
 
 .command-item {
+  position: relative;
   display: grid;
   grid-template-columns: 118px 1fr;
   gap: 16px;
@@ -898,6 +918,25 @@ img.ProseMirror-separator {
 
 .command-item[data-selected="true"] {
   background: #1d1d1b;
+}
+
+.command-item[data-motion-selection="true"][data-selected="true"] {
+  background: transparent;
+}
+
+.command-selection-motion {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: 8px;
+  background: #1d1d1b;
+  pointer-events: none;
+}
+
+.command-item > span,
+.command-item > small {
+  position: relative;
+  z-index: 1;
 }
 
 .command-item[data-current="true"] span::after {

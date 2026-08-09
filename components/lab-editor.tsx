@@ -20,7 +20,9 @@ import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
 import { NodeSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { BorderBeam } from "border-beam";
 import katex from "katex";
+import { LayoutGroup, motion, type Transition } from "motion/react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   createEditorPersistenceController,
@@ -114,6 +116,23 @@ const CROP_HANDLES: CropHandle[] = [
   "bottom-left",
   "left",
 ];
+
+const SLASH_PALETTE_INITIAL = {
+  opacity: 0,
+  transform: "translateY(0px) scale(0.93)",
+};
+const SLASH_PALETTE_TRANSITION: Transition = {
+  type: "spring",
+  stiffness: 560,
+  damping: 34,
+  mass: 0.62,
+};
+const SLASH_SELECTION_TRANSITION: Transition = {
+  type: "spring",
+  stiffness: 480,
+  damping: 35,
+  mass: 0.58,
+};
 
 const COMMANDS: Command[] = [
   { id: "text", label: "Text", detail: "Plain paragraph", terms: "paragraph normal" },
@@ -288,6 +307,22 @@ function useIsClient() {
     () => () => {},
     () => true,
     () => false,
+  );
+}
+
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+
+function subscribeToReducedMotion(callback: () => void) {
+  const mediaQuery = window.matchMedia(REDUCED_MOTION_QUERY);
+  mediaQuery.addEventListener("change", callback);
+  return () => mediaQuery.removeEventListener("change", callback);
+}
+
+function usePrefersReducedMotion() {
+  return useSyncExternalStore(
+    subscribeToReducedMotion,
+    () => window.matchMedia(REDUCED_MOTION_QUERY).matches,
+    () => true,
   );
 }
 
@@ -1336,6 +1371,7 @@ function LabEditorSession() {
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
+  const prefersReducedMotion = usePrefersReducedMotion();
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -2820,37 +2856,69 @@ function LabEditorSession() {
       <input ref={imageInputRef} hidden type="file" accept="image/*" multiple tabIndex={-1} aria-hidden="true" onChange={onImageImport} />
 
       {palette ? (
-        <>
+        <div
+          ref={paletteElementRef}
+          className="command-palette-positioner"
+          style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
+        >
+          <motion.div
+            className="command-palette-motion"
+            initial={prefersReducedMotion ? { opacity: 0, transform: "none" } : SLASH_PALETTE_INITIAL}
+            animate={{ opacity: 1, transform: "translateY(0px) scale(1)" }}
+            transition={prefersReducedMotion ? { duration: 0.08, ease: [0.23, 1, 0.32, 1] } : SLASH_PALETTE_TRANSITION}
+          >
+          <BorderBeam
+            className="command-palette-frame"
+            size="line"
+            colorVariant="mono"
+            theme="dark"
+            staticColors
+            duration={3.2}
+            active={palette.mode === "commands" && !prefersReducedMotion}
+            strength={0.42}
+            brightness={1.05}
+            saturation={0}
+            borderRadius={13}
+          >
           <div
-            ref={paletteElementRef}
             id={PALETTE_ID}
             className="command-palette"
             role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
             aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
-            style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
-              <div className="command-list">
-                {filtered.map((command, index) => (
-                  <div
-                    className="command-item"
-                    data-selected={index === selected}
-                    id={`${PALETTE_ID}-${command.id}`}
-                    key={command.id}
-                    role="option"
-                    aria-selected={index === selected}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      runCommand(command);
-                    }}
-                    onMouseEnter={() => setSelected(index)}
-                  >
-                    <span>{command.label}</span>
-                    <small>{command.detail}</small>
-                  </div>
-                ))}
-              </div>
+              <LayoutGroup id="slash-command-selection">
+                <div className="command-list">
+                  {filtered.map((command, index) => (
+                    <div
+                      className="command-item"
+                      data-motion-selection="true"
+                      data-selected={index === selected}
+                      id={`${PALETTE_ID}-${command.id}`}
+                      key={command.id}
+                      role="option"
+                      aria-selected={index === selected}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        runCommand(command);
+                      }}
+                      onMouseEnter={() => setSelected(index)}
+                    >
+                      {index === selected ? (
+                        <motion.div
+                          className="command-selection-motion"
+                          layoutId="slash-command-selection"
+                          transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
+                          aria-hidden="true"
+                        />
+                      ) : null}
+                      <span>{command.label}</span>
+                      <small>{command.detail}</small>
+                    </div>
+                  ))}
+                </div>
+              </LayoutGroup>
             ) : (
               <div className="palette-message">No command</div>
             )
@@ -2920,7 +2988,9 @@ function LabEditorSession() {
             </div>
           )}
           </div>
-        </>
+          </BorderBeam>
+          </motion.div>
+        </div>
       ) : null}
       {notice ? <p className="editor-notice" role="status">{notice}</p> : null}
     </div>
