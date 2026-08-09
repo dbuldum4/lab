@@ -1312,7 +1312,7 @@ function LabEditorSession() {
             setNotice("Local version history is unavailable in this browser.");
             return;
           }
-          const versions = listDocumentVersions(documentId);
+          const versions = listDocumentVersions(documentId).filter((version) => version.markdown !== currentMarkdown);
           setHistoryVersions(versions);
           historySelectionRef.current = 0;
           setSelected(0);
@@ -1512,7 +1512,6 @@ function LabEditorSession() {
           return;
         }
         if (!active) return;
-        recordDocumentVersion(documentId, markdown, { force: true });
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
         persistence.markLoaded(markdown);
         const nextHealth = await inspectLocalStorage();
@@ -1904,11 +1903,11 @@ function LabEditorSession() {
                     onMouseDown={(event) => { event.preventDefault(); restoreHistoryVersion(version); }}
                     onMouseEnter={() => { historySelectionRef.current = index; setSelected(index); }}
                   >
-                    <span>{index === 0 ? "Current checkpoint" : new Date(version.createdAt).toLocaleString()}</span>
+                    <span>{new Date(version.createdAt).toLocaleString()}</span>
                     <small>{preview}</small>
                   </div>
                 );
-              }) : <div className="palette-message">No local checkpoints yet</div>}
+              }) : <div className="palette-message">No earlier checkpoints yet</div>}
             </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
