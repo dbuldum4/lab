@@ -21,6 +21,7 @@ import {
 import {
   DEFAULT_DOCUMENT_ID,
   inspectLocalStorage,
+  loadLocalDocument,
   isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
   requestPersistentStorage,
@@ -42,9 +43,10 @@ import {
   type DocumentSession,
 } from "@/lib/document-sessions";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import { searchWorkspace, type WorkspaceSearchResult } from "@/lib/workspace-search";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions" | "search";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -96,6 +98,7 @@ const COMMANDS: Command[] = [
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
+  { id: "search", label: "Search workspace", detail: "Find text across local sessions", terms: "find documents notes content global" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
@@ -406,6 +409,7 @@ function LabEditorSession() {
   const mathEditorElementRef = useRef<HTMLDivElement>(null);
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
   const paletteRef = useRef<PaletteState | null>(null);
@@ -428,6 +432,8 @@ function LabEditorSession() {
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<WorkspaceSearchResult[]>([]);
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -1064,6 +1070,32 @@ function LabEditorSession() {
   }, [mathEditorIdentity]);
 
   useEffect(() => {
+    if (palette?.mode !== "search") return;
+    const frame = window.requestAnimationFrame(() => searchInputRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "search") return;
+    let active = true;
+    const timeout = window.setTimeout(() => {
+      void searchWorkspace(sessions, searchQuery, (id) => loadLocalDocument(id))
+        .then((results) => {
+          if (!active) return;
+          setSearchResults(results);
+          setSelected(0);
+        })
+        .catch(() => {
+          if (active) setNotice("Workspace search could not read the local sessions.");
+        });
+    }, 80);
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [palette?.mode, searchQuery, sessions, setSelected]);
+
+  useEffect(() => {
     if (palette?.mode !== "name") return;
     const frame = window.requestAnimationFrame(() => {
       sessionNameInputRef.current?.focus();
@@ -1316,6 +1348,21 @@ function LabEditorSession() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
         return;
       }
+      if (command.id === "search") {
+        void (async () => {
+          if (!(await persistence.flush())) {
+            setNotice("This note could not be fully saved, so workspace search was cancelled.");
+            return;
+          }
+          const available = listDocumentSessions();
+          setSessions(available);
+          setSearchQuery("");
+          setSearchResults(await searchWorkspace(available, "", (id) => loadLocalDocument(id)));
+          setSelected(0);
+          setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "search" });
+        })().catch(() => setNotice("Workspace search could not be opened."));
+        return;
+      }
       if (command.id === "undo") {
         editor.commands.undo();
         return;
@@ -1559,6 +1606,25 @@ function LabEditorSession() {
       return;
     }
 
+    if (current.mode === "search") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, searchResults.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && searchResults.length > 0) {
+        event.preventDefault();
+        const result = searchResults[selectedRef.current] ?? searchResults[0];
+        if (result.session.id === documentId) {
+          setPalette(null);
+          editor?.commands.focus();
+        } else {
+          void resumeSession(result.session);
+        }
+      }
+      return;
+    }
+
     if (current.mode === "name") return;
 
     if (current.mode === "sessions") {
@@ -1740,8 +1806,8 @@ function LabEditorSession() {
             ref={paletteElementRef}
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" || palette.mode === "search" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "search" ? "Workspace search" : "Slash commands"}
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
@@ -1769,6 +1835,42 @@ function LabEditorSession() {
             ) : (
               <div className="palette-message">No command</div>
             )
+          ) : palette.mode === "search" ? (
+            <div className="session-name-panel">
+              <label htmlFor="workspace-search-input">Search local sessions</label>
+              <input
+                ref={searchInputRef}
+                id="workspace-search-input"
+                data-testid="workspace-search-input"
+                value={searchQuery}
+                autoComplete="off"
+                onChange={(event) => setSearchQuery(event.target.value)}
+              />
+              <div className="command-list session-list" data-testid="workspace-search-results">
+                {searchResults.length > 0 ? searchResults.map((result, index) => (
+                  <div
+                    className="command-item"
+                    data-selected={index === selected}
+                    key={result.session.id}
+                    role="option"
+                    aria-selected={index === selected}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      if (result.session.id === documentId) {
+                        setPalette(null);
+                        editor?.commands.focus();
+                      } else {
+                        void resumeSession(result.session);
+                      }
+                    }}
+                    onMouseEnter={() => setSelected(index)}
+                  >
+                    <span>{result.session.name}</span>
+                    <small>{result.snippet}</small>
+                  </div>
+                )) : <div className="palette-message">No local match</div>}
+              </div>
+            </div>
           ) : palette.mode === "name" ? (
             <div className="session-name-panel">
               <label htmlFor="session-name-input">Session name</label>

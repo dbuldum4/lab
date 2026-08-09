@@ -1262,7 +1262,7 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
   };
 }
 
-export function loadLocalDocument() {
+export function loadLocalDocument(documentId: string = activeDocumentId) {
   return serializeVaultOperation(async () => {
     if (await refreshDeletedFromIndexedDb()) return "";
 
@@ -1310,7 +1310,7 @@ export function loadLocalDocument() {
     }
     // If verification was unavailable, deliberately do not clear its pending record.
     return actualWinner.markdown;
-  });
+  }, documentId);
 }
 
 export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
