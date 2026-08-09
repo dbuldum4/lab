@@ -21,6 +21,7 @@
     "verify": "npm run test:all && npm run lint && npm run typecheck && npm run build"
   },
   "dependencies": {
+    "@tiptap/extension-image": "3.29.2",
     "@tiptap/extension-mathematics": "3.29.2",
     "@tiptap/extension-placeholder": "3.29.2",
     "@tiptap/extension-table": "3.29.2",
