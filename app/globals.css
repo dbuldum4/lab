@@ -609,6 +609,12 @@ img.ProseMirror-separator {
   gap: 5px;
 }
 
+.help-panel small {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .session-name-panel {
   display: grid;
   gap: 7px;

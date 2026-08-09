@@ -1746,7 +1746,7 @@ function LabEditorSession() {
             id={PALETTE_ID}
             className="command-palette"
             role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "help" ? "Help" : "Slash commands"}
             style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
           >
           {palette.mode === "commands" ? (
@@ -1822,13 +1822,15 @@ function LabEditorSession() {
               ))}
             </div>
           ) : palette.mode === "help" ? (
-            <div className="palette-message storage-message" data-testid="help-panel">
+            <div className="palette-message storage-message help-panel" data-testid="help-panel">
               <span>Keyboard-first local Markdown</span>
               <small>/new · /name · /sessions · /delete</small>
               <small>/import · /export · /recover · /status</small>
+              <small>/undo · /redo · /clear</small>
               <small>Headings, lists, tasks, quotes, code, tables, and links live in /</small>
               <small>$$…$$ for inline math · /math for a block equation</small>
-              <small>Esc closes panels · no accounts, analytics, or network note storage</small>
+              <small>↑/↓ select · Enter/Tab run · Esc closes panels</small>
+              <small>No accounts, analytics, or network note storage</small>
             </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">

@@ -11,7 +11,10 @@ test("slash help shows the local command reference", async ({ page }) => {
   await expect(help).toBeVisible();
   await expect(help).toContainText("Keyboard-first local Markdown");
   await expect(help).toContainText("/sessions");
+  await expect(help).toContainText("/undo · /redo · /clear");
   await expect(help).toContainText("$$…$$");
+  await expect(help).toContainText("Enter/Tab run");
+  await expect(page.getByRole("status", { name: "Help" })).toBeVisible();
 
   await page.keyboard.press("Escape");
   await expect(help).toBeHidden();
