@@ -21,9 +21,11 @@ import {
 import {
   DEFAULT_DOCUMENT_ID,
   inspectLocalStorage,
+  loadLocalDocument,
   isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
   requestPersistentStorage,
+  saveLocalDocument,
   setLocalDocumentScope,
   type LocalRecoveryDraft,
   type StorageHealth,
@@ -42,6 +44,7 @@ import {
   type DocumentSession,
 } from "@/lib/document-sessions";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import { buildWorkspaceBackup, parseWorkspaceBackup } from "@/lib/workspace-backup";
 
 type SlashRange = { from: number; to: number };
 type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
@@ -92,6 +95,8 @@ const COMMANDS: Command[] = [
   { id: "redo", label: "Redo", detail: "Redo the last change", terms: "forward history" },
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
   { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
+  { id: "backup", label: "Backup workspace", detail: "Export every local session", terms: "workspace all documents json archive" },
+  { id: "restore", label: "Restore workspace", detail: "Merge a workspace backup", terms: "workspace import json sessions" },
   { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
@@ -318,6 +323,18 @@ function downloadMarkdown(filename: string, markdown: string) {
   globalThis.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
 }
 
+function downloadJson(filename: string, value: unknown) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json;charset=utf-8" });
+  const anchor = document.createElement("a");
+  anchor.href = URL.createObjectURL(blob);
+  anchor.download = filename;
+  anchor.hidden = true;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  globalThis.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
+}
+
 function recoveryBundle(drafts: readonly LocalRecoveryDraft[]) {
   if (drafts.length === 1) return drafts[0].markdown;
   return drafts.map((draft, index) => {
@@ -407,6 +424,7 @@ function LabEditorSession() {
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const workspaceInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
   const paletteRef = useRef<PaletteState | null>(null);
   const mathEditorRef = useRef<MathEditorState | null>(null);
@@ -1268,6 +1286,27 @@ function LabEditorSession() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-delete" });
         return;
       }
+      if (command.id === "backup") {
+        void (async () => {
+          try {
+            if (!(await persistence.flush())) {
+              setNotice("This note could not be fully saved, so the workspace backup was cancelled.");
+              return;
+            }
+            const available = listDocumentSessions();
+            const bundle = await buildWorkspaceBackup(available, (id) => loadLocalDocument(id));
+            downloadJson("lab-workspace.json", bundle);
+            setNotice(`Backed up ${bundle.documents.length} local ${bundle.documents.length === 1 ? "session" : "sessions"}.`);
+          } catch {
+            setNotice("The local workspace could not be backed up.");
+          }
+        })();
+        return;
+      }
+      if (command.id === "restore") {
+        workspaceInputRef.current?.click();
+        return;
+      }
       if (command.id === "recover") {
         const revisionAtRequest = persistence.getState().editRevision;
         void listLocalRecoveryDrafts()
@@ -1641,6 +1680,33 @@ function LabEditorSession() {
     event.target.value = "";
   };
 
+  const onWorkspaceRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    void file.text()
+      .then(parseWorkspaceBackup)
+      .then(async (bundle) => {
+        const restored: DocumentSession[] = [];
+        try {
+          for (const document of bundle.documents) {
+            const session = await createDocumentSession(`Restored ${document.name}`);
+            restored.push(session);
+            const result = await saveLocalDocument(document.markdown, session.id);
+            if (result.saved !== true) throw new Error("A restored document could not be saved.");
+          }
+          setSessions(listDocumentSessions());
+          setNotice(`Restored ${restored.length} ${restored.length === 1 ? "session" : "sessions"} as new local documents.`);
+        } catch {
+          await Promise.all(restored.map((session) => purgeDocumentSession(session.id).catch(() => undefined)));
+          setNotice("Workspace restore failed; newly created sessions were rolled back.");
+        }
+      })
+      .catch((error: unknown) => {
+        setNotice(error instanceof Error ? error.message : "The selected workspace backup could not be read.");
+      });
+    event.target.value = "";
+  };
+
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1733,6 +1799,7 @@ function LabEditorSession() {
         <span ref={caretStrokeRef} className="lab-caret-stroke" data-blinking="true" />
       </div>
       <input ref={fileInputRef} hidden type="file" accept=".md,.markdown,text/markdown,text/plain" tabIndex={-1} aria-hidden="true" onChange={onImport} />
+      <input ref={workspaceInputRef} data-testid="workspace-restore-input" hidden type="file" accept=".json,application/json" tabIndex={-1} aria-hidden="true" onChange={onWorkspaceRestore} />
 
       {palette ? (
         <>

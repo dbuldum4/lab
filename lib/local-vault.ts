@@ -1262,7 +1262,7 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
   };
 }
 
-export function loadLocalDocument() {
+export function loadLocalDocument(documentId: string = activeDocumentId) {
   return serializeVaultOperation(async () => {
     if (await refreshDeletedFromIndexedDb()) return "";
 
@@ -1310,7 +1310,7 @@ export function loadLocalDocument() {
     }
     // If verification was unavailable, deliberately do not clear its pending record.
     return actualWinner.markdown;
-  });
+  }, documentId);
 }
 
 export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
@@ -1339,7 +1339,7 @@ export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
   });
 }
 
-export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
+export function saveLocalDocument(markdown: string, documentId: string = activeDocumentId): Promise<StorageHealth> {
   return serializeVaultOperation(async () => {
     if (await refreshDeletedFromIndexedDb()) {
       const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
@@ -1442,7 +1442,7 @@ export function saveLocalDocument(markdown: string): Promise<StorageHealth> {
     // the exact pending record until load/reconciliation proves it was consumed.
     const health = await inspectLocalStorageNow([...extraErrors, ...writeErrors]);
     return { ...health, saved: candidateSaved };
-  });
+  }, documentId);
 }
 
 export async function requestPersistentStorage() {
