@@ -1,5 +1,7 @@
 # lab
 
+<!-- Connector write-path smoke test. -->
+
 A local-only, local-first Markdown notepad. There is no toolbar: type `/` in an empty line to open every command.
 
 ## Run locally
