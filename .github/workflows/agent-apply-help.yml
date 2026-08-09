@@ -1,0 +1,64 @@
+name: Apply help feature patch
+
+on:
+  push:
+    branches:
+      - agent/help-command
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/help-command
+      - name: Apply feature patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('components/lab-editor.tsx')
+          text = path.read_text()
+
+          replacements = [
+            (
+              'type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";',
+              'type PaletteMode = "commands" | "status" | "help" | "confirm-clear" | "confirm-delete" | "name" | "sessions";',
+            ),
+            (
+              '  { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },',
+              '  { id: "help", label: "Help", detail: "Show commands and keyboard syntax", terms: "guide shortcuts cheatsheet reference" },\n  { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },',
+            ),
+            (
+              '      if (command.id === "undo") {',
+              '      if (command.id === "help") {\n        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "help" });\n        return;\n      }\n      if (command.id === "undo") {',
+            ),
+            (
+              '    if (current.mode === "status") {',
+              '    if (current.mode === "status" || current.mode === "help") {',
+            ),
+            (
+              '          ) : palette.mode === "confirm-clear" ? (',
+              '          ) : palette.mode === "help" ? (\n            <div className="palette-message storage-message" data-testid="help-panel">\n              <span>Keyboard-first local Markdown</span>\n              <small>/new · /name · /sessions · /delete</small>\n              <small>/import · /export · /recover · /status</small>\n              <small>Headings, lists, tasks, quotes, code, tables, and links live in /</small>\n              <small>$$…$$ for inline math · /math for a block equation</small>\n              <small>Esc closes panels · no accounts, analytics, or network note storage</small>\n            </div>\n          ) : palette.mode === "confirm-clear" ? (',
+            ),
+          ]
+
+          for old, new in replacements:
+            if old not in text:
+              raise SystemExit(f'missing patch anchor: {old[:80]}')
+            text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+      - name: Commit feature
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/agent-apply-help.yml
+          git add components/lab-editor.tsx
+          git commit -m 'feat(editor): add help command'
+          git push
