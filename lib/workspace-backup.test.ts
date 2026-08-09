@@ -30,3 +30,12 @@ test("parseWorkspaceBackup validates and normalizes a v1 bundle", () => {
 test("parseWorkspaceBackup rejects unrelated JSON", () => {
   assert.throws(() => parseWorkspaceBackup('{"hello":"world"}'), /supported lab workspace backup/);
 });
+
+test("parseWorkspaceBackup rejects empty workspace bundles", () => {
+  assert.throws(() => parseWorkspaceBackup(JSON.stringify({
+    format: "lab-workspace",
+    version: 1,
+    exportedAt: 42,
+    documents: [],
+  })), /document count/);
+});
