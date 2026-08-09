@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { GeistSans, GeistMono } from "geist/font";
+import { ServiceWorkerRegistration } from "@/components/service-worker-registration";
 import "katex/dist/katex.min.css";
 import "./globals.css";
 
@@ -16,6 +17,7 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const scriptSources = ["'self'", "'unsafe-inline'"];
+  const basePath = process.env.LAB_GITHUB_PAGES_BUILD === "true" ? "/lab" : "";
   if (process.env.NODE_ENV === "development") {
     // React's development client uses eval to reconstruct server-component
     // callstacks. Keep this exception out of production/static exports.
@@ -30,7 +32,10 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
           content={`default-src 'self'; script-src ${scriptSources.join(" ")}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'`}
         />
       </head>
-      <body>{children}</body>
+      <body>
+        {children}
+        <ServiceWorkerRegistration basePath={basePath} />
+      </body>
     </html>
   );
 }
