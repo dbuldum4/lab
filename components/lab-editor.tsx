@@ -382,19 +382,18 @@ function readFileAsDataURL(file: File): Promise<string> {
   });
 }
 
-/** Local-first images only: data URLs, blob URLs, and same-origin paths. */
+/** Local-first images only: data URLs and same-origin paths. */
 function isAllowedImageSrc(src: string | null | undefined): boolean {
   if (!src) return false;
   const trimmed = src.trim();
   if (trimmed.startsWith("data:image/")) return true;
-  if (trimmed.startsWith("blob:")) return true;
   try {
     if (typeof window === "undefined") {
       return trimmed.startsWith("/") && !trimmed.startsWith("//");
     }
     const url = new URL(trimmed, window.location.href);
-    if (url.protocol === "blob:") return true;
     if (url.protocol === "data:") return url.href.startsWith("data:image/");
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
     return url.origin === window.location.origin;
   } catch {
     return false;
@@ -491,6 +490,10 @@ async function insertImageFiles(
   }
   if (accepted.length === 0 || editor.isDestroyed) return;
 
+  // FileReader yields to the event loop. Keep the numeric anchor only when
+  // the editor state is unchanged; otherwise it may point into a different
+  // document after a concurrent edit. The current selection is a safe fallback.
+  const anchorState = editor.state;
   let dataUrls: { file: File; dataUrl: string }[];
   try {
     dataUrls = await Promise.all(
@@ -503,12 +506,16 @@ async function insertImageFiles(
   if (editor.isDestroyed) return;
 
   const { schema, state } = editor;
+  const anchorIsCurrent = editor.state === anchorState;
   const images = dataUrls.map(({ file, dataUrl }) => {
     const alt = file.name.replace(/\.[^/.]+$/, "");
     return schema.nodes.image.create({ src: dataUrl, alt });
   });
 
   // Prefer an explicit drop/insert position; otherwise replace the selection.
+  // Do not use either captured value after a transaction has changed the doc.
+  const insertionPos = anchorIsCurrent ? options.pos : undefined;
+  const insertionSelection = anchorIsCurrent ? options.selection : undefined;
   let from: number;
   let to: number;
   let $insert = state.selection.$to;
@@ -516,14 +523,14 @@ async function insertImageFiles(
     0,
     Math.min(Math.round(value), state.doc.content.size),
   );
-  if (typeof options.pos === "number" && Number.isFinite(options.pos)) {
-    const pos = clampDocPosition(options.pos);
+  if (typeof insertionPos === "number" && Number.isFinite(insertionPos)) {
+    const pos = clampDocPosition(insertionPos);
     from = pos;
     to = pos;
     $insert = state.doc.resolve(pos);
-  } else if (options.selection) {
-    from = clampDocPosition(options.selection.from);
-    to = clampDocPosition(options.selection.to);
+  } else if (insertionSelection) {
+    from = clampDocPosition(insertionSelection.from);
+    to = clampDocPosition(insertionSelection.to);
     if (from > to) [from, to] = [to, from];
     $insert = state.doc.resolve(to);
   } else {
@@ -545,7 +552,7 @@ async function insertImageFiles(
 }
 
 /**
- * Local-first image node: base64/blob/same-origin only, and safe Markdown alt.
+ * Local-first image node: base64/same-origin only, and safe Markdown alt.
  */
 type ImageCropHandler = (node: PMNode, pos: number) => void;
 
@@ -704,8 +711,15 @@ const LabImage = Image.extend({
         const height = imageDimension(node.attrs.height);
         if (width) image.style.width = `${width}px`;
         else image.style.removeProperty("width");
-        if (height) image.style.height = `${height}px`;
-        else image.style.removeProperty("height");
+        if (width && height) {
+          // Let max-width shrink both dimensions together on narrow screens.
+          image.style.aspectRatio = `${width} / ${height}`;
+          image.style.removeProperty("height");
+        } else {
+          image.style.removeProperty("aspect-ratio");
+          if (height) image.style.height = `${height}px`;
+          else image.style.removeProperty("height");
+        }
         const nextAlign = node.attrs.align === "center" ? "center" : null;
         const currentAlign = image.dataset.imageAlign === "center" ? "center" : null;
         if (currentAlign === nextAlign) setImageAlignment(nextAlign);
@@ -1701,6 +1715,19 @@ function LabEditorSession() {
         return true;
       },
       handlePaste: (view, event) => {
+        const text = event.clipboardData?.getData("text/plain") ?? "";
+        const html = event.clipboardData?.getData("text/html") ?? "";
+        const { $from } = view.state.selection;
+        const insideCodeBlock = isCodeBlock($from.parent);
+
+        // Code blocks must never be split by an image node. Preserve the
+        // clipboard's text representation and ignore its file payload.
+        if (insideCodeBlock) {
+          event.preventDefault();
+          view.dispatch(view.state.tr.insertText(text).scrollIntoView());
+          return true;
+        }
+
         const files = event.clipboardData?.files;
         if (files && files.length > 0) {
           const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
@@ -1732,16 +1759,6 @@ function LabEditorSession() {
             });
             return true;
           }
-        }
-
-        const text = event.clipboardData?.getData("text/plain") ?? "";
-        const html = event.clipboardData?.getData("text/html") ?? "";
-        const { $from } = view.state.selection;
-        const insideCodeBlock = isCodeBlock($from.parent);
-
-        if (insideCodeBlock) {
-          view.dispatch(view.state.tr.insertText(text).scrollIntoView());
-          return true;
         }
 
         // 2. Slash-fragment completion first because it interacts with
@@ -1872,12 +1889,19 @@ function LabEditorSession() {
         if (files && files.length > 0) {
           const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
           if (imageFiles.length > 0 && editorRef.current) {
-            event.preventDefault();
             // Insert under the pointer, not at the current caret.
             const dropPos = view.posAtCoords({
               left: dragEvent.clientX,
               top: dragEvent.clientY,
             })?.pos;
+            if (
+              typeof dropPos === "number"
+              && isCodeBlock(view.state.doc.resolve(dropPos).parent)
+            ) {
+              event.preventDefault();
+              return true;
+            }
+            event.preventDefault();
             void insertImageFiles(editorRef.current, imageFiles, {
               onNotice: (message) => setNoticeRef.current(message),
               pos: dropPos,

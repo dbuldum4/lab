@@ -62,6 +62,99 @@ test("pasting an image file inserts a base64 image", async ({ page }) => {
   await waitForAuthority(page, /!\[pasted\]\(data:image\/png;base64,/);
 });
 
+test("pasting an image follows the current selection after a concurrent edit", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await page.keyboard.type("before");
+
+  await page.evaluate(() => {
+    const originalReadAsDataURL = FileReader.prototype.readAsDataURL;
+    FileReader.prototype.readAsDataURL = function (blob: Blob) {
+      window.setTimeout(() => originalReadAsDataURL.call(this, blob), 300);
+    };
+  });
+
+  await editor.evaluate((node) => {
+    const buffer = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+    const file = new File([buffer], "concurrent.png", { type: "image/png" });
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    node.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dataTransfer,
+      }),
+    );
+  });
+  await page.keyboard.type("after");
+
+  await expect(editor.locator("img.lab-image")).toBeVisible();
+  await expect.poll(async () => editor.evaluate((node) => Array.from(node.querySelectorAll(":scope > *")).map((element) => {
+    if (element.tagName === "IMG") return "img";
+    if (element.tagName === "P") return `p:${element.textContent ?? ""}`;
+    return element.tagName.toLowerCase();
+  }))).toEqual(["p:beforeafter", "img", "p:"]);
+});
+
+test("pasting an image inside a code block preserves code-block text", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("/code");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect(editor.locator("pre")).toBeVisible();
+
+  await editor.evaluate((node) => {
+    const buffer = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+    const file = new File([buffer], "code-image.png", { type: "image/png" });
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    dataTransfer.setData("text/plain", "const pasted = true;");
+    node.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dataTransfer,
+      }),
+    );
+  });
+
+  await expect(editor.locator("pre code")).toHaveText("const pasted = true;");
+  await expect(editor.locator("img.lab-image")).toHaveCount(0);
+});
+
+test("dropping an image inside a code block does not insert an image", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("/code");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+  await page.keyboard.press("Enter");
+  const codeBlock = editor.locator("pre");
+  await expect(codeBlock).toBeVisible();
+  const box = await codeBlock.boundingBox();
+  if (!box) throw new Error("Code block bounding box not available");
+
+  await editor.evaluate((node, coords) => {
+    const buffer = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+    const file = new File([buffer], "dropped-code-image.png", { type: "image/png" });
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    node.dispatchEvent(
+      new DragEvent("drop", {
+        bubbles: true,
+        cancelable: true,
+        clientX: coords.x,
+        clientY: coords.y,
+        dataTransfer,
+      }),
+    );
+  }, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
+
+  await expect(editor.locator("img.lab-image")).toHaveCount(0);
+  await expect(editor.locator("pre")).toBeVisible();
+});
+
 test("dropping an image file inserts a base64 image", async ({ page }) => {
   const editor = await openEditor(page);
   const box = await editor.boundingBox();
@@ -268,6 +361,26 @@ test("rich HTML with a remote image URL does not insert a broken image", async (
   await expect(editor.locator('img[src*="example.com"]')).toHaveCount(0);
 });
 
+test("blob image URLs are rejected before they can be persisted", async ({ page }) => {
+  const editor = await openEditor(page);
+
+  await editor.evaluate((node) => {
+    const dataTransfer = new DataTransfer();
+    dataTransfer.setData("text/html", '<p>See <img src="blob:http://127.0.0.1:3100/expired-image" alt="blob"></p>');
+    dataTransfer.setData("text/plain", "See ");
+    node.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dataTransfer,
+      }),
+    );
+  });
+
+  await expect(editor.locator("img")).toHaveCount(0);
+  await expect(editor).toContainText("See");
+});
+
 test("typed remote image Markdown does not create an image", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.click();
@@ -333,6 +446,12 @@ test("resizing an image preserves its aspect ratio and persists its size", async
 
   await expect.poll(() => image.getAttribute("style")).toMatch(/width: \d+px/);
   await waitForAuthority(page, /lab-size:\d+x\d+/);
+
+  await page.setViewportSize({ width: 500, height: 800 });
+  await expect.poll(async () => image.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 ? Math.abs(rect.height / rect.width - 0.6) : 1;
+  })).toBeLessThan(0.02);
 });
 
 test("cropping an image creates a local cropped data URL", async ({ page }) => {
