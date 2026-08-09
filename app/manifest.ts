@@ -1,5 +1,7 @@
 import type { MetadataRoute } from "next";
 
+export const dynamic = "force-static";
+
 export default function manifest(): MetadataRoute.Manifest {
   const basePath = process.env.LAB_GITHUB_PAGES_BUILD === "true" ? "/lab" : "";
   return {
