@@ -414,6 +414,7 @@ function LabEditorSession() {
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const historySelectionRef = useRef(0);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [selected, setSelectedState] = useState(0);
@@ -1313,6 +1314,7 @@ function LabEditorSession() {
           }
           const versions = listDocumentVersions(documentId);
           setHistoryVersions(versions);
+          historySelectionRef.current = 0;
           setSelected(0);
           setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "history" });
         })();
@@ -1615,10 +1617,13 @@ function LabEditorSession() {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
         const count = Math.max(1, historyVersions.length);
-        setSelected((selectedRef.current + direction + count) % count);
+        const next = (historySelectionRef.current + direction + count) % count;
+        historySelectionRef.current = next;
+        setSelected(next);
       } else if ((event.key === "Enter" || event.key === "Tab") && historyVersions.length > 0) {
         event.preventDefault();
-        restoreHistoryVersion(historyVersions[selectedRef.current] ?? historyVersions[0]);
+        const index = Math.min(historySelectionRef.current, historyVersions.length - 1);
+        restoreHistoryVersion(historyVersions[index] ?? historyVersions[0]);
       }
       return;
     }
@@ -1897,7 +1902,7 @@ function LabEditorSession() {
                     role="option"
                     aria-selected={index === selected}
                     onMouseDown={(event) => { event.preventDefault(); restoreHistoryVersion(version); }}
-                    onMouseEnter={() => setSelected(index)}
+                    onMouseEnter={() => { historySelectionRef.current = index; setSelected(index); }}
                   >
                     <span>{index === 0 ? "Current checkpoint" : new Date(version.createdAt).toLocaleString()}</span>
                     <small>{preview}</small>
