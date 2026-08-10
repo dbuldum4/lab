@@ -56,7 +56,20 @@ test("outline visibility is local to the current page and stays inside a narrow 
   await editor.press("ControlOrMeta+Shift+o");
 
   const outline = page.getByTestId("document-outline");
+  const obscuredEditor = page.locator(".lab-document");
   await expect(outline).toBeVisible();
+  await expect(outline).toHaveAttribute("role", "dialog");
+  await expect(outline).toHaveAttribute("aria-modal", "true");
+  await expect(outline).toHaveAccessibleName("Outline");
+  await expect(obscuredEditor).toHaveAttribute("inert", "");
+  await expect(obscuredEditor).toHaveAttribute("aria-hidden", "true");
+
+  const heading = outline.getByRole("button", { name: "A heading", exact: true });
+  await expect(heading).toBeFocused();
+  const documentText = await obscuredEditor.textContent();
+  await page.keyboard.type("BLOCKED");
+  await expect(obscuredEditor).toHaveText(documentText ?? "");
+
   const box = await outline.boundingBox();
   expect(box).not.toBeNull();
   expect(box?.x).toBeGreaterThanOrEqual(0);
@@ -64,8 +77,23 @@ test("outline visibility is local to the current page and stays inside a narrow 
   expect(await outline.evaluate((element) => getComputedStyle(element).position)).toBe("fixed");
 
   const subsection = outline.getByRole("button", { name: "A subsection", exact: true });
-  await subsection.focus();
-  await subsection.press("Enter");
+  await page.keyboard.press("Shift+Tab");
+  await expect(page.getByRole("button", { name: "Close outline" })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(subsection).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "Close outline" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(outline).toBeHidden();
+  await expect(editor).toBeFocused();
+  await expect(editor).not.toHaveAttribute("inert", "");
+  await expect(editor).not.toHaveAttribute("aria-hidden", "true");
+
+  await editor.press("ControlOrMeta+Shift+o");
+  await expect(heading).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(subsection).toBeFocused();
+  await page.keyboard.press("Enter");
   await expect(outline).toBeHidden();
   await expect(editor).toBeFocused();
 

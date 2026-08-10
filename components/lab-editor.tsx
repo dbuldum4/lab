@@ -334,6 +334,7 @@ function useIsClient() {
 }
 
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+const MOBILE_OUTLINE_QUERY = "(max-width: 640px)";
 
 function subscribeToReducedMotion(callback: () => void) {
   const mediaQuery = window.matchMedia(REDUCED_MOTION_QUERY);
@@ -346,6 +347,20 @@ function usePrefersReducedMotion() {
     subscribeToReducedMotion,
     () => window.matchMedia(REDUCED_MOTION_QUERY).matches,
     () => true,
+  );
+}
+
+function subscribeToMobileOutline(callback: () => void) {
+  const mediaQuery = window.matchMedia(MOBILE_OUTLINE_QUERY);
+  mediaQuery.addEventListener("change", callback);
+  return () => mediaQuery.removeEventListener("change", callback);
+}
+
+function useMobileOutline() {
+  return useSyncExternalStore(
+    subscribeToMobileOutline,
+    () => window.matchMedia(MOBILE_OUTLINE_QUERY).matches,
+    () => false,
   );
 }
 
@@ -1362,6 +1377,7 @@ export function LabEditor() {
 
 function LabEditorSession() {
   const shellRef = useRef<HTMLDivElement>(null);
+  const outlinePanelRef = useRef<HTMLElement>(null);
   const caretRef = useRef<HTMLDivElement>(null);
   const caretStrokeRef = useRef<HTMLSpanElement>(null);
   const paletteElementRef = useRef<HTMLDivElement>(null);
@@ -1400,6 +1416,7 @@ function LabEditorSession() {
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
   const prefersReducedMotion = usePrefersReducedMotion();
+  const mobileOutline = useMobileOutline();
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -1470,6 +1487,40 @@ function LabEditorSession() {
       window.requestAnimationFrame(() => editorRef.current?.commands.focus());
     }
   }, [setOutlineOpen]);
+
+  useLayoutEffect(() => {
+    if (!outlineOpen || !mobileOutline) return;
+
+    const panel = outlinePanelRef.current;
+    const editorElement = editorRef.current?.view.dom;
+    if (!panel || !editorElement) return;
+
+    const editorWasInert = editorElement.hasAttribute("inert");
+    const editorAriaHidden = editorElement.getAttribute("aria-hidden");
+    editorElement.setAttribute("inert", "");
+    editorElement.setAttribute("aria-hidden", "true");
+
+    const focusInitialControl = () => {
+      const activeItem = panel.querySelector<HTMLElement>('.outline-item[aria-current="location"]');
+      const firstItem = panel.querySelector<HTMLElement>(".outline-item");
+      const closeButton = panel.querySelector<HTMLElement>(".outline-close");
+      (activeItem ?? firstItem ?? closeButton ?? panel).focus();
+    };
+
+    const keepFocusInPanel = (event: FocusEvent) => {
+      if (!panel.contains(event.target as Node)) focusInitialControl();
+    };
+
+    focusInitialControl();
+    document.addEventListener("focusin", keepFocusInPanel);
+
+    return () => {
+      document.removeEventListener("focusin", keepFocusInPanel);
+      if (!editorWasInert) editorElement.removeAttribute("inert");
+      if (editorAriaHidden === null) editorElement.removeAttribute("aria-hidden");
+      else editorElement.setAttribute("aria-hidden", editorAriaHidden);
+    };
+  }, [mobileOutline, outlineOpen]);
 
   const openImageCrop = useCallback((node: PMNode, pos: number) => {
     const src = String(node.attrs.src ?? "");
@@ -2546,13 +2597,15 @@ function LabEditorSession() {
     }
 
     const targetPosition = Math.min(item.position + 1, instance.state.doc.content.size);
-    instance.chain().focus().setTextSelection(targetPosition).scrollIntoView().run();
+    const chain = instance.chain();
+    if (!mobileOutline) chain.focus();
+    chain.setTextSelection(targetPosition).scrollIntoView().run();
     setActiveOutlineIdState(item.id);
 
-    if (window.matchMedia("(max-width: 640px)").matches) {
+    if (mobileOutline) {
       closeOutline();
     }
-  }, [closeOutline, syncOutlineItems]);
+  }, [closeOutline, mobileOutline, syncOutlineItems]);
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
   // run before the passive hydration effect, so the persistence controller's
@@ -2892,9 +2945,42 @@ function LabEditorSession() {
             onClick={() => closeOutline()}
           />
           <aside
+            ref={outlinePanelRef}
             className="outline-panel"
             data-testid="document-outline"
+            role={mobileOutline ? "dialog" : undefined}
+            aria-modal={mobileOutline ? "true" : undefined}
             aria-labelledby="document-outline-title"
+            tabIndex={mobileOutline ? -1 : undefined}
+            onKeyDown={(event) => {
+              if (!mobileOutline || event.key !== "Tab") return;
+
+              const panel = outlinePanelRef.current;
+              if (!panel) return;
+              const focusable = Array.from(
+                panel.querySelectorAll<HTMLElement>(
+                  "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
+                ),
+              ).filter((element) => element !== panel && element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
+              if (focusable.length === 0) {
+                event.preventDefault();
+                panel.focus();
+                return;
+              }
+
+              const first = focusable[0];
+              const last = focusable[focusable.length - 1];
+              const active = document.activeElement;
+              if (
+                active === panel
+                || !panel.contains(active)
+                || (event.shiftKey && active === first)
+                || (!event.shiftKey && active === last)
+              ) {
+                event.preventDefault();
+                (event.shiftKey ? last : first).focus();
+              }
+            }}
           >
             <div className="outline-header">
               <div>
