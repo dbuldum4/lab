@@ -2,6 +2,16 @@
 
 A local-only, local-first Markdown notepad. There is no toolbar: type `/` in an empty line to open every command.
 
+## Outline
+
+Use `/outline` (or `Cmd/Ctrl+Shift+O`) to toggle a side outline built from the
+note's `#`, `##`, and `###` headings. It updates as you edit, keeps heading
+levels indented, marks the section around the caret, and jumps to a heading
+when selected. The outline is keyboard accessible: use `Tab` to reach it,
+`Enter` or `Space` to navigate, and `Escape` to close it. On narrow screens it
+opens as a local overlay and closes after navigation. Its open/closed state is
+UI-only and is not saved with the document.
+
 ## Run locally
 
 Requires Node.js 22.6 or newer.

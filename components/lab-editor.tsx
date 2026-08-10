@@ -60,6 +60,13 @@ import {
   type LocalSearchResult,
 } from "@/lib/local-search";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import {
+  activeOutlineIndex,
+  areOutlineItemsEqual,
+  buildOutline,
+  type HeadingLevel,
+  type OutlineItem,
+} from "@/lib/outline";
 
 type SlashRange = { from: number; to: number };
 type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions" | "search";
@@ -147,6 +154,7 @@ const COMMANDS: Command[] = [
   { id: "h1", label: "Heading 1", detail: "Large section title", terms: "title h1" },
   { id: "h2", label: "Heading 2", detail: "Medium section title", terms: "subtitle h2" },
   { id: "h3", label: "Heading 3", detail: "Small section title", terms: "subtitle h3" },
+  { id: "outline", label: "Outline", detail: "Toggle document headings", terms: "toc table of contents navigation sidebar" },
   { id: "bullet", label: "Bulleted list", detail: "Create an unordered list", terms: "ul list bullets" },
   { id: "number", label: "Numbered list", detail: "Create an ordered list", terms: "ol list numbers" },
   { id: "todo", label: "To-do list", detail: "Create a checklist", terms: "task check checkbox" },
@@ -255,6 +263,21 @@ function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
 }
 
+function outlineFromEditor(instance: Editor): OutlineItem[] {
+  const headings: Array<{ level: HeadingLevel; title: string; position: number }> = [];
+  instance.state.doc.descendants((node, position) => {
+    if (node.type.name !== "heading") return;
+    const level = Number(node.attrs.level);
+    if (level !== 1 && level !== 2 && level !== 3) return;
+    headings.push({
+      level,
+      title: node.textContent,
+      position,
+    });
+  });
+  return buildOutline(headings);
+}
+
 /** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
 function previousGraphemeIndex(text: string, index: number) {
   if (index <= 0) return 0;
@@ -320,6 +343,7 @@ function useIsClient() {
 }
 
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+const MOBILE_OUTLINE_QUERY = "(max-width: 640px)";
 
 function subscribeToReducedMotion(callback: () => void) {
   const mediaQuery = window.matchMedia(REDUCED_MOTION_QUERY);
@@ -332,6 +356,20 @@ function usePrefersReducedMotion() {
     subscribeToReducedMotion,
     () => window.matchMedia(REDUCED_MOTION_QUERY).matches,
     () => true,
+  );
+}
+
+function subscribeToMobileOutline(callback: () => void) {
+  const mediaQuery = window.matchMedia(MOBILE_OUTLINE_QUERY);
+  mediaQuery.addEventListener("change", callback);
+  return () => mediaQuery.removeEventListener("change", callback);
+}
+
+function useMobileOutline() {
+  return useSyncExternalStore(
+    subscribeToMobileOutline,
+    () => window.matchMedia(MOBILE_OUTLINE_QUERY).matches,
+    () => false,
   );
 }
 
@@ -1364,6 +1402,7 @@ export function LabEditor() {
 
 function LabEditorSession() {
   const shellRef = useRef<HTMLDivElement>(null);
+  const outlinePanelRef = useRef<HTMLElement>(null);
   const caretRef = useRef<HTMLDivElement>(null);
   const caretStrokeRef = useRef<HTMLSpanElement>(null);
   const paletteElementRef = useRef<HTMLDivElement>(null);
@@ -1384,12 +1423,17 @@ function LabEditorSession() {
   const searchComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const outlineOpenRef = useRef(false);
+  const outlineItemsRef = useRef<OutlineItem[]>([]);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
+  const [outlineOpen, setOutlineOpenState] = useState(false);
+  const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
+  const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
@@ -1404,6 +1448,7 @@ function LabEditorSession() {
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
   const prefersReducedMotion = usePrefersReducedMotion();
+  const mobileOutline = useMobileOutline();
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -1446,6 +1491,77 @@ function LabEditorSession() {
     mathEditorRef.current = value;
     setMathEditorState(value);
   }, []);
+
+  const setOutlineOpen = useCallback((value: boolean) => {
+    outlineOpenRef.current = value;
+    setOutlineOpenState(value);
+  }, []);
+
+  const syncOutlineActive = useCallback((instance: Editor) => {
+    const items = outlineItemsRef.current;
+    const nextActiveIndex = activeOutlineIndex(items, instance.state.selection.from);
+    const nextActiveId = items[nextActiveIndex]?.id ?? null;
+    setActiveOutlineIdState((current) => current === nextActiveId ? current : nextActiveId);
+  }, []);
+
+  const syncOutlineItems = useCallback((instance: Editor) => {
+    const nextItems = outlineFromEditor(instance);
+    if (!areOutlineItemsEqual(outlineItemsRef.current, nextItems)) {
+      outlineItemsRef.current = nextItems;
+      setOutlineItemsState(nextItems);
+    }
+    syncOutlineActive(instance);
+  }, [syncOutlineActive]);
+
+  const toggleOutline = useCallback(() => {
+    const nextOpen = !outlineOpenRef.current;
+    if (nextOpen) {
+      const instance = editorRef.current;
+      if (instance && !instance.isDestroyed) syncOutlineItems(instance);
+    }
+    setOutlineOpen(nextOpen);
+  }, [setOutlineOpen, syncOutlineItems]);
+
+  const closeOutline = useCallback((focusEditor = true) => {
+    setOutlineOpen(false);
+    if (focusEditor) {
+      window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+    }
+  }, [setOutlineOpen]);
+
+  useLayoutEffect(() => {
+    if (!outlineOpen || !mobileOutline) return;
+
+    const panel = outlinePanelRef.current;
+    const editorElement = editorRef.current?.view.dom;
+    if (!panel || !editorElement) return;
+
+    const editorWasInert = editorElement.hasAttribute("inert");
+    const editorAriaHidden = editorElement.getAttribute("aria-hidden");
+    editorElement.setAttribute("inert", "");
+    editorElement.setAttribute("aria-hidden", "true");
+
+    const focusInitialControl = () => {
+      const activeItem = panel.querySelector<HTMLElement>('.outline-item[aria-current="location"]');
+      const firstItem = panel.querySelector<HTMLElement>(".outline-item");
+      const closeButton = panel.querySelector<HTMLElement>(".outline-close");
+      (activeItem ?? firstItem ?? closeButton ?? panel).focus();
+    };
+
+    const keepFocusInPanel = (event: FocusEvent) => {
+      if (!panel.contains(event.target as Node)) focusInitialControl();
+    };
+
+    focusInitialControl();
+    document.addEventListener("focusin", keepFocusInPanel);
+
+    return () => {
+      document.removeEventListener("focusin", keepFocusInPanel);
+      if (!editorWasInert) editorElement.removeAttribute("inert");
+      if (editorAriaHidden === null) editorElement.removeAttribute("aria-hidden");
+      else editorElement.setAttribute("aria-hidden", editorAriaHidden);
+    };
+  }, [mobileOutline, outlineOpen]);
 
   const openImageCrop = useCallback((node: PMNode, pos: number) => {
     const src = String(node.attrs.src ?? "");
@@ -1716,14 +1832,18 @@ function LabEditorSession() {
   }, [setPalette]);
 
   const syncInterface = useCallback(
-    (instance: Editor) => {
+    (instance: Editor, refreshOutline = false) => {
       requestAnimationFrame(() => positionCaret(instance));
+      if (outlineOpenRef.current) {
+        if (refreshOutline) syncOutlineItems(instance);
+        else syncOutlineActive(instance);
+      }
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
       setSelected(0);
     },
-    [findSlash, positionCaret, setPalette, setSelected],
+    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive, syncOutlineItems],
   );
 
   const editor = useEditor({
@@ -2002,6 +2122,12 @@ function LabEditorSession() {
         },
       },
       handleKeyDown: (view, event) => {
+        if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "o") {
+          event.preventDefault();
+          toggleOutline();
+          return true;
+        }
+
         if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e") {
           if (isCodeBlock(view.state.selection.$from.parent)) return false;
           event.preventDefault();
@@ -2112,7 +2238,7 @@ function LabEditorSession() {
     },
     onUpdate: ({ editor: instance }) => {
       if (migrateInlineMath(instance)) return;
-      syncInterface(instance);
+      syncInterface(instance, true);
       persistence.onEdit(instance.getMarkdown());
     },
     onSelectionUpdate: ({ editor: instance }) => syncInterface(instance),
@@ -2567,6 +2693,10 @@ function LabEditorSession() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
         return;
       }
+      if (command.id === "outline") {
+        toggleOutline();
+        return;
+      }
       if (command.id === "undo") {
         editor.commands.undo();
         return;
@@ -2627,8 +2757,28 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, refreshSearchIndex, savedSessionName, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, refreshSearchIndex, savedSessionName, setPalette, setSelected, toggleOutline],
   );
+
+  const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
+    const instance = editorRef.current;
+    if (!instance || instance.isDestroyed) return;
+    const node = instance.state.doc.nodeAt(item.position);
+    if (!node || node.type.name !== "heading") {
+      syncOutlineItems(instance);
+      return;
+    }
+
+    const targetPosition = Math.min(item.position + 1, instance.state.doc.content.size);
+    const chain = instance.chain();
+    if (!mobileOutline) chain.focus();
+    chain.setTextSelection(targetPosition).scrollIntoView().run();
+    setActiveOutlineIdState(item.id);
+
+    if (mobileOutline) {
+      closeOutline();
+    }
+  }, [closeOutline, mobileOutline, syncOutlineItems]);
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
   // run before the passive hydration effect, so the persistence controller's
@@ -2801,7 +2951,13 @@ function LabEditorSession() {
 
   const onKeyDownCapture = (event: React.KeyboardEvent) => {
     const current = paletteRef.current;
-    if (!current) return;
+    if (!current) {
+      if (outlineOpenRef.current && event.key === "Escape") {
+        event.preventDefault();
+        closeOutline();
+      }
+      return;
+    }
 
     if (event.key === "Escape") {
       event.preventDefault();
@@ -2977,6 +3133,95 @@ function LabEditorSession() {
   return (
     <div className="lab-shell" ref={shellRef} onKeyDownCapture={onKeyDownCapture}>
       <EditorContent editor={editor} aria-busy={hydrating} />
+      {outlineOpen ? (
+        <>
+          <div
+            className="outline-backdrop"
+            aria-hidden="true"
+            onClick={() => closeOutline()}
+          />
+          <aside
+            ref={outlinePanelRef}
+            className="outline-panel"
+            data-testid="document-outline"
+            role={mobileOutline ? "dialog" : undefined}
+            aria-modal={mobileOutline ? "true" : undefined}
+            aria-labelledby="document-outline-title"
+            tabIndex={mobileOutline ? -1 : undefined}
+            onKeyDown={(event) => {
+              if (!mobileOutline || event.key !== "Tab") return;
+
+              const panel = outlinePanelRef.current;
+              if (!panel) return;
+              const focusable = Array.from(
+                panel.querySelectorAll<HTMLElement>(
+                  "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
+                ),
+              ).filter((element) => element !== panel && element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
+              if (focusable.length === 0) {
+                event.preventDefault();
+                panel.focus();
+                return;
+              }
+
+              const first = focusable[0];
+              const last = focusable[focusable.length - 1];
+              const active = document.activeElement;
+              if (
+                active === panel
+                || !panel.contains(active)
+                || (event.shiftKey && active === first)
+                || (!event.shiftKey && active === last)
+              ) {
+                event.preventDefault();
+                (event.shiftKey ? last : first).focus();
+              }
+            }}
+          >
+            <div className="outline-header">
+              <div>
+                <h2 id="document-outline-title">Outline</h2>
+                <p>{outlineItems.length === 0 ? "No sections yet" : `${outlineItems.length} ${outlineItems.length === 1 ? "section" : "sections"}`}</p>
+              </div>
+              <button
+                type="button"
+                className="outline-close"
+                aria-label="Close outline"
+                onClick={() => closeOutline()}
+              >
+                ×
+              </button>
+            </div>
+            {outlineItems.length > 0 ? (
+              <nav className="outline-navigation" aria-label="Document headings">
+                <ol className="outline-list">
+                  {outlineItems.map((item) => {
+                    const active = item.id === activeOutlineId;
+                    return (
+                      <li key={item.id} data-depth={item.depth}>
+                        <button
+                          type="button"
+                          className="outline-item"
+                          data-active={active}
+                          data-level={item.level}
+                          aria-current={active ? "location" : undefined}
+                          title={item.title}
+                          onClick={() => navigateToOutlineHeading(item)}
+                        >
+                          <span className="outline-item-marker" aria-hidden="true" />
+                          <span className="outline-item-label">{item.title}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </nav>
+            ) : (
+              <p className="outline-empty">Type a heading with <code>#</code> to build your outline.</p>
+            )}
+          </aside>
+        </>
+      ) : null}
       {imageCropTarget ? (
         <ImageCropDialog
           src={imageCropTarget.src}

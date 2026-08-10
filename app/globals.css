@@ -771,6 +771,185 @@ img.ProseMirror-separator {
   }
 }
 
+.outline-backdrop {
+  display: none;
+}
+
+.outline-panel {
+  position: fixed;
+  top: clamp(24px, 15vh, 164px);
+  right: 24px;
+  z-index: 25;
+  display: flex;
+  width: min(208px, calc(100vw - 32px));
+  max-height: min(520px, calc(100dvh - clamp(24px, 15vh, 164px) - 24px));
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #2d2d2a;
+  border-radius: 13px;
+  background: rgba(10, 10, 10, 0.97);
+  box-shadow: 0 20px 54px rgba(0, 0, 0, 0.66), 0 1px 0 rgba(255, 255, 255, 0.055) inset;
+  color: #f0f0ed;
+  font-family: var(--font-geist-sans), Geist, system-ui, sans-serif;
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+.outline-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid #242421;
+  padding: 13px 12px 11px 14px;
+}
+
+.outline-header h2,
+.outline-header p {
+  margin: 0;
+}
+
+.outline-header h2 {
+  color: #e8e8e4;
+  font-size: 12px;
+  font-weight: 570;
+  letter-spacing: -0.012em;
+}
+
+.outline-header p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: -0.008em;
+}
+
+.outline-close {
+  display: grid;
+  flex: 0 0 auto;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  margin: -3px -3px 0 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #92928d;
+  font: inherit;
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.outline-close:hover,
+.outline-close:focus-visible {
+  outline: none;
+  background: #242421;
+  color: #fff;
+}
+
+.outline-navigation {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 5px;
+  scrollbar-width: none;
+}
+
+.outline-navigation::-webkit-scrollbar {
+  display: none;
+}
+
+.outline-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.outline-list li {
+  margin: 0;
+  padding: 0;
+}
+
+.outline-item {
+  display: flex;
+  width: 100%;
+  min-height: 34px;
+  align-items: flex-start;
+  gap: 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  padding: 8px 8px;
+  color: #a7a7a2;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+}
+
+.outline-list li[data-depth="1"] .outline-item {
+  padding-left: 22px;
+}
+
+.outline-list li[data-depth="2"] .outline-item {
+  padding-left: 36px;
+}
+
+.outline-item:hover,
+.outline-item:focus-visible,
+.outline-item[data-active="true"] {
+  outline: none;
+  background: #1b1b19;
+  color: #f1f1ee;
+}
+
+.outline-item:focus-visible {
+  box-shadow: inset 0 0 0 1px #666660;
+}
+
+.outline-item-marker {
+  flex: 0 0 auto;
+  width: 4px;
+  height: 4px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: #555551;
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.outline-item[data-active="true"] .outline-item-marker {
+  background: #f2f2ef;
+  box-shadow: 0 0 0 3px rgba(242, 242, 239, 0.09);
+}
+
+.outline-item-label {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.45;
+  letter-spacing: -0.012em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outline-empty {
+  margin: 0;
+  padding: 15px 14px 17px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.outline-empty code {
+  border: 1px solid #2d2d2a;
+  border-radius: 4px;
+  background: #151513;
+  padding: 1px 4px;
+  color: #e2e2dd;
+  font-family: var(--font-geist-mono), "Geist Mono", monospace;
+  font-size: 0.9em;
+}
+
 .command-palette-positioner {
   position: absolute;
   z-index: 30;
@@ -1228,6 +1407,34 @@ img.ProseMirror-separator {
   .command-item {
     grid-template-columns: 108px 1fr;
   }
+
+  .outline-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 45;
+    display: block;
+    background: rgba(0, 0, 0, 0.62);
+    -webkit-backdrop-filter: blur(4px);
+    backdrop-filter: blur(4px);
+  }
+
+  .outline-panel {
+    top: 16px;
+    right: 12px;
+    left: 12px;
+    z-index: 46;
+    width: auto;
+    max-height: min(70dvh, 540px);
+    border-radius: 15px;
+  }
+}
+
+@media (min-width: 1260px) {
+  .outline-panel {
+    right: auto;
+    left: calc(50% + 384px);
+    width: 216px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1238,5 +1445,9 @@ img.ProseMirror-separator {
   .lab-caret-stroke[data-blinking="true"] {
     /* Slow the cadence without stretching each fade beyond a restrained 100ms. */
     animation-duration: 1.3s;
+  }
+
+  .outline-item-marker {
+    transition: none;
   }
 }
