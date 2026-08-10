@@ -65,6 +65,22 @@ Stress failures print the seed, iteration, and schedule; replay the same seed wi
 
 Use `/export` for a portable Markdown copy and `/import` to restore one.
 
+Use `/backup` to download `lab-vault-backup.json`, a versioned JSON snapshot of
+the whole local vault. It contains every live session's id, name, timestamps,
+and Markdown. Embedded `data:image/...` images are moved into a deduplicated
+asset table so the backup remains a single portable file. The backup is local
+data only; it does not fetch remote images.
+
+Use `/restore` to choose a backup file. The file is parsed and validated in
+full before anything is written: unsupported versions, duplicate ids, invalid
+timestamps, malformed image data, missing image assets, and truncated JSON are
+rejected without changing the vault. Restore is a non-destructive merge—an
+exact existing session is skipped, and a conflicting or tombstoned session is
+imported under a new id. Existing sessions are never replaced and deleted
+session ids are never revived. If storage fails during a multi-session import,
+completed imports remain intact and the failed session is reported so the user
+can retry safely.
+
 ## Sessions
 
 The original note remains the default, so existing users do not need to manage documents. Use `/new` to start a separate local document, `/name` to give the current document a recognizable name, `/sessions` to resume another document, and `/delete` to permanently remove an extra session (the original cannot be deleted; use `/clear` to empty it).

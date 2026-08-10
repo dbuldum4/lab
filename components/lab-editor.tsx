@@ -40,6 +40,16 @@ import {
   type StorageHealth,
 } from "@/lib/local-vault";
 import {
+  VAULT_BACKUP_FILENAME,
+  MAX_VAULT_BACKUP_BYTES,
+  exportLocalVault,
+  isValidLocalImageDataUrl,
+  parseVaultBackup,
+  restoreLocalVault,
+  serializeVaultBackup,
+} from "@/lib/vault-backup";
+import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
+import {
   activeDocumentIdFromLocation,
   clearInvalidDocumentSessionHash,
   createDocumentSession,
@@ -170,6 +180,8 @@ const COMMANDS: Command[] = [
   { id: "redo", label: "Redo", detail: "Redo the last change", terms: "forward history" },
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
   { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
+  { id: "backup", label: "Export vault backup", detail: "Save every session and local image", terms: "vault backup export all archive" },
+  { id: "restore", label: "Restore vault backup", detail: "Merge a validated local backup", terms: "vault backup restore import merge" },
   { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
@@ -448,7 +460,11 @@ function highlightSearchText(value: string, query: string): ReactNode {
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
-  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+  downloadText(filename, markdown, "text/markdown;charset=utf-8");
+}
+
+function downloadText(filename: string, content: string, type: string) {
+  const blob = new Blob([content], { type });
   const anchor = document.createElement("a");
   anchor.href = URL.createObjectURL(blob);
   anchor.download = filename;
@@ -457,6 +473,10 @@ function downloadMarkdown(filename: string, markdown: string) {
   anchor.click();
   anchor.remove();
   globalThis.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
+}
+
+function downloadVaultBackup(backup: Awaited<ReturnType<typeof exportLocalVault>>) {
+  downloadText(VAULT_BACKUP_FILENAME, serializeVaultBackup(backup), "application/json;charset=utf-8");
 }
 
 function recoveryBundle(drafts: readonly LocalRecoveryDraft[]) {
@@ -484,13 +504,13 @@ function readFileAsDataURL(file: File): Promise<string> {
 function isAllowedImageSrc(src: string | null | undefined): boolean {
   if (!src) return false;
   const trimmed = src.trim();
-  if (trimmed.startsWith("data:image/")) return true;
+  if (trimmed.toLowerCase().startsWith("data:image/")) return isValidLocalImageDataUrl(trimmed);
   try {
     if (typeof window === "undefined") {
       return trimmed.startsWith("/") && !trimmed.startsWith("//");
     }
     const url = new URL(trimmed, window.location.href);
-    if (url.protocol === "data:") return url.href.startsWith("data:image/");
+    if (url.protocol === "data:") return isValidLocalImageDataUrl(url.href);
     if (url.protocol !== "http:" && url.protocol !== "https:") return false;
     return url.origin === window.location.origin;
   } catch {
@@ -1412,6 +1432,7 @@ function LabEditorSession() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const vaultBackupInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
   // useEditor freezes editorProps on first create; keep notices current via ref.
   const setNoticeRef = useRef<(message: string | null) => void>(() => undefined);
@@ -1435,6 +1456,10 @@ function LabEditorSession() {
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
   const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
+  // This chain must be observable synchronously. A successful flush calls
+  // onHealth before its promise resolves; React state would leave /backup and
+  // /restore awaiting the render-time (stale) chain instead of that new touch.
+  const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
@@ -1460,7 +1485,9 @@ function LabEditorSession() {
         setHealth(nextHealth);
         // documentId is stable for the mount lifetime (session switches reload),
         // so capturing it here is intentional and avoids a ref.
-        if (nextHealth.saved === true) void touchDocumentSession(documentId).catch(() => undefined);
+        if (nextHealth.saved === true) {
+          sessionTouchBarrier.enqueue(() => touchDocumentSession(documentId).then(() => undefined));
+        }
       },
       onNotice: setNotice,
       onStageFailure: () => setNotice("This edit could not be staged locally. Please export a copy before closing the page."),
@@ -2633,6 +2660,39 @@ function LabEditorSession() {
         void refreshSearchIndex();
         return;
       }
+      if (command.id === "backup") {
+        const revisionAtRequest = persistence.getState().editRevision;
+        void (async () => {
+          if (!(await persistence.flush())) {
+            setNotice("The vault could not be backed up because this note was not fully saved.");
+            return;
+          }
+          if (!(await sessionTouchBarrier.wait())) {
+            setNotice("The vault could not be backed up because session metadata was not fully saved.");
+            return;
+          }
+          if (revisionAtRequest !== persistence.getState().editRevision) {
+            setNotice("The note changed while the vault backup was being prepared. Export was cancelled.");
+            return;
+          }
+          try {
+            const backup = await exportLocalVault();
+            if (revisionAtRequest !== persistence.getState().editRevision) {
+              setNotice("The note changed while the vault backup was being prepared. Export was cancelled.");
+              return;
+            }
+            downloadVaultBackup(backup);
+            setNotice(`Exported ${backup.sessions.length} ${backup.sessions.length === 1 ? "session" : "sessions"} and ${backup.assets.length} embedded ${backup.assets.length === 1 ? "image" : "images"}.`);
+          } catch {
+            setNotice("The local vault backup could not be created.");
+          }
+        })();
+        return;
+      }
+      if (command.id === "restore") {
+        vaultBackupInputRef.current?.click();
+        return;
+      }
       if (command.id === "clear") {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-clear" });
         return;
@@ -2757,7 +2817,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, refreshSearchIndex, savedSessionName, setPalette, setSelected, toggleOutline],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, refreshSearchIndex, savedSessionName, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
@@ -3072,6 +3132,67 @@ function LabEditorSession() {
     event.target.value = "";
   };
 
+  const onVaultRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file || !editor) return;
+    if (file.size > MAX_VAULT_BACKUP_BYTES) {
+      setNotice("The selected vault backup is too large.");
+      event.target.value = "";
+      return;
+    }
+    const revisionAtRequest = persistence.getState().editRevision;
+    void file.text()
+      .then(async (text) => {
+        let backup: ReturnType<typeof parseVaultBackup>;
+        try {
+          backup = parseVaultBackup(text);
+        } catch (error) {
+          setNotice(error instanceof Error ? error.message : "The selected vault backup is invalid.");
+          return;
+        }
+        if (revisionAtRequest !== persistence.getState().editRevision) {
+          setNotice("The note changed while the vault backup was loading. Restore was cancelled.");
+          return;
+        }
+        if (!(await persistence.flush())) {
+          setNotice("The vault could not be restored because this note was not fully saved.");
+          return;
+        }
+        if (!(await sessionTouchBarrier.wait())) {
+          setNotice("The vault could not be restored because session metadata was not fully saved.");
+          return;
+        }
+        if (revisionAtRequest !== persistence.getState().editRevision) {
+          setNotice("The note changed while the vault backup was loading. Restore was cancelled.");
+          return;
+        }
+        const confirmed = window.confirm(
+          `Restore ${backup.sessions.length} ${backup.sessions.length === 1 ? "session" : "sessions"} from this backup? Existing sessions will never be replaced; conflicts will be restored as new sessions.`,
+        );
+        if (!confirmed) {
+          setNotice("Vault restore cancelled.");
+          return;
+        }
+        try {
+          const result = await restoreLocalVault(backup, { activeDocumentId: documentId });
+          if (result.activeDocumentUpdated) {
+            window.location.reload();
+            return;
+          }
+          const imported = `${result.imported} ${result.imported === 1 ? "session" : "sessions"}`;
+          const skipped = `${result.skipped} existing ${result.skipped === 1 ? "session was" : "sessions were"} already present`;
+          const conflict = result.renamed > 0
+            ? ` ${result.renamed} conflict${result.renamed === 1 ? " was" : "s were"} restored under a new id.`
+            : "";
+          setNotice(`Restored ${imported}; ${skipped}.${conflict}`);
+        } catch (error) {
+          setNotice(error instanceof Error ? error.message : "The vault backup could not be restored.");
+        }
+      })
+      .catch(() => setNotice("The selected vault backup could not be read."));
+    event.target.value = "";
+  };
+
   const onImageImport = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || !editor || files.length === 0) return;
@@ -3294,6 +3415,7 @@ function LabEditorSession() {
         <span ref={caretStrokeRef} className="lab-caret-stroke" data-blinking="true" />
       </div>
       <input ref={fileInputRef} hidden type="file" accept=".md,.markdown,text/markdown,text/plain" tabIndex={-1} aria-hidden="true" onChange={onImport} />
+      <input ref={vaultBackupInputRef} hidden type="file" accept=".json,.lab-vault,application/json" tabIndex={-1} aria-hidden="true" onChange={onVaultRestore} />
       <input ref={imageInputRef} hidden type="file" accept="image/*" multiple tabIndex={-1} aria-hidden="true" onChange={onImageImport} />
 
       {palette ? (
