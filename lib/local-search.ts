@@ -123,7 +123,6 @@ export function searchLocalDocuments(
       || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
       || left.documentId.localeCompare(right.documentId)
     ))
-    .slice(0, 24)
     .map(({ documentId, name, excerpt, match, updatedAt }) => ({
       documentId,
       name,

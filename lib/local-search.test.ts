@@ -80,3 +80,21 @@ test("empty queries do not expose any local documents", () => {
     { id: "alpha", name: "Private", markdown: "secret" },
   ], "   "), []);
 });
+
+test("returns every matching session beyond the first 24 results", () => {
+  const documents = Array.from({ length: 30 }, (_, index) => ({
+    id: `match-${index}`,
+    name: `Result ${index}`,
+    markdown: "shared searchable token",
+    updatedAt: index,
+  }));
+
+  const results = searchLocalDocuments(documents, "searchable token");
+
+  assert.equal(results.length, 30);
+  assert.deepEqual(
+    new Set(results.map((result) => result.documentId)),
+    new Set(documents.map((document) => document.id)),
+  );
+  assert.equal(results.at(-1)?.documentId, "match-0");
+});

@@ -1381,6 +1381,7 @@ function LabEditorSession() {
   const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const searchIndexVersionRef = useRef(0);
+  const searchComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
@@ -1425,6 +1426,7 @@ function LabEditorSession() {
     const previous = paletteRef.current;
     if (previous?.mode === "search" && value?.mode !== "search") {
       searchIndexVersionRef.current += 1;
+      searchComposingRef.current = false;
       searchDocumentsRef.current = [];
       searchResultRefs.current.clear();
       setSearchResults([]);
@@ -2812,6 +2814,14 @@ function LabEditorSession() {
     if (current.mode === "name") return;
 
     if (current.mode === "search") {
+      const isComposing = searchComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -3128,6 +3138,8 @@ function LabEditorSession() {
                   placeholder="Search sessions and note text"
                   value={palette.query}
                   onChange={(event) => updateSearchQuery(event.target.value)}
+                  onCompositionStart={() => { searchComposingRef.current = true; }}
+                  onCompositionEnd={() => { searchComposingRef.current = false; }}
                 />
                 <kbd>Esc</kbd>
               </div>

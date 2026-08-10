@@ -337,6 +337,51 @@ test("keyboard search selection scrolls the active result into view", async ({ p
   }), { timeout: 5000 }).toBe(true);
 });
 
+test("search keyboard navigation waits for IME composition to finish", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.evaluate(async () => {
+    const base = Date.now();
+    for (let index = 0; index < 2; index += 1) {
+      const id = `composition-seeded-${index}`;
+      const markdown = `composition token ${index}`;
+      const updatedAt = base + index;
+      const bytes = new TextEncoder().encode(JSON.stringify(["lab.snapshot.v2", updatedAt, markdown]));
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      const checksum = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem(`lab.session.v1.${id}`, JSON.stringify({
+        id,
+        name: `Composition ${index}`,
+        createdAt: updatedAt,
+        updatedAt,
+      }));
+      localStorage.setItem(`lab.document.v2.${id}`, JSON.stringify({ markdown, updatedAt, checksum, version: 2 }));
+    }
+  });
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
+  await searchInput.fill("composition token");
+  await expect(page.getByTestId("search-result")).toHaveCount(2);
+  const selectedResult = page.locator('.search-result[data-selected="true"]');
+  await expect(selectedResult).toContainText("Composition 1");
+
+  await searchInput.dispatchEvent("compositionstart");
+  await searchInput.press("ArrowDown");
+  await searchInput.press("Enter");
+  await expect(selectedResult).toContainText("Composition 1");
+  await expect(searchInput).toBeVisible();
+  await expect(page).not.toHaveURL(/#session=composition-seeded-/);
+
+  await searchInput.dispatchEvent("compositionend");
+  await searchInput.press("ArrowDown");
+  await expect(selectedResult).toContainText("Composition 0");
+  await searchInput.press("Enter");
+  await expect(page).toHaveURL(/#session=composition-seeded-0$/);
+});
+
 test("delete removes an extra session and returns to the original note", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.fill("keep the original note");
