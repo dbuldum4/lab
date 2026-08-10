@@ -1311,6 +1311,50 @@ async function loadLocalDocumentNow() {
     return actualWinner.markdown;
 }
 
+/**
+ * Read a durable document for cross-session consumers without touching
+ * recovery drafts, timestamps, tombstones, or any replica. A null result is a
+ * verified deletion marker; an empty string is a live document with no data.
+ */
+async function readVerifiedLocalDocumentNow(): Promise<string | null> {
+  const id = currentDocumentId();
+  if (isLocalDocumentDeleted(id)) return null;
+
+  if (hasIndexedDb()) {
+    try {
+      const raw = await readIndexedDbRawState();
+      if (isDeletedRecord(raw.deleted)) return null;
+    } catch {
+      if (isLocalDocumentDeleted(id)) return null;
+    }
+  }
+
+  const reads = await readSnapshots();
+
+  // Deletion can be published by a peer while the replicas are being read.
+  // Recheck without promoting the marker into localStorage: this path must be
+  // safe to call while indexing an inactive session.
+  if (isLocalDocumentDeleted(id)) return null;
+  if (hasIndexedDb()) {
+    try {
+      const raw = await readIndexedDbRawState();
+      if (isDeletedRecord(raw.deleted)) return null;
+    } catch {
+      if (isLocalDocumentDeleted(id)) return null;
+    }
+  }
+
+  const winner = selectCurrentSnapshot(
+    reads.filter((read) => read.valid && read.snapshot).map((read) => read.snapshot as CanonicalSnapshot),
+  );
+  return winner?.markdown ?? "";
+}
+
+/** Read only durable replicas for an explicit session namespace. */
+export function readVerifiedLocalDocument(documentId: string = activeDocumentId) {
+  return serializeVaultOperation(readVerifiedLocalDocumentNow, documentId);
+}
+
 /** Load a verified local document, optionally from an explicit session namespace. */
 export function loadLocalDocument(documentId: string = activeDocumentId) {
   return serializeVaultOperation(loadLocalDocumentNow, documentId);

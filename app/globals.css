@@ -927,13 +927,16 @@ img.ProseMirror-separator {
 }
 
 .search-result-excerpt {
+  display: -webkit-box;
   overflow: hidden;
   color: #aaa9a2;
   font-size: 12px;
   line-height: 1.38;
   letter-spacing: -0.006em;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .search-result mark {

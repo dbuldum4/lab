@@ -36,12 +36,43 @@ test("requires every query term and prioritizes name matches", () => {
   assert.equal(results[1]?.match, "content");
 });
 
+test("allows a multi-word query to span a session name and its note body", () => {
+  const results = searchLocalDocuments([
+    { id: "planning", name: "Planning", markdown: "Prepare the launch checklist." },
+    { id: "unrelated", name: "Planning", markdown: "Review the budget." },
+  ], "planning launch");
+
+  assert.deepEqual(results.map((result) => result.documentId), ["planning"]);
+  assert.equal(results[0]?.match, "name-and-content");
+  assert.match(results[0]?.excerpt ?? "", /launch/);
+});
+
+test("keeps literal punctuation searchable", () => {
+  const markdown = "# Budget\n\nCost $5; use snake_case and C:\\tmp.\n\n$$x^2$$";
+  assert.match(searchableMarkdown(markdown), /Cost \$5; use snake_case and C:\\tmp\. \$\$x\^2\$\$/);
+
+  for (const query of ["$5", "snake_case", "C:\\tmp", "x^2"]) {
+    assert.deepEqual(
+      searchLocalDocuments([{ id: "budget", name: "Budget", markdown }], query).map((result) => result.documentId),
+      ["budget"],
+      query,
+    );
+  }
+});
+
 test("excerpts remove Markdown chrome and center the useful match", () => {
   const markdown = "# Weekly plan\n\nA very long introduction that should move out of the way.\n\n[Launch checklist](https://example.com) is ready for review.";
   assert.equal(searchableMarkdown(markdown), "Weekly plan A very long introduction that should move out of the way. Launch checklist is ready for review.");
   const excerpt = searchExcerpt(markdown, "checklist", 48);
   assert.match(excerpt, /checklist/);
   assert.match(excerpt, /^…/);
+});
+
+test("excerpts keep a distant match near the visible start of the card", () => {
+  const markdown = `${"long introduction ".repeat(40)}needle ${"trailing context ".repeat(40)}`;
+  const excerpt = searchExcerpt(markdown, "needle", 48);
+  assert.ok(excerpt.indexOf("needle") >= 0);
+  assert.ok(excerpt.indexOf("needle") < 30, excerpt);
 });
 
 test("empty queries do not expose any local documents", () => {

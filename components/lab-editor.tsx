@@ -33,7 +33,7 @@ import {
   inspectLocalStorage,
   isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
-  loadLocalDocument,
+  readVerifiedLocalDocument,
   requestPersistentStorage,
   setLocalDocumentScope,
   type LocalRecoveryDraft,
@@ -54,6 +54,7 @@ import {
 } from "@/lib/document-sessions";
 import {
   normalizeSearchQuery,
+  searchableMarkdown,
   searchLocalDocuments,
   type LocalSearchDocument,
   type LocalSearchResult,
@@ -1378,6 +1379,7 @@ function LabEditorSession() {
   const paletteRef = useRef<PaletteState | null>(null);
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
+  const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const searchIndexVersionRef = useRef(0);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
@@ -1424,6 +1426,7 @@ function LabEditorSession() {
     if (previous?.mode === "search" && value?.mode !== "search") {
       searchIndexVersionRef.current += 1;
       searchDocumentsRef.current = [];
+      searchResultRefs.current.clear();
       setSearchResults([]);
       setSearchLoading(false);
     }
@@ -2195,6 +2198,18 @@ function LabEditorSession() {
     return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode]);
 
+  useEffect(() => {
+    if (palette?.mode !== "search" || searchLoading) return;
+    const activeResult = searchResults[selected];
+    if (!activeResult) return;
+    const frame = window.requestAnimationFrame(() => {
+      searchResultRefs.current
+        .get(activeResult.documentId)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode, searchLoading, searchResults, selected]);
+
   useLayoutEffect(() => {
     repositionMathEditor();
   }, [mathEditorState, repositionMathEditor]);
@@ -2230,17 +2245,11 @@ function LabEditorSession() {
       return;
     }
     if (palette?.mode === "search") {
-      const activeResult = searchResults[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", `${PALETTE_ID}-results`);
-      if (activeResult) {
-        documentElement.setAttribute(
-          "aria-activedescendant",
-          `${PALETTE_ID}-search-${activeResult.documentId}`,
-        );
-      } else {
-        documentElement.removeAttribute("aria-activedescendant");
-      }
+      // The searchbox owns the result list. The editor is only the command
+      // launcher and must not claim the search list as its active descendant.
+      documentElement.setAttribute("aria-expanded", "false");
+      documentElement.removeAttribute("aria-controls");
+      documentElement.removeAttribute("aria-activedescendant");
       return;
     }
     documentElement.setAttribute("aria-expanded", "false");
@@ -2342,11 +2351,6 @@ function LabEditorSession() {
     try {
       // Include the current in-memory note even when a save is still debounced
       // or an authority conflict has made the latest edit unsavable.
-      try {
-        await persistence.flush();
-      } catch {
-        // Search remains useful from the editor's current in-memory value.
-      }
       const available = searchSessionList();
       setSessions(available);
       const currentMarkdown = editor?.getMarkdown() ?? "";
@@ -2356,13 +2360,16 @@ function LabEditorSession() {
             id: session.id,
             name: session.name,
             markdown: currentMarkdown,
+            searchableText: searchableMarkdown(currentMarkdown),
             updatedAt: session.updatedAt,
           } satisfies LocalSearchDocument;
         }
 
         let markdown = "";
         try {
-          markdown = await loadLocalDocument(session.id);
+          const verifiedMarkdown = await readVerifiedLocalDocument(session.id);
+          if (verifiedMarkdown === null) return null;
+          markdown = verifiedMarkdown;
         } catch {
           // A readable session name is still searchable when one of its
           // replicas is temporarily unavailable.
@@ -2372,6 +2379,7 @@ function LabEditorSession() {
           id: session.id,
           name: session.name,
           markdown,
+          searchableText: searchableMarkdown(markdown),
           updatedAt: session.updatedAt,
         } satisfies LocalSearchDocument;
       }))).flatMap((document) => document ? [document] : []);
@@ -2385,7 +2393,7 @@ function LabEditorSession() {
     } finally {
       if (requestVersion === searchIndexVersionRef.current) setSearchLoading(false);
     }
-  }, [documentId, editor, persistence, searchSessionList]);
+  }, [documentId, editor, searchSessionList]);
 
   const updateSearchQuery = useCallback((query: string) => {
     const current = paletteRef.current;
@@ -3107,8 +3115,15 @@ function LabEditorSession() {
                 <input
                   ref={searchInputRef}
                   type="search"
+                  role="combobox"
                   aria-label="Search local notes"
+                  aria-expanded="true"
                   aria-controls={`${PALETTE_ID}-results`}
+                  aria-activedescendant={!searchLoading && searchResults[selected]
+                    ? `${PALETTE_ID}-search-${searchResults[selected].documentId}`
+                    : undefined}
+                  aria-autocomplete="list"
+                  aria-haspopup="listbox"
                   autoComplete="off"
                   placeholder="Search sessions and note text"
                   value={palette.query}
@@ -3123,12 +3138,16 @@ function LabEditorSession() {
                     ? `${searchResults.length} ${searchResults.length === 1 ? "match" : "matches"}`
                     : `${sessions.length} local ${sessions.length === 1 ? "session" : "sessions"}`}
               </div>
-              {searchLoading ? (
-                <div className="search-empty">Reading verified local copies…</div>
-              ) : palette.query.trim() && searchResults.length > 0 ? (
-                <div id={`${PALETTE_ID}-results`} className="search-results" role="listbox" aria-label="Search results">
-                  {searchResults.map((result, index) => (
+              <div id={`${PALETTE_ID}-results`} className="search-results" role="listbox" aria-label="Search results">
+                {searchLoading ? (
+                  <div className="search-empty">Reading verified local copies…</div>
+                ) : palette.query.trim() && searchResults.length > 0 ? (
+                  searchResults.map((result, index) => (
                     <div
+                      ref={(element) => {
+                        if (element) searchResultRefs.current.set(result.documentId, element);
+                        else searchResultRefs.current.delete(result.documentId);
+                      }}
                       className="search-result"
                       data-testid="search-result"
                       data-selected={index === selected}
@@ -3158,13 +3177,13 @@ function LabEditorSession() {
                         {highlightSearchText(result.excerpt || "Session name match", palette.query)}
                       </div>
                     </div>
-                  ))}
-                </div>
-              ) : palette.query.trim() ? (
-                <div className="search-empty">No local notes match “{palette.query.trim()}”.</div>
-              ) : (
-                <div className="search-empty">Search session names and the text of every local note.</div>
-              )}
+                  ))
+                ) : palette.query.trim() ? (
+                  <div className="search-empty">No local notes match “{palette.query.trim()}”.</div>
+                ) : (
+                  <div className="search-empty">Search session names and the text of every local note.</div>
+                )}
+              </div>
               <div className="search-footer">↑↓ move · Enter open · Esc close · local only</div>
             </div>
           ) : palette.mode === "name" ? (

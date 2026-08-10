@@ -267,8 +267,19 @@ test("search finds session names and verified note excerpts, then opens the resu
   await secondEditor.press("Enter");
   await secondEditor.type("/search");
   await page.keyboard.press("Enter");
-  const searchInput = page.getByRole("searchbox", { name: "Search local notes" });
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
   await expect(searchInput).toBeVisible();
+  await expect(searchInput).toHaveAttribute("aria-expanded", "true");
+  await expect(searchInput).toHaveAttribute("aria-controls", "slash-command-palette-results");
+  await expect(page.locator("#slash-command-palette-results")).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "lab local-only Markdown note" }))
+    .not.toHaveAttribute("aria-controls", "slash-command-palette-results");
+
+  await searchInput.fill("planning launch");
+  const crossFieldResult = page.getByTestId("search-result").filter({ hasText: "Planning" });
+  await expect(crossFieldResult).toContainText("final checklist");
+  await expect(crossFieldResult).toContainText("Name + note text");
+  await expect(searchInput).toHaveAttribute("aria-activedescendant", "slash-command-palette-search-default");
 
   await searchInput.fill("launch");
   const launchResult = page.getByTestId("search-result").filter({ hasText: "Planning" });
@@ -283,6 +294,47 @@ test("search finds session names and verified note excerpts, then opens the resu
   await searchInput.press("Enter");
   await expect(page).not.toHaveURL(/#session=/);
   await expect(page.getByRole("textbox", { name: "lab local-only Markdown note" })).toContainText(originalNote);
+});
+
+test("keyboard search selection scrolls the active result into view", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.evaluate(async () => {
+    const base = Date.now();
+    for (let index = 0; index < 6; index += 1) {
+      const id = `scroll-seeded-${index}`;
+      const markdown = `scroll token ${index}`;
+      const updatedAt = base + index;
+      const bytes = new TextEncoder().encode(JSON.stringify(["lab.snapshot.v2", updatedAt, markdown]));
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      const checksum = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem(`lab.session.v1.${id}`, JSON.stringify({
+        id,
+        name: `Scroll ${index}`,
+        createdAt: updatedAt,
+        updatedAt,
+      }));
+      localStorage.setItem(`lab.document.v2.${id}`, JSON.stringify({ markdown, updatedAt, checksum, version: 2 }));
+    }
+  });
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
+  await searchInput.fill("scroll token");
+  const results = page.getByTestId("search-result");
+  await expect(results).toHaveCount(6);
+
+  for (let index = 0; index < 5; index += 1) await searchInput.press("ArrowDown");
+  const selectedResult = page.locator('.search-result[data-selected="true"]');
+  await expect(selectedResult).toHaveCount(1);
+  await expect.poll(async () => page.evaluate(() => {
+    const container = document.getElementById("slash-command-palette-results")?.getBoundingClientRect();
+    const selected = document.querySelector('.search-result[data-selected="true"]')?.getBoundingClientRect();
+    if (!container || !selected) return false;
+    return selected.top >= container.top - 1 && selected.bottom <= container.bottom + 1;
+  }), { timeout: 5000 }).toBe(true);
 });
 
 test("delete removes an extra session and returns to the original note", async ({ page }) => {
