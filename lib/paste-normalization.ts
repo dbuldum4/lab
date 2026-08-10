@@ -37,14 +37,20 @@ function normalizeLineEndings(text: string) {
 /**
  * Ordered clipboard decision pipeline. Earlier rules take precedence:
  *
- * 1. HTML that merely wraps literal Markdown is parsed as Markdown.
+ * 1. Inside a code block the payload is always literal plain text.
  * 2. Rich HTML with meaningful semantic structure wins over plain text.
- * 3. Otherwise the plain-text payload is classified on its own.
+ * 3. HTML that merely wraps literal Markdown is parsed as Markdown.
+ * 4. Otherwise the plain-text payload is classified on its own.
  */
 export function classifyClipboardPaste(input: {
   plainText: string;
   html: string;
+  insideCodeBlock: boolean;
 }): PasteIntent {
+  if (input.insideCodeBlock) {
+    return { kind: "plain-text", text: normalizeLineEndings(input.plainText) };
+  }
+
   const plainText = normalizeLineEndings(input.plainText);
   const html = input.html.trim();
 
@@ -309,7 +315,7 @@ function katexValidates(latex: string, displayMode: boolean): boolean {
       throwOnError: true,
       strict: "warn",
       trust: false,
-      output: "html",
+      output: "htmlAndMathml",
     });
     return true;
   } catch {

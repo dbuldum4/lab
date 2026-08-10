@@ -8,6 +8,7 @@ import {
   isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
   loadLocalDocument,
+  readVerifiedLocalDocument,
   resetLocalVaultStateForTests,
   sameSnapshot,
   saveLocalDocument,
@@ -968,10 +969,54 @@ test("document scopes isolate durable snapshots and pending recovery drafts", as
   setLocalDocumentScope("alpha");
   assert.equal(await loadLocalDocument(), "alpha note");
   setLocalDocumentScope("default");
+  assert.equal(await loadLocalDocument("alpha"), "alpha note");
   assert.equal(await loadLocalDocument(), "original note");
 
   assert.ok(environment.local.values.has("lab.document.v1"));
   assert.ok(environment.local.values.has("lab.document.v2.alpha"));
+});
+
+test("read-only scoped loads ignore staged recovery drafts and never reconcile them", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  setLocalDocumentScope("alpha");
+  assert.equal(stageLocalDocument("durable note"), true);
+  assert.equal((await saveLocalDocument("durable note")).saved, true);
+  assert.equal(await loadLocalDocument(), "durable note");
+
+  assert.equal(stageLocalDocument("inactive unsaved draft"), true);
+  const pendingKey = [...environment.local.values.keys()].find((key) => (
+    key.startsWith("lab.document.pending.scoped.v2.alpha.")
+  ));
+  assert.ok(pendingKey);
+
+  assert.equal(await readVerifiedLocalDocument("alpha"), "durable note");
+  assert.equal(
+    (environment.idb?.read("authority:alpha") as { snapshot?: { markdown?: string } } | undefined)?.snapshot?.markdown,
+    "durable note",
+  );
+  assert.equal(
+    (environment.idb?.read("current:alpha") as { markdown?: string } | undefined)?.markdown,
+    "durable note",
+  );
+  assert.equal(
+    JSON.parse(environment.local.getItem(pendingKey as string) ?? "null")?.markdown,
+    "inactive unsaved draft",
+  );
+});
+
+test("read-only scoped loads observe IndexedDB deletion without creating a local tombstone", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("to delete")).saved, true);
+  await deleteLocalDocument("alpha");
+  environment.local.removeItem("lab.document.deleted.v1.alpha");
+  resetLocalVaultStateForTests();
+  setLocalDocumentScope("alpha");
+
+  assert.equal(await readVerifiedLocalDocument("alpha"), null);
+  assert.equal(environment.local.getItem("lab.document.deleted.v1.alpha"), null);
 });
 
 test("deleteLocalDocument purges scoped replicas and refuses the original session", async () => {
