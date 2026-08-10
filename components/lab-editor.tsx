@@ -40,7 +40,9 @@ import {
 } from "@/lib/local-vault";
 import {
   VAULT_BACKUP_FILENAME,
+  MAX_VAULT_BACKUP_BYTES,
   exportLocalVault,
+  isValidLocalImageDataUrl,
   parseVaultBackup,
   restoreLocalVault,
   serializeVaultBackup,
@@ -438,13 +440,13 @@ function readFileAsDataURL(file: File): Promise<string> {
 function isAllowedImageSrc(src: string | null | undefined): boolean {
   if (!src) return false;
   const trimmed = src.trim();
-  if (trimmed.startsWith("data:image/")) return true;
+  if (trimmed.toLowerCase().startsWith("data:image/")) return isValidLocalImageDataUrl(trimmed);
   try {
     if (typeof window === "undefined") {
       return trimmed.startsWith("/") && !trimmed.startsWith("//");
     }
     const url = new URL(trimmed, window.location.href);
-    if (url.protocol === "data:") return url.href.startsWith("data:image/");
+    if (url.protocol === "data:") return isValidLocalImageDataUrl(url.href);
     if (url.protocol !== "http:" && url.protocol !== "https:") return false;
     return url.origin === window.location.origin;
   } catch {
@@ -1377,6 +1379,7 @@ function LabEditorSession() {
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [selected, setSelectedState] = useState(0);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
+  const [sessionTouchPromise, setSessionTouchPromise] = useState<Promise<boolean>>(() => Promise.resolve(true));
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
@@ -1401,7 +1404,16 @@ function LabEditorSession() {
         setHealth(nextHealth);
         // documentId is stable for the mount lifetime (session switches reload),
         // so capturing it here is intentional and avoids a ref.
-        if (nextHealth.saved === true) void touchDocumentSession(documentId).catch(() => undefined);
+        if (nextHealth.saved === true) {
+          setSessionTouchPromise((previous) => previous.then(async () => {
+            try {
+              await touchDocumentSession(documentId);
+              return true;
+            } catch {
+              return false;
+            }
+          }));
+        }
       },
       onNotice: setNotice,
       onStageFailure: () => setNotice("This edit could not be staged locally. Please export a copy before closing the page."),
@@ -2359,6 +2371,10 @@ function LabEditorSession() {
             setNotice("The vault could not be backed up because this note was not fully saved.");
             return;
           }
+          if (!(await sessionTouchPromise)) {
+            setNotice("The vault could not be backed up because session metadata was not fully saved.");
+            return;
+          }
           if (revisionAtRequest !== persistence.getState().editRevision) {
             setNotice("The note changed while the vault backup was being prepared. Export was cancelled.");
             return;
@@ -2501,7 +2517,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, sessionTouchPromise, setPalette, setSelected],
   );
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
@@ -2770,6 +2786,11 @@ function LabEditorSession() {
   const onVaultRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file || !editor) return;
+    if (file.size > MAX_VAULT_BACKUP_BYTES) {
+      setNotice("The selected vault backup is too large.");
+      event.target.value = "";
+      return;
+    }
     const revisionAtRequest = persistence.getState().editRevision;
     void file.text()
       .then(async (text) => {
@@ -2788,6 +2809,10 @@ function LabEditorSession() {
           setNotice("The vault could not be restored because this note was not fully saved.");
           return;
         }
+        if (!(await sessionTouchPromise)) {
+          setNotice("The vault could not be restored because session metadata was not fully saved.");
+          return;
+        }
         if (revisionAtRequest !== persistence.getState().editRevision) {
           setNotice("The note changed while the vault backup was loading. Restore was cancelled.");
           return;
@@ -2800,7 +2825,7 @@ function LabEditorSession() {
           return;
         }
         try {
-          const result = await restoreLocalVault(backup);
+          const result = await restoreLocalVault(backup, { activeDocumentId: documentId });
           if (result.activeDocumentUpdated) {
             window.location.reload();
             return;

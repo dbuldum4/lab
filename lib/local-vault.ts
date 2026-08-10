@@ -785,14 +785,18 @@ async function readOpfs(): Promise<LocalSnapshot | null> {
     const file = await handle.getFile();
     return JSON.parse(await file.text()) as LocalSnapshot;
   } catch (error) {
-    if (isNotFound(error) || error instanceof SyntaxError) return null;
+    if (isNotFound(error)) return null;
+    if (error instanceof SyntaxError) throw new Error("The browser file system contains an invalid snapshot.");
     throw error;
   }
 }
 
 async function writeOpfs(snapshot: CanonicalSnapshot) {
   const root = await opfsRoot();
-  if (!root) throw new Error("The browser file system is unavailable.");
+  // OPFS is an optional replica. An environment without the API (for example
+  // a privacy-restricted browser or the Node test runtime) is not a quota or
+  // write failure; IndexedDB/localStorage remain the durable path.
+  if (!root) return;
   const handle = await root.getFileHandle(opfsFile(), { create: true });
   const writer = await handle.createWritable();
   try {
@@ -815,8 +819,9 @@ function readLocalStorage(): LocalSnapshot | null {
   try {
     return JSON.parse(value) as LocalSnapshot;
   } catch {
-    // A malformed local copy is treated as stale and repaired from a valid replica.
-    return null;
+    // Surface corruption to strict backup callers. Normal load/reconciliation
+    // still repairs this copy when another verified replica is available.
+    throw new Error("localStorage contains an invalid snapshot.");
   }
 }
 
@@ -1226,6 +1231,20 @@ async function reconcileSnapshots(winner: CanonicalSnapshot, reads: ReadSnapshot
 
 async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<StorageHealth> {
   const reads = await readSnapshots();
+  const indexedDbAvailable = hasIndexedDb();
+  let opfsAvailable = false;
+  try {
+    opfsAvailable = Boolean(await opfsRoot());
+  } catch {
+    // An OPFS API can exist but reject access in a privacy-restricted context;
+    // classify that as an unavailable optional replica so health inspection
+    // still reports the usable authority/replicas accurately.
+    opfsAvailable = false;
+  }
+  const isOptionalReplicaUnavailable = (label: string) => (
+    (label === INDEXED_DB_TARGET.label && !indexedDbAvailable)
+    || (label === OPFS_TARGET.label && !opfsAvailable)
+  );
   const winner = selectCurrentSnapshot(
     reads.filter((read) => read.valid && read.snapshot).map((read) => read.snapshot as CanonicalSnapshot),
   );
@@ -1235,10 +1254,11 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
     : [];
   const staleErrors = winner
     ? reads
+      .filter((read) => !isOptionalReplicaUnavailable(read.target.label))
       .filter((read) => !read.error && (!read.valid || !sameSnapshot(read.snapshot, winner)))
       .map((read) => `${read.target.label} is out of sync`)
     : [];
-  const authorityErrors = isBrowserContext() && !hasIndexedDb() && !hasWebLocks()
+  const authorityErrors = isBrowserContext() && !indexedDbAvailable && !hasWebLocks()
     ? ["Cross-tab persistence requires IndexedDB or Web Locks."]
     : [];
   const pendingDocuments = readPendingDocuments();
@@ -1257,7 +1277,9 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
       ...extraErrors,
       ...authorityErrors,
       ...staleErrors,
-      ...reads.flatMap((read) => read.error ? [read.error] : []),
+      ...reads.flatMap((read) => (
+        read.error && !isOptionalReplicaUnavailable(read.target.label) ? [read.error] : []
+      )),
     ])],
   };
 }
@@ -1322,6 +1344,11 @@ export function loadLocalDocument() {
  */
 export function loadLocalDocumentForDocument(documentId: string) {
   return serializeVaultOperation(loadLocalDocumentInScope, normalizedDocumentId(documentId));
+}
+
+/** Inspect a document without changing this page's active scope. */
+export function inspectLocalStorageForDocument(documentId: string): Promise<StorageHealth> {
+  return serializeVaultOperation(inspectLocalStorageNow, normalizedDocumentId(documentId));
 }
 
 export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {

@@ -17,6 +17,12 @@ export type DocumentSession = {
   updatedAt: number;
 };
 
+export type DocumentSessionList = {
+  sessions: DocumentSession[];
+  /** False means metadata enumeration was interrupted or contained invalid rows. */
+  complete: boolean;
+};
+
 function storage(): Storage | null {
   try {
     return globalThis.localStorage;
@@ -124,6 +130,17 @@ function readSession(id: string) {
   } catch {
     return null;
   }
+}
+
+/** Strict metadata read for non-destructive restore/rollback decisions. */
+function readSessionStrict(id: string) {
+  const local = storage();
+  if (!local) throw new Error("Session metadata storage is unavailable.");
+  const raw = local.getItem(sessionKey(id));
+  if (raw === null) return null;
+  const session = parseSession(raw);
+  if (!session) throw new Error("Session metadata is invalid.");
+  return mergeActivity(local, session);
 }
 
 function writeSession(session: DocumentSession) {
@@ -278,17 +295,127 @@ export async function restoreDocumentSession(
     if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
     const created = await withSessionLock(id, () => {
       if (id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(id)) return null;
-      if (readSession(id)) return null;
-      return writeSession({
+      if (readSessionStrict(id)) return null;
+      const restored = {
         id,
         name: normalizeName(session.name),
         createdAt: Number.isFinite(session.createdAt) ? session.createdAt : 0,
         updatedAt: Number.isFinite(session.updatedAt) ? session.updatedAt : 0,
-      });
+      };
+      try {
+        return writeSession(restored);
+      } catch (error) {
+        // Some quota-like Storage implementations can throw after committing
+        // the key. Remove only the exact record this attempt intended to add.
+        try {
+          const current = readSessionStrict(id);
+          if (
+            current
+            && current.id === restored.id
+            && current.name === restored.name
+            && current.createdAt === restored.createdAt
+            && current.updatedAt === restored.updatedAt
+          ) {
+            const local = storage();
+            local?.removeItem(sessionKey(id));
+            local?.removeItem(activityKey(id));
+          }
+        } catch {
+          // The caller still receives the write failure; restore's outer
+          // cleanup will make a second, compare-and-delete attempt.
+        }
+        throw error;
+      }
     });
     if (created) return created;
   }
   throw new Error("A restored session id could not be allocated.");
+}
+
+/**
+ * Restore metadata for an existing empty session without clobbering a
+ * concurrent rename or activity update. The expected record is compared while
+ * holding the metadata lock; a mismatch makes the caller retry or abort.
+ */
+export async function restoreExistingDocumentSession(
+  session: DocumentSession,
+  expected: DocumentSession,
+): Promise<DocumentSession | null> {
+  const normalized = normalizeId(session.id);
+  await ensureDocumentNotDeleted(normalized);
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) return null;
+    const existing = readSessionStrict(normalized);
+    if (
+      !existing
+      || existing.id !== expected.id
+      || existing.name !== expected.name
+      || existing.createdAt !== expected.createdAt
+      || existing.updatedAt !== expected.updatedAt
+    ) return null;
+    const local = storage();
+    if (!local) throw new Error("Session metadata storage is unavailable.");
+    const restored = {
+      id: normalized,
+      name: normalizeName(session.name),
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+    };
+    try {
+      local.removeItem(activityKey(normalized));
+      return writeSession(restored);
+    } catch (error) {
+      // A Storage implementation can throw after committing setItem. Restore
+      // the compare-and-set input so a failed metadata update cannot leave a
+      // partially applied name/timestamp behind.
+      try {
+        const current = readSessionStrict(normalized);
+        if (
+          current
+          && current.id === restored.id
+          && current.name === restored.name
+          && current.createdAt === restored.createdAt
+          && current.updatedAt === restored.updatedAt
+        ) writeSession(expected);
+      } catch {
+        // Surface the original failure; the restore caller will report any
+        // remaining cleanup failure with the affected session id.
+      }
+      if (error instanceof Error && error.message === "Session metadata storage is unavailable.") throw error;
+      throw new Error("Session metadata could not be restored.");
+    }
+  });
+}
+
+/**
+ * Remove metadata created by a restore, but only while it still matches the
+ * record that restore wrote. This is intentionally separate from
+ * deleteDocumentSession: rollback must also be able to remove a newly-created
+ * default record, while never deleting a concurrent rename or activity update.
+ */
+export async function rollbackDocumentSessionMetadata(
+  expected: DocumentSession,
+): Promise<boolean> {
+  const normalized = normalizeId(expected.id);
+  return withSessionLock(normalized, () => {
+    const existing = readSessionStrict(normalized);
+    if (
+      !existing
+      || existing.id !== expected.id
+      || existing.name !== expected.name
+      || existing.createdAt !== expected.createdAt
+      || existing.updatedAt !== expected.updatedAt
+    ) return false;
+    const local = storage();
+    if (!local) throw new Error("Session metadata storage is unavailable.");
+    try {
+      local.removeItem(sessionKey(normalized));
+      local.removeItem(activityKey(normalized));
+      return true;
+    } catch {
+      throw new Error("Session metadata could not be rolled back.");
+    }
+  });
 }
 
 export async function renameDocumentSession(id: string, name: string) {
@@ -380,29 +507,43 @@ export async function purgeDocumentSession(id: string) {
   return deleteDocumentSession(normalized);
 }
 
-export function listDocumentSessions(): DocumentSession[] {
+export function listDocumentSessionsWithStatus(): DocumentSessionList {
   const local = storage();
   const sessions: DocumentSession[] = [];
+  let complete = Boolean(local);
   if (local) {
     try {
       for (let index = 0; index < local.length; index += 1) {
         const key = local.key(index);
         if (!key?.startsWith(SESSION_KEY_PREFIX)) continue;
-        const session = parseSession(local.getItem(key));
-        if (!session) continue;
+        const raw = local.getItem(key);
+        const session = parseSession(raw);
+        if (!session) {
+          if (raw !== null) complete = false;
+          continue;
+        }
         if (session.id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(session.id)) continue;
         sessions.push(mergeActivity(local, session));
       }
     } catch {
-      // Return any metadata that was readable before enumeration failed.
+      // Return any metadata that was readable before enumeration failed, but
+      // let strict backup callers fail closed instead of exporting a subset.
+      complete = false;
     }
   }
   if (!sessions.some((session) => session.id === DEFAULT_DOCUMENT_ID)) {
     sessions.push({ id: DEFAULT_DOCUMENT_ID, name: "Untitled", createdAt: 0, updatedAt: 0 });
   }
-  return sessions.sort((left, right) => (
-    right.updatedAt - left.updatedAt
-    || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
-    || left.id.localeCompare(right.id)
-  ));
+  return {
+    sessions: sessions.sort((left, right) => (
+      right.updatedAt - left.updatedAt
+      || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
+      || left.id.localeCompare(right.id)
+    )),
+    complete,
+  };
+}
+
+export function listDocumentSessions(): DocumentSession[] {
+  return listDocumentSessionsWithStatus().sessions;
 }

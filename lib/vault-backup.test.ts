@@ -4,6 +4,7 @@ import test, { afterEach, beforeEach } from "node:test";
 import {
   buildVaultBackup,
   exportLocalVault,
+  isValidLocalImageDataUrl,
   parseVaultBackup,
   restoreLocalVault,
   serializeVaultBackup,
@@ -11,6 +12,7 @@ import {
 import {
   isLocalDocumentDeleted,
   loadLocalDocument,
+  loadLocalDocumentForDocument,
   resetLocalVaultStateForTests,
   saveLocalDocument,
   saveLocalDocumentForDocument,
@@ -18,14 +20,23 @@ import {
 } from "./local-vault.ts";
 import {
   createDocumentSession,
+  getDocumentSession,
   purgeDocumentSession,
   type DocumentSession,
 } from "./document-sessions.ts";
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
+  throwOnLength = false;
+  throwOnGet = false;
+  throwOnSet = false;
+  throwOnDocumentSet = false;
+  throwOnDocumentId: string | null = null;
+  throwAfterSessionSet = false;
+  onGet: ((key: string) => void) | null = null;
 
   get length() {
+    if (this.throwOnLength) throw new Error("storage length unavailable");
     return this.values.size;
   }
 
@@ -34,6 +45,8 @@ class MemoryStorage implements Storage {
   }
 
   getItem(key: string) {
+    if (this.throwOnGet) throw new Error("storage read unavailable");
+    this.onGet?.(key);
     return this.values.get(key) ?? null;
   }
 
@@ -46,11 +59,21 @@ class MemoryStorage implements Storage {
   }
 
   setItem(key: string, value: string) {
+    if (
+      this.throwOnSet
+      || (this.throwOnDocumentSet && key.startsWith("lab.document."))
+      || (this.throwOnDocumentId && key === `lab.document.v2.${this.throwOnDocumentId}`)
+    ) {
+      throw new Error("storage quota exceeded");
+    }
     this.values.set(key, value);
+    if (this.throwAfterSessionSet && key.startsWith("lab.session.v1.")) {
+      throw new Error("storage quota exceeded after metadata write");
+    }
   }
 }
 
-const TEST_IMAGE = "data:image/png;base64,AAAA";
+const TEST_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 const GLOBALS = ["localStorage", "indexedDB", "window", "crypto"] as const;
 let descriptors = new Map<string, PropertyDescriptor | undefined>();
 let local: MemoryStorage;
@@ -150,4 +173,179 @@ test("restoring a tombstoned session allocates a new id without reviving the old
   assert.equal(restored.renamed, 1);
   assert.notEqual(restored.importedSessionIds[0], doomed.id);
   assert.equal(isLocalDocumentDeleted(doomed.id), true);
+});
+
+test("export fails closed when session metadata enumeration is incomplete", async () => {
+  await saveLocalDocument("do not export a partial vault");
+  local.throwOnLength = true;
+
+  await assert.rejects(
+    () => exportLocalVault(),
+    /session catalog could not be read completely/i,
+  );
+});
+
+test("export fails closed instead of turning an unreadable snapshot into blank Markdown", async () => {
+  local.setItem("lab.document.v1", "not-json");
+
+  await assert.rejects(
+    () => exportLocalVault(),
+    /could not be verified|unavailable|invalid snapshot/i,
+  );
+});
+
+test("image validation is shared, case-tolerant, and rejects forged PNG bytes", () => {
+  const uppercase = TEST_IMAGE.replace("data:image/png", "DATA:IMAGE/PNG");
+  assert.equal(isValidLocalImageDataUrl(uppercase), true);
+  const svg = `data:image/svg+xml;base64,${Buffer.from("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>").toString("base64")}`;
+  assert.equal(isValidLocalImageDataUrl(svg), true);
+  assert.equal(isValidLocalImageDataUrl("data:image/png;base64,AAAA"), false);
+
+  const backup = buildVaultBackup([{
+    ...session("default", "Untitled"),
+    markdown: `![pixel](${uppercase})`,
+  }]);
+  assert.equal(backup.assets[0]?.dataUrl, TEST_IMAGE);
+  assert.throws(() => parseVaultBackup({
+    ...backup,
+    assets: [{ id: "asset-1", dataUrl: "data:image/png;base64,AAAA", mimeType: "image/png" }],
+  }), /valid local image/i);
+});
+
+test("asset replacement ignores fenced and inline code while deduplicating real images", async () => {
+  const markdown = [
+    "```markdown",
+    `![literal](${TEST_IMAGE})`,
+    "```",
+    "",
+    `\`![inline](${TEST_IMAGE})\``,
+    "",
+    "`literal code span",
+    "![multiline literal](lab-asset://asset-1)",
+    "`",
+    "",
+    `![real](${TEST_IMAGE})`,
+  ].join("\n");
+  const backup = buildVaultBackup([{ ...session("default", "Untitled"), markdown }]);
+
+  assert.equal(backup.counts.assets, 1);
+  assert.match(backup.sessions[0]?.markdown ?? "", /```markdown\n!\[literal\]\(data:image\/png/);
+  assert.match(backup.sessions[0]?.markdown ?? "", /`!\[inline\]\(data:image\/png/);
+  assert.match(backup.sessions[0]?.markdown ?? "", /`literal code span\n!\[multiline literal\]\(lab-asset:\/\/asset-1\)\n`/);
+  assert.match(backup.sessions[0]?.markdown ?? "", /!\[real\]\(lab-asset:\/\/asset-1\)/);
+  const restored = await restoreLocalVault(backup);
+  assert.equal(restored.imported, 1);
+  assert.equal(await loadLocalDocument(), markdown);
+});
+
+test("restore rejects repeated asset expansion before allocating an oversized string", () => {
+  const backup = buildVaultBackup([{ ...session("default", "Untitled"), markdown: `![pixel](${TEST_IMAGE})` }]);
+  const repeated = Array.from({ length: 150_000 }, () => "![pixel](lab-asset://asset-1)").join("\n");
+  backup.sessions[0]!.markdown = repeated;
+
+  assert.throws(
+    () => parseVaultBackup(backup),
+    /restored Markdown is oversized|restored Markdown payload is oversized/i,
+  );
+});
+
+test("default restore preserves backup metadata while filling the empty editor session", async () => {
+  local.setItem("lab.session.v1.default", JSON.stringify({
+    id: "default",
+    name: "Untitled",
+    createdAt: 1,
+    updatedAt: 2,
+  }));
+  const source = {
+    ...session("default", "Restored home"),
+    createdAt: 111,
+    updatedAt: 222,
+    markdown: "restored default",
+  };
+
+  const result = await restoreLocalVault(buildVaultBackup([source]));
+  assert.equal(result.activeDocumentUpdated, true);
+  assert.deepEqual(await getDocumentSession("default"), {
+    id: source.id,
+    name: source.name,
+    createdAt: source.createdAt,
+    updatedAt: source.updatedAt,
+  });
+  assert.equal(await loadLocalDocument(), source.markdown);
+});
+
+test("a later restore failure rolls back an earlier default fill", async () => {
+  const originalMetadata = {
+    id: "default",
+    name: "Untitled",
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  local.setItem("lab.session.v1.default", JSON.stringify(originalMetadata));
+  local.throwOnDocumentId = "rollback-child";
+
+  await assert.rejects(
+    () => restoreLocalVault(buildVaultBackup([
+      { ...session("default", "Restored default"), markdown: "new default" },
+      { ...session("rollback-child", "Child"), markdown: "child" },
+    ])),
+    /All changes from this restore were rolled back/i,
+  );
+  assert.equal(await loadLocalDocument(), "");
+  assert.deepEqual(await getDocumentSession("default"), originalMetadata);
+  assert.equal(local.getItem("lab.session.v1.rollback-child"), null);
+});
+
+test("restore marks an active metadata-less named URL for refresh", async () => {
+  const active = session("active-session", "Active restored note");
+  const result = await restoreLocalVault(
+    buildVaultBackup([{ ...active, markdown: "active content" }]),
+    { activeDocumentId: active.id },
+  );
+
+  assert.equal(result.activeDocumentUpdated, true);
+  assert.equal(result.importedSessionIds[0], active.id);
+  assert.equal(await loadLocalDocumentForDocument(active.id), "active content");
+});
+
+test("restore reports replica failure and removes newly-created metadata", async () => {
+  const imported = session("quota-session", "Quota session");
+  local.throwOnDocumentSet = true;
+
+  await assert.rejects(
+    () => restoreLocalVault(buildVaultBackup([{ ...imported, markdown: "must not orphan" }])),
+    /incomplete redundant storage|not durably saved/i,
+  );
+  assert.equal(local.getItem(`lab.session.v1.${imported.id}`), null);
+});
+
+test("metadata write failures after commit do not leave a restore orphan", async () => {
+  const imported = session("metadata-partial", "Metadata partial");
+  local.throwAfterSessionSet = true;
+
+  await assert.rejects(
+    () => restoreLocalVault(buildVaultBackup([{ ...imported, markdown: "content" }])),
+    /could not allocate|quota|restore session/i,
+  );
+  assert.equal(local.getItem(`lab.session.v1.${imported.id}`), null);
+});
+
+test("export rejects a session catalog mutation from another tab", async () => {
+  await saveLocalDocument("initial");
+  let injected = false;
+  local.onGet = (key) => {
+    if (injected || key !== "lab.document.v1") return;
+    injected = true;
+    local.setItem("lab.session.v1.raced", JSON.stringify({
+      id: "raced",
+      name: "Raced session",
+      createdAt: 3,
+      updatedAt: 4,
+    }));
+  };
+
+  await assert.rejects(
+    () => exportLocalVault(),
+    /session catalog changed/i,
+  );
 });
