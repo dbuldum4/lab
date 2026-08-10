@@ -2,14 +2,15 @@ import {
   DEFAULT_DOCUMENT_ID,
   inspectLocalStorageForDocument,
   isLocalDocumentDeleted,
+  deleteLocalDocumentIfMatches,
   loadLocalDocumentForDocument,
   saveLocalDocumentForDocument,
+  saveLocalDocumentForDocumentIfMatches,
   type StorageHealth,
 } from "./local-vault.ts";
 import {
   getDocumentSession,
   listDocumentSessionsWithStatus,
-  purgeDocumentSession,
   restoreExistingDocumentSession,
   restoreDocumentSession,
   rollbackDocumentSessionMetadata,
@@ -626,7 +627,7 @@ export async function restoreLocalVault(
     activeDocumentUpdated: false,
   };
 
-  const createdSessions: Array<{ metadata: DocumentSession; markdown: string }> = [];
+  const createdSessions: Array<{ metadata: DocumentSession; markdown: string; contentCommitted: boolean }> = [];
   let filledDefault: {
     originalMetadata: DocumentSession;
     originalMarkdown: string;
@@ -636,22 +637,36 @@ export async function restoreLocalVault(
   let failedSessionId = "unknown";
 
   const cleanupCreatedSession = async (
-    record: { metadata: DocumentSession; markdown: string },
+    record: { metadata: DocumentSession; markdown: string; contentCommitted: boolean },
   ) => {
     const errors: string[] = [];
     try {
-      if (record.metadata.id !== DEFAULT_DOCUMENT_ID) {
-        await purgeDocumentSession(record.metadata.id);
-        return errors;
-      }
+      const removed = await rollbackDocumentSessionMetadata(
+        record.metadata,
+        async () => {
+          if (!record.contentCommitted) {
+            // The authority rejected the restore write, so there is no restore
+            // content to purge. Preserve any peer content; metadata itself is
+            // still removed only if it exactly matches our allocation.
+            return true;
+          }
+          if (record.metadata.id !== DEFAULT_DOCUMENT_ID) {
+            return deleteLocalDocumentIfMatches(record.metadata.id, record.markdown);
+          }
+          const compared = await saveLocalDocumentForDocumentIfMatches(
+            DEFAULT_DOCUMENT_ID,
+            record.markdown,
+            "",
+          );
+          if (!compared.matched) return false;
+          const failure = compared.health && storageHealthFailure(DEFAULT_DOCUMENT_ID, compared.health);
+          if (failure) throw failure;
+          return true;
+        },
+      );
+      if (!removed) errors.push(`${record.metadata.id} content or metadata changed before cleanup`);
     } catch (error) {
-      errors.push(`${record.metadata.id} content cleanup failed: ${String(error)}`);
-    }
-    try {
-      const removed = await rollbackDocumentSessionMetadata(record.metadata);
-      if (!removed) errors.push(`${record.metadata.id} metadata changed before cleanup`);
-    } catch (error) {
-      errors.push(`${record.metadata.id} metadata cleanup failed: ${String(error)}`);
+      errors.push(`${record.metadata.id} coordinated cleanup failed: ${String(error)}`);
     }
     return errors;
   };
@@ -660,33 +675,27 @@ export async function restoreLocalVault(
     if (!filledDefault) return [] as string[];
     const errors: string[] = [];
     try {
-      const currentMetadata = await getDocumentSession(DEFAULT_DOCUMENT_ID);
-      const currentMarkdown = await loadLocalDocumentForDocument(DEFAULT_DOCUMENT_ID);
-      const metadataWasRestored = sameSessionMetadata(currentMetadata, {
-        ...filledDefault.restoredMetadata,
-        markdown: "",
-      });
-      const metadataWasOriginal = sameSessionMetadata(currentMetadata, {
-        ...filledDefault.originalMetadata,
-        markdown: "",
-      });
-      if ((!metadataWasRestored && !metadataWasOriginal) || currentMarkdown !== filledDefault.restoredMarkdown) {
-        errors.push("default session changed before rollback");
-        return errors;
-      }
-      const health = await saveLocalDocumentForDocument(DEFAULT_DOCUMENT_ID, filledDefault.originalMarkdown);
-      const failure = storageHealthFailure(DEFAULT_DOCUMENT_ID, health);
-      if (failure) {
-        errors.push(`default content rollback failed: ${failure.message}`);
-        return errors;
-      }
-      if (metadataWasRestored) {
-        const restored = await restoreExistingDocumentSession(
-          filledDefault.originalMetadata,
-          filledDefault.restoredMetadata,
+      const rollbackContent = async () => {
+        const compared = await saveLocalDocumentForDocumentIfMatches(
+          DEFAULT_DOCUMENT_ID,
+          filledDefault!.restoredMarkdown,
+          filledDefault!.originalMarkdown,
         );
-        if (!restored) errors.push("default metadata changed before rollback");
-      }
+        if (!compared.matched) return false;
+        const failure = compared.health && storageHealthFailure(DEFAULT_DOCUMENT_ID, compared.health);
+        if (failure) throw failure;
+        return true;
+      };
+      const restored = await restoreExistingDocumentSession(
+        filledDefault.originalMetadata,
+        filledDefault.restoredMetadata,
+        rollbackContent,
+      ) ?? await restoreExistingDocumentSession(
+        filledDefault.originalMetadata,
+        filledDefault.originalMetadata,
+        rollbackContent,
+      );
+      if (!restored) errors.push("default content or metadata changed before rollback");
     } catch (error) {
       errors.push(`default rollback failed: ${String(error)}`);
     }
@@ -731,24 +740,40 @@ export async function restoreLocalVault(
           restoredMarkdown: markdown,
           restoredMetadata: session,
         };
-        const health = await saveLocalDocumentForDocument(DEFAULT_DOCUMENT_ID, markdown);
-        const failure = storageHealthFailure(session.id, health);
-        if (failure) throw failure;
-        const restoredMetadata = await restoreExistingDocumentSession(session, existingMetadata);
-        if (!restoredMetadata) throw new Error("the default session metadata changed while it was being restored");
-        result.imported += 1;
-        result.importedSessionIds.push(DEFAULT_DOCUMENT_ID);
-        result.activeDocumentUpdated = activeDocumentId === DEFAULT_DOCUMENT_ID;
-        continue;
+        const restoredMetadata = await restoreExistingDocumentSession(
+          session,
+          existingMetadata,
+          async () => {
+            const compared = await saveLocalDocumentForDocumentIfMatches(DEFAULT_DOCUMENT_ID, "", markdown);
+            if (!compared.matched) return false;
+            const failure = compared.health && storageHealthFailure(session.id, compared.health);
+            if (failure) throw failure;
+            return true;
+          },
+        );
+        if (!restoredMetadata) {
+          filledDefault = null;
+          // The empty snapshot or its metadata lost the CAS. Import safely under
+          // a fresh id rather than overwriting the peer edit.
+        } else {
+          result.imported += 1;
+          result.importedSessionIds.push(DEFAULT_DOCUMENT_ID);
+          result.activeDocumentUpdated = activeDocumentId === DEFAULT_DOCUMENT_ID;
+          continue;
+        }
       }
 
       // A null preferred id skips the backup id entirely. This matters when a
       // corrupt/orphaned content replica exists without readable metadata.
       const preferredId = existingMetadata || existingMarkdown || tombstoned ? null : session.id;
       const imported = await restoreDocumentSession(session, preferredId);
-      const record = { metadata: imported, markdown };
+      const record = { metadata: imported, markdown, contentCommitted: false };
       createdSessions.push(record);
       const health: StorageHealth = await saveLocalDocumentForDocument(imported.id, markdown);
+      const currentMarkdown = await loadLocalDocumentForDocument(imported.id);
+      // No readable copy means the failed write left metadata only. Any
+      // readable differing copy may be a peer edit and must go through CAS.
+      record.contentCommitted = currentMarkdown === markdown || health.copies > 0;
       const failure = storageHealthFailure(imported.id, health);
       if (failure) throw failure;
 

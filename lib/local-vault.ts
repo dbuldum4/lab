@@ -77,6 +77,11 @@ type AuthorityCommitResult = {
   rejectedBecauseDeleted?: boolean;
 };
 
+export type LocalDocumentCompareSaveResult = {
+  matched: boolean;
+  health?: StorageHealth;
+};
+
 type DeletedRecord = {
   recordVersion: 1;
   deletedAt: number;
@@ -713,6 +718,91 @@ async function commitIndexedDb(candidate: CanonicalSnapshot): Promise<AuthorityC
     if (result) return result;
   }
   throw new Error("IndexedDB authority changed during commit.");
+}
+
+/** Commit only if the exact authenticated authority snapshot is still current. */
+async function commitIndexedDbIfSnapshot(
+  expected: CanonicalSnapshot | null,
+  candidate: CanonicalSnapshot,
+): Promise<AuthorityCommitResult | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const observed = await readIndexedDbRawState();
+    if (isDeletedRecord(observed.deleted)) return null;
+    const authority = authorityRecord(observed.authority);
+    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
+      normalizeSnapshot(authority?.snapshot),
+      normalizeSnapshot(observed.current),
+    ]);
+    const existing = selectCurrentSnapshot(
+      [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
+    ) as CanonicalSnapshot | null;
+    if ((expected || existing) && !sameSnapshot(expected, existing)) return null;
+    const revision = authority?.revision ?? (existing ? 1 : 0);
+    const result = await commitIndexedDbOnce(candidate, observed, existing, revision, false);
+    if (result) return result;
+  }
+  throw new Error("IndexedDB authority changed repeatedly during compare-and-save.");
+}
+
+/** Delete authority/current only if the exact authenticated snapshot remains current. */
+async function commitIndexedDbDeletionIfSnapshot(
+  documentId: string,
+  expected: CanonicalSnapshot,
+  deletedAt: number,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const observed = await readIndexedDbRawState();
+    if (isDeletedRecord(observed.deleted)) return false;
+    const authority = authorityRecord(observed.authority);
+    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
+      normalizeSnapshot(authority?.snapshot),
+      normalizeSnapshot(observed.current),
+    ]);
+    const existing = selectCurrentSnapshot(
+      [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
+    ) as CanonicalSnapshot | null;
+    if (!sameSnapshot(existing, expected)) return false;
+
+    const db = await openDatabase();
+    try {
+      const result = await new Promise<boolean | null>((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, "readwrite");
+        const store = transaction.objectStore(STORE_NAME);
+        let authorityRaw: unknown;
+        let currentRaw: unknown;
+        let deletedRaw: unknown;
+        let completed = 0;
+        let decision: boolean | null = null;
+        const decide = () => {
+          completed += 1;
+          if (completed !== 3) return;
+          if (!sameRawValue(authorityRaw, observed.authority)
+            || !sameRawValue(currentRaw, observed.current)
+            || !sameRawValue(deletedRaw, observed.deleted)) return;
+          store.put({ recordVersion: 1, deletedAt } satisfies DeletedRecord, deletedIdbKey(documentId));
+          store.delete(authorityKeyFor(documentId));
+          store.delete(currentKeyFor(documentId));
+          decision = true;
+        };
+        for (const [key, assign] of [
+          [authorityKeyFor(documentId), (value: unknown) => { authorityRaw = value; }],
+          [currentKeyFor(documentId), (value: unknown) => { currentRaw = value; }],
+          [deletedIdbKey(documentId), (value: unknown) => { deletedRaw = value; }],
+        ] as const) {
+          const request = store.get(key);
+          request.onsuccess = () => { assign(request.result); decide(); };
+          request.onerror = () => reject(request.error ?? new Error("Could not compare IndexedDB authority."));
+        }
+        transaction.oncomplete = () => resolve(decision);
+        transaction.onerror = () => reject(transaction.error ?? new Error("Could not delete IndexedDB authority."));
+        transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB compare-and-delete was aborted."));
+      });
+      if (result !== null) return result;
+    } finally {
+      db.close();
+    }
+  }
+  throw new Error("IndexedDB authority changed repeatedly during compare-and-delete.");
 }
 
 /**
@@ -1490,6 +1580,55 @@ export function saveLocalDocumentForDocument(documentId: string, markdown: strin
   return serializeVaultOperation(() => saveLocalDocumentInScope(markdown), normalizedDocumentId(documentId));
 }
 
+/**
+ * Replace a document only while its exact authenticated authority snapshot is
+ * still the expected Markdown. The IndexedDB compare and commit share one
+ * observed revision; Web Locks provide the equivalent fallback barrier.
+ */
+export function saveLocalDocumentForDocumentIfMatches(
+  documentId: string,
+  expectedMarkdown: string,
+  markdown: string,
+): Promise<LocalDocumentCompareSaveResult> {
+  const normalized = normalizedDocumentId(documentId);
+  return serializeVaultOperation(async () => {
+    if (await refreshDeletedFromIndexedDb()) return { matched: false };
+    const reads = await readSnapshots();
+    const expected = selectCurrentSnapshot(
+      reads.filter((read) => read.valid && read.snapshot).map((read) => read.snapshot as CanonicalSnapshot),
+    ) as CanonicalSnapshot | null;
+    if ((expected?.markdown ?? "") !== expectedMarkdown) return { matched: false };
+
+    const candidate = await makeSnapshot(markdown, issueTimestamp());
+    let authoritativeWinner = candidate;
+    if (hasIndexedDb()) {
+      const committed = await commitIndexedDbIfSnapshot(expected, candidate);
+      if (!committed?.accepted) return { matched: false };
+      const verified = await normalizeSnapshot(committed.rawSnapshot);
+      if (!verified || !sameSnapshot(verified, candidate)) return { matched: false };
+      authoritativeWinner = verified;
+    } else if (!hasWebLocks() && isBrowserContext()) {
+      throw new Error("Cross-tab persistence requires IndexedDB or Web Locks.");
+    }
+
+    const writes = await Promise.allSettled(
+      REPLICA_TARGETS.map((target) => writeReplicaIfCurrent(target, authoritativeWinner)),
+    );
+    const writeErrors = writes.flatMap((write, index) => write.status === "rejected"
+      ? [`${REPLICA_TARGETS[index].label} could not be updated`]
+      : []);
+    if (hasIndexedDb()) {
+      const finalAuthority = await normalizeSnapshot(await readIndexedDb());
+      if (!sameSnapshot(finalAuthority, authoritativeWinner)) return { matched: false };
+    }
+    const health = await inspectLocalStorageNow(writeErrors);
+    const saved = hasIndexedDb()
+      ? true
+      : writes.some((write) => write.status === "fulfilled" && write.value);
+    return { matched: true, health: { ...health, saved } };
+  }, normalized);
+}
+
 export async function requestPersistentStorage() {
   try {
     const storage = typeof navigator === "undefined" ? undefined : navigator.storage;
@@ -1577,6 +1716,49 @@ export async function deleteLocalDocument(documentId: string) {
       if (!durableMarkerWritten) clearLocalTombstone(normalized);
       throw error;
     }
+  }, normalized);
+}
+
+/**
+ * Remove a non-default document only if its exact authenticated content is
+ * unchanged. Callers coordinate metadata by holding its compare lock around
+ * this operation; a peer content save makes this return false without purging.
+ */
+export async function deleteLocalDocumentIfMatches(documentId: string, expectedMarkdown: string) {
+  const normalized = normalizedDocumentId(documentId);
+  if (normalized === DEFAULT_DOCUMENT_ID) throw new Error("The original session cannot be deleted.");
+
+  return serializeVaultOperation(async () => {
+    if (await refreshDeletedFromIndexedDb()) return false;
+    const reads = await readSnapshots();
+    const expected = selectCurrentSnapshot(
+      reads.filter((read) => read.valid && read.snapshot).map((read) => read.snapshot as CanonicalSnapshot),
+    ) as CanonicalSnapshot | null;
+    if (!expected || expected.markdown !== expectedMarkdown) return false;
+    const deletedAt = Date.now();
+
+    if (hasIndexedDb()) {
+      if (!await commitIndexedDbDeletionIfSnapshot(normalized, expected, deletedAt)) return false;
+      writeLocalTombstone(normalized, deletedAt);
+    } else {
+      if (!hasWebLocks() && isBrowserContext()) {
+        throw new Error("Cross-tab persistence requires IndexedDB or Web Locks.");
+      }
+      if (!writeLocalTombstone(normalized, deletedAt)) {
+        clearLocalTombstone(normalized);
+        throw new Error("Could not record a local deletion marker for this session.");
+      }
+    }
+
+    try {
+      purgeLocalReplicas();
+      await purgeOpfsReplica();
+    } catch (error) {
+      // Once the authority tombstone is committed, residue is unreachable and
+      // must not be mistaken for permission to remove changed metadata.
+      throw new Error(`Could not purge matched local replicas: ${String(error)}`);
+    }
+    return true;
   }, normalized);
 }
 

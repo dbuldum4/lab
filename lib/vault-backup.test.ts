@@ -10,6 +10,7 @@ import {
   serializeVaultBackup,
 } from "./vault-backup.ts";
 import {
+  DEFAULT_DOCUMENT_ID,
   isLocalDocumentDeleted,
   loadLocalDocument,
   loadLocalDocumentForDocument,
@@ -34,6 +35,7 @@ class MemoryStorage implements Storage {
   throwOnDocumentId: string | null = null;
   throwAfterSessionSet = false;
   onGet: ((key: string) => void) | null = null;
+  onSetAttempt: ((key: string, value: string) => void) | null = null;
 
   get length() {
     if (this.throwOnLength) throw new Error("storage length unavailable");
@@ -59,6 +61,7 @@ class MemoryStorage implements Storage {
   }
 
   setItem(key: string, value: string) {
+    this.onSetAttempt?.(key, value);
     if (
       this.throwOnSet
       || (this.throwOnDocumentSet && key.startsWith("lab.document."))
@@ -274,6 +277,34 @@ test("default restore preserves backup metadata while filling the empty editor s
   assert.equal(await loadLocalDocument(), source.markdown);
 });
 
+test("default fill CAS preserves a peer save and imports the backup under a fresh id", async () => {
+  await saveLocalDocument("peer edit");
+  const peerSnapshot = local.getItem("lab.document.v1");
+  assert.ok(peerSnapshot);
+  local.removeItem("lab.document.v1");
+  local.setItem("lab.session.v1.default", JSON.stringify({
+    id: "default",
+    name: "Untitled",
+    createdAt: 1,
+    updatedAt: 2,
+  }));
+  let metadataReads = 0;
+  local.onGet = (key) => {
+    if (key !== "lab.session.v1.default" || ++metadataReads !== 2) return;
+    local.setItem("lab.document.v1", peerSnapshot);
+  };
+
+  const result = await restoreLocalVault(buildVaultBackup([{
+    ...session("default", "Backup home"),
+    markdown: "backup content",
+  }]));
+
+  assert.equal(await loadLocalDocument(), "peer edit");
+  assert.equal(result.imported, 1);
+  assert.notEqual(result.importedSessionIds[0], DEFAULT_DOCUMENT_ID);
+  assert.equal(await loadLocalDocumentForDocument(result.importedSessionIds[0]!), "backup content");
+});
+
 test("a later restore failure rolls back an earlier default fill", async () => {
   const originalMetadata = {
     id: "default",
@@ -294,6 +325,60 @@ test("a later restore failure rolls back an earlier default fill", async () => {
   assert.equal(await loadLocalDocument(), "");
   assert.deepEqual(await getDocumentSession("default"), originalMetadata);
   assert.equal(local.getItem("lab.session.v1.rollback-child"), null);
+});
+
+test("rollback preserves a concurrently renamed imported session and reports incomplete cleanup", async () => {
+  local.throwOnDocumentId = "z-failure";
+  let changed = false;
+  local.onSetAttempt = (key) => {
+    if (changed || key !== "lab.document.v2.z-failure") return;
+    changed = true;
+    local.setItem("lab.session.v1.a-imported", JSON.stringify({
+      id: "a-imported",
+      name: "Peer rename",
+      createdAt: 10,
+      updatedAt: 21,
+    }));
+  };
+
+  await assert.rejects(
+    () => restoreLocalVault(buildVaultBackup([
+      { ...session("a-imported", "Imported"), markdown: "restored content" },
+      { ...session("z-failure", "Failure"), markdown: "cannot save" },
+    ])),
+    /Cleanup was incomplete.*a-imported content or metadata changed/i,
+  );
+  assert.deepEqual(await getDocumentSession("a-imported"), {
+    id: "a-imported",
+    name: "Peer rename",
+    createdAt: 10,
+    updatedAt: 21,
+  });
+  assert.equal(await loadLocalDocumentForDocument("a-imported"), "restored content");
+});
+
+test("rollback compare-and-delete preserves concurrently edited imported content", async () => {
+  await saveLocalDocumentForDocument("a-imported", "peer content");
+  const peerSnapshot = local.getItem("lab.document.v2.a-imported");
+  assert.ok(peerSnapshot);
+  local.removeItem("lab.document.v2.a-imported");
+  local.throwOnDocumentId = "z-failure";
+  let changed = false;
+  local.onSetAttempt = (key) => {
+    if (changed || key !== "lab.document.v2.z-failure") return;
+    changed = true;
+    local.setItem("lab.document.v2.a-imported", peerSnapshot);
+  };
+
+  await assert.rejects(
+    () => restoreLocalVault(buildVaultBackup([
+      { ...session("a-imported", "Imported"), markdown: "restored content" },
+      { ...session("z-failure", "Failure"), markdown: "cannot save" },
+    ])),
+    /Cleanup was incomplete.*a-imported content or metadata changed/i,
+  );
+  assert.deepEqual(await getDocumentSession("a-imported"), session("a-imported", "Imported"));
+  assert.equal(await loadLocalDocumentForDocument("a-imported"), "peer content");
 });
 
 test("restore marks an active metadata-less named URL for refresh", async () => {

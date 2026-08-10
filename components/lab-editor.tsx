@@ -47,6 +47,7 @@ import {
   restoreLocalVault,
   serializeVaultBackup,
 } from "@/lib/vault-backup";
+import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
   clearInvalidDocumentSessionHash,
@@ -1379,7 +1380,10 @@ function LabEditorSession() {
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [selected, setSelectedState] = useState(0);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
-  const [sessionTouchPromise, setSessionTouchPromise] = useState<Promise<boolean>>(() => Promise.resolve(true));
+  // This chain must be observable synchronously. A successful flush calls
+  // onHealth before its promise resolves; React state would leave /backup and
+  // /restore awaiting the render-time (stale) chain instead of that new touch.
+  const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
@@ -1405,14 +1409,7 @@ function LabEditorSession() {
         // documentId is stable for the mount lifetime (session switches reload),
         // so capturing it here is intentional and avoids a ref.
         if (nextHealth.saved === true) {
-          setSessionTouchPromise((previous) => previous.then(async () => {
-            try {
-              await touchDocumentSession(documentId);
-              return true;
-            } catch {
-              return false;
-            }
-          }));
+          sessionTouchBarrier.enqueue(() => touchDocumentSession(documentId).then(() => undefined));
         }
       },
       onNotice: setNotice,
@@ -2371,7 +2368,7 @@ function LabEditorSession() {
             setNotice("The vault could not be backed up because this note was not fully saved.");
             return;
           }
-          if (!(await sessionTouchPromise)) {
+          if (!(await sessionTouchBarrier.wait())) {
             setNotice("The vault could not be backed up because session metadata was not fully saved.");
             return;
           }
@@ -2517,7 +2514,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, sessionTouchPromise, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, sessionTouchBarrier, setPalette, setSelected],
   );
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
@@ -2809,7 +2806,7 @@ function LabEditorSession() {
           setNotice("The vault could not be restored because this note was not fully saved.");
           return;
         }
-        if (!(await sessionTouchPromise)) {
+        if (!(await sessionTouchBarrier.wait())) {
           setNotice("The vault could not be restored because session metadata was not fully saved.");
           return;
         }

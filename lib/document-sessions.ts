@@ -340,10 +340,11 @@ export async function restoreDocumentSession(
 export async function restoreExistingDocumentSession(
   session: DocumentSession,
   expected: DocumentSession,
+  mutateContent: () => Promise<boolean> = async () => true,
 ): Promise<DocumentSession | null> {
   const normalized = normalizeId(session.id);
   await ensureDocumentNotDeleted(normalized);
-  return withSessionLock(normalized, () => {
+  return withSessionLock(normalized, async () => {
     if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) return null;
     const existing = readSessionStrict(normalized);
     if (
@@ -362,6 +363,7 @@ export async function restoreExistingDocumentSession(
       updatedAt: session.updatedAt,
     };
     try {
+      if (!await mutateContent()) return null;
       local.removeItem(activityKey(normalized));
       return writeSession(restored);
     } catch (error) {
@@ -395,9 +397,10 @@ export async function restoreExistingDocumentSession(
  */
 export async function rollbackDocumentSessionMetadata(
   expected: DocumentSession,
+  cleanupContent: () => Promise<boolean> = async () => true,
 ): Promise<boolean> {
   const normalized = normalizeId(expected.id);
-  return withSessionLock(normalized, () => {
+  return withSessionLock(normalized, async () => {
     const existing = readSessionStrict(normalized);
     if (
       !existing
@@ -409,6 +412,7 @@ export async function rollbackDocumentSessionMetadata(
     const local = storage();
     if (!local) throw new Error("Session metadata storage is unavailable.");
     try {
+      if (!await cleanupContent()) return false;
       local.removeItem(sessionKey(normalized));
       local.removeItem(activityKey(normalized));
       return true;
