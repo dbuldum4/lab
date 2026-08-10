@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { activeOutlineIndex, buildOutline } from "./outline.ts";
+import { activeOutlineIndex, areOutlineItemsEqual, buildOutline } from "./outline.ts";
 
 test("buildOutline preserves heading hierarchy and normalizes labels", () => {
   const outline = buildOutline([
@@ -29,4 +29,27 @@ test("activeOutlineIndex tracks the last heading before the cursor", () => {
   assert.equal(activeOutlineIndex(outline, 4), 0);
   assert.equal(activeOutlineIndex(outline, 31), 1);
   assert.equal(activeOutlineIndex(outline, 80), 2);
+});
+
+test("areOutlineItemsEqual allows cached outline arrays to be reused", () => {
+  const outline = buildOutline([
+    { level: 1, title: "First", position: 4 },
+    { level: 2, title: "Second", position: 18 },
+  ]);
+
+  assert.equal(areOutlineItemsEqual(outline, outline.map((item) => ({ ...item }))), true);
+  assert.equal(
+    areOutlineItemsEqual(outline, buildOutline([
+      { level: 1, title: "First", position: 4 },
+      { level: 2, title: "Changed", position: 18 },
+    ])),
+    false,
+  );
+  assert.equal(
+    areOutlineItemsEqual(outline, buildOutline([
+      { level: 1, title: "First", position: 4 },
+      { level: 2, title: "Second", position: 19 },
+    ])),
+    false,
+  );
 });

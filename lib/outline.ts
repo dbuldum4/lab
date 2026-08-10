@@ -30,6 +30,18 @@ export function buildOutline(headings: readonly OutlineHeadingInput[]): OutlineI
   }));
 }
 
+export function areOutlineItemsEqual(left: readonly OutlineItem[], right: readonly OutlineItem[]) {
+  if (left.length !== right.length) return false;
+  return left.every((item, index) => {
+    const other = right[index];
+    return item.id === other.id
+      && item.level === other.level
+      && item.title === other.title
+      && item.position === other.position
+      && item.depth === other.depth;
+  });
+}
+
 export function activeOutlineIndex(items: readonly OutlineItem[], position: number) {
   let active = -1;
   for (let index = 0; index < items.length; index += 1) {

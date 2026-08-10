@@ -54,6 +54,7 @@ import {
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
 import {
   activeOutlineIndex,
+  areOutlineItemsEqual,
   buildOutline,
   type HeadingLevel,
   type OutlineItem,
@@ -1377,6 +1378,7 @@ function LabEditorSession() {
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
+  const outlineItemsRef = useRef<OutlineItem[]>([]);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
@@ -1437,17 +1439,30 @@ function LabEditorSession() {
     setOutlineOpenState(value);
   }, []);
 
-  const syncOutline = useCallback((instance: Editor) => {
-    const nextItems = outlineFromEditor(instance);
-    const nextActiveIndex = activeOutlineIndex(nextItems, instance.state.selection.from);
-    const nextActiveId = nextItems[nextActiveIndex]?.id ?? null;
-    setOutlineItemsState(nextItems);
-    setActiveOutlineIdState(nextActiveId);
+  const syncOutlineActive = useCallback((instance: Editor) => {
+    const items = outlineItemsRef.current;
+    const nextActiveIndex = activeOutlineIndex(items, instance.state.selection.from);
+    const nextActiveId = items[nextActiveIndex]?.id ?? null;
+    setActiveOutlineIdState((current) => current === nextActiveId ? current : nextActiveId);
   }, []);
 
+  const syncOutlineItems = useCallback((instance: Editor) => {
+    const nextItems = outlineFromEditor(instance);
+    if (!areOutlineItemsEqual(outlineItemsRef.current, nextItems)) {
+      outlineItemsRef.current = nextItems;
+      setOutlineItemsState(nextItems);
+    }
+    syncOutlineActive(instance);
+  }, [syncOutlineActive]);
+
   const toggleOutline = useCallback(() => {
-    setOutlineOpen(!outlineOpenRef.current);
-  }, [setOutlineOpen]);
+    const nextOpen = !outlineOpenRef.current;
+    if (nextOpen) {
+      const instance = editorRef.current;
+      if (instance && !instance.isDestroyed) syncOutlineItems(instance);
+    }
+    setOutlineOpen(nextOpen);
+  }, [setOutlineOpen, syncOutlineItems]);
 
   const closeOutline = useCallback((focusEditor = true) => {
     setOutlineOpen(false);
@@ -1725,15 +1740,18 @@ function LabEditorSession() {
   }, [setPalette]);
 
   const syncInterface = useCallback(
-    (instance: Editor) => {
+    (instance: Editor, refreshOutline = false) => {
       requestAnimationFrame(() => positionCaret(instance));
-      syncOutline(instance);
+      if (outlineOpenRef.current) {
+        if (refreshOutline) syncOutlineItems(instance);
+        else syncOutlineActive(instance);
+      }
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
       setSelected(0);
     },
-    [findSlash, positionCaret, setPalette, setSelected, syncOutline],
+    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive, syncOutlineItems],
   );
 
   const editor = useEditor({
@@ -2128,7 +2146,7 @@ function LabEditorSession() {
     },
     onUpdate: ({ editor: instance }) => {
       if (migrateInlineMath(instance)) return;
-      syncInterface(instance);
+      syncInterface(instance, true);
       persistence.onEdit(instance.getMarkdown());
     },
     onSelectionUpdate: ({ editor: instance }) => syncInterface(instance),
@@ -2523,7 +2541,7 @@ function LabEditorSession() {
     if (!instance || instance.isDestroyed) return;
     const node = instance.state.doc.nodeAt(item.position);
     if (!node || node.type.name !== "heading") {
-      syncOutline(instance);
+      syncOutlineItems(instance);
       return;
     }
 
@@ -2532,9 +2550,9 @@ function LabEditorSession() {
     setActiveOutlineIdState(item.id);
 
     if (window.matchMedia("(max-width: 640px)").matches) {
-      closeOutline(false);
+      closeOutline();
     }
-  }, [closeOutline, syncOutline]);
+  }, [closeOutline, syncOutlineItems]);
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
   // run before the passive hydration effect, so the persistence controller's

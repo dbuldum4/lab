@@ -63,6 +63,12 @@ test("outline visibility is local to the current page and stays inside a narrow 
   expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(390);
   expect(await outline.evaluate((element) => getComputedStyle(element).position)).toBe("fixed");
 
+  const subsection = outline.getByRole("button", { name: "A subsection", exact: true });
+  await subsection.focus();
+  await subsection.press("Enter");
+  await expect(outline).toBeHidden();
+  await expect(editor).toBeFocused();
+
   await page.reload();
   await openEditor(page);
   await expect(page.getByTestId("document-outline")).toBeHidden();
