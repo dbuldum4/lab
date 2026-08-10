@@ -23,7 +23,7 @@ import StarterKit from "@tiptap/starter-kit";
 import { BorderBeam } from "border-beam";
 import katex from "katex";
 import { LayoutGroup, motion, type Transition } from "motion/react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import {
   createEditorPersistenceController,
   type EditorPersistenceController,
@@ -33,6 +33,7 @@ import {
   inspectLocalStorage,
   isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
+  readVerifiedLocalDocument,
   requestPersistentStorage,
   setLocalDocumentScope,
   type LocalRecoveryDraft,
@@ -61,10 +62,24 @@ import {
   touchDocumentSession,
   type DocumentSession,
 } from "@/lib/document-sessions";
+import {
+  normalizeSearchQuery,
+  searchableMarkdown,
+  searchLocalDocuments,
+  type LocalSearchDocument,
+  type LocalSearchResult,
+} from "@/lib/local-search";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import {
+  activeOutlineIndex,
+  areOutlineItemsEqual,
+  buildOutline,
+  type HeadingLevel,
+  type OutlineItem,
+} from "@/lib/outline";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions" | "search";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -149,6 +164,7 @@ const COMMANDS: Command[] = [
   { id: "h1", label: "Heading 1", detail: "Large section title", terms: "title h1" },
   { id: "h2", label: "Heading 2", detail: "Medium section title", terms: "subtitle h2" },
   { id: "h3", label: "Heading 3", detail: "Small section title", terms: "subtitle h3" },
+  { id: "outline", label: "Outline", detail: "Toggle document headings", terms: "toc table of contents navigation sidebar" },
   { id: "bullet", label: "Bulleted list", detail: "Create an unordered list", terms: "ul list bullets" },
   { id: "number", label: "Numbered list", detail: "Create an ordered list", terms: "ol list numbers" },
   { id: "todo", label: "To-do list", detail: "Create a checklist", terms: "task check checkbox" },
@@ -170,6 +186,7 @@ const COMMANDS: Command[] = [
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
+  { id: "search", label: "Search notes", detail: "Find across local sessions", terms: "find search notes text content sessions" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
@@ -258,6 +275,21 @@ function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
 }
 
+function outlineFromEditor(instance: Editor): OutlineItem[] {
+  const headings: Array<{ level: HeadingLevel; title: string; position: number }> = [];
+  instance.state.doc.descendants((node, position) => {
+    if (node.type.name !== "heading") return;
+    const level = Number(node.attrs.level);
+    if (level !== 1 && level !== 2 && level !== 3) return;
+    headings.push({
+      level,
+      title: node.textContent,
+      position,
+    });
+  });
+  return buildOutline(headings);
+}
+
 /** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
 function previousGraphemeIndex(text: string, index: number) {
   if (index <= 0) return 0;
@@ -323,6 +355,7 @@ function useIsClient() {
 }
 
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+const MOBILE_OUTLINE_QUERY = "(max-width: 640px)";
 
 function subscribeToReducedMotion(callback: () => void) {
   const mediaQuery = window.matchMedia(REDUCED_MOTION_QUERY);
@@ -335,6 +368,20 @@ function usePrefersReducedMotion() {
     subscribeToReducedMotion,
     () => window.matchMedia(REDUCED_MOTION_QUERY).matches,
     () => true,
+  );
+}
+
+function subscribeToMobileOutline(callback: () => void) {
+  const mediaQuery = window.matchMedia(MOBILE_OUTLINE_QUERY);
+  mediaQuery.addEventListener("change", callback);
+  return () => mediaQuery.removeEventListener("change", callback);
+}
+
+function useMobileOutline() {
+  return useSyncExternalStore(
+    subscribeToMobileOutline,
+    () => window.matchMedia(MOBILE_OUTLINE_QUERY).matches,
+    () => false,
   );
 }
 
@@ -394,6 +441,22 @@ function deleteMathNode(instance: Editor, current: MathEditorState) {
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function highlightSearchText(value: string, query: string): ReactNode {
+  const terms = [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))]
+    .sort((left, right) => right.length - left.length);
+  if (terms.length === 0) return value;
+  const matcher = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
+  return value.split(matcher).map((part, index) => (
+    terms.includes(part.toLowerCase())
+      ? <mark key={`${part}-${index}`}>{part}</mark>
+      : <span key={`${part}-${index}`}>{part}</span>
+  ));
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -1359,12 +1422,14 @@ export function LabEditor() {
 
 function LabEditorSession() {
   const shellRef = useRef<HTMLDivElement>(null);
+  const outlinePanelRef = useRef<HTMLElement>(null);
   const caretRef = useRef<HTMLDivElement>(null);
   const caretStrokeRef = useRef<HTMLSpanElement>(null);
   const paletteElementRef = useRef<HTMLDivElement>(null);
   const mathEditorElementRef = useRef<HTMLDivElement>(null);
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1373,12 +1438,23 @@ function LabEditorSession() {
   const setNoticeRef = useRef<(message: string | null) => void>(() => undefined);
   const paletteRef = useRef<PaletteState | null>(null);
   const mathEditorRef = useRef<MathEditorState | null>(null);
+  const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
+  const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
+  const searchIndexVersionRef = useRef(0);
+  const searchComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const outlineOpenRef = useRef(false);
+  const outlineItemsRef = useRef<OutlineItem[]>([]);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
+  const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
+  const [outlineOpen, setOutlineOpenState] = useState(false);
+  const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
+  const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
   // This chain must be observable synchronously. A successful flush calls
   // onHealth before its promise resolves; React state would leave /backup and
@@ -1397,6 +1473,7 @@ function LabEditorSession() {
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
   const prefersReducedMotion = usePrefersReducedMotion();
+  const mobileOutline = useMobileOutline();
 
   const [persistence] = useState<EditorPersistenceController>(() => {
     const e2eDelay = typeof window === "undefined"
@@ -1418,6 +1495,15 @@ function LabEditorSession() {
   });
 
   const setPalette = useCallback((value: PaletteState | null) => {
+    const previous = paletteRef.current;
+    if (previous?.mode === "search" && value?.mode !== "search") {
+      searchIndexVersionRef.current += 1;
+      searchComposingRef.current = false;
+      searchDocumentsRef.current = [];
+      searchResultRefs.current.clear();
+      setSearchResults([]);
+      setSearchLoading(false);
+    }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
     setPaletteState(value);
@@ -1432,6 +1518,77 @@ function LabEditorSession() {
     mathEditorRef.current = value;
     setMathEditorState(value);
   }, []);
+
+  const setOutlineOpen = useCallback((value: boolean) => {
+    outlineOpenRef.current = value;
+    setOutlineOpenState(value);
+  }, []);
+
+  const syncOutlineActive = useCallback((instance: Editor) => {
+    const items = outlineItemsRef.current;
+    const nextActiveIndex = activeOutlineIndex(items, instance.state.selection.from);
+    const nextActiveId = items[nextActiveIndex]?.id ?? null;
+    setActiveOutlineIdState((current) => current === nextActiveId ? current : nextActiveId);
+  }, []);
+
+  const syncOutlineItems = useCallback((instance: Editor) => {
+    const nextItems = outlineFromEditor(instance);
+    if (!areOutlineItemsEqual(outlineItemsRef.current, nextItems)) {
+      outlineItemsRef.current = nextItems;
+      setOutlineItemsState(nextItems);
+    }
+    syncOutlineActive(instance);
+  }, [syncOutlineActive]);
+
+  const toggleOutline = useCallback(() => {
+    const nextOpen = !outlineOpenRef.current;
+    if (nextOpen) {
+      const instance = editorRef.current;
+      if (instance && !instance.isDestroyed) syncOutlineItems(instance);
+    }
+    setOutlineOpen(nextOpen);
+  }, [setOutlineOpen, syncOutlineItems]);
+
+  const closeOutline = useCallback((focusEditor = true) => {
+    setOutlineOpen(false);
+    if (focusEditor) {
+      window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+    }
+  }, [setOutlineOpen]);
+
+  useLayoutEffect(() => {
+    if (!outlineOpen || !mobileOutline) return;
+
+    const panel = outlinePanelRef.current;
+    const editorElement = editorRef.current?.view.dom;
+    if (!panel || !editorElement) return;
+
+    const editorWasInert = editorElement.hasAttribute("inert");
+    const editorAriaHidden = editorElement.getAttribute("aria-hidden");
+    editorElement.setAttribute("inert", "");
+    editorElement.setAttribute("aria-hidden", "true");
+
+    const focusInitialControl = () => {
+      const activeItem = panel.querySelector<HTMLElement>('.outline-item[aria-current="location"]');
+      const firstItem = panel.querySelector<HTMLElement>(".outline-item");
+      const closeButton = panel.querySelector<HTMLElement>(".outline-close");
+      (activeItem ?? firstItem ?? closeButton ?? panel).focus();
+    };
+
+    const keepFocusInPanel = (event: FocusEvent) => {
+      if (!panel.contains(event.target as Node)) focusInitialControl();
+    };
+
+    focusInitialControl();
+    document.addEventListener("focusin", keepFocusInPanel);
+
+    return () => {
+      document.removeEventListener("focusin", keepFocusInPanel);
+      if (!editorWasInert) editorElement.removeAttribute("inert");
+      if (editorAriaHidden === null) editorElement.removeAttribute("aria-hidden");
+      else editorElement.setAttribute("aria-hidden", editorAriaHidden);
+    };
+  }, [mobileOutline, outlineOpen]);
 
   const openImageCrop = useCallback((node: PMNode, pos: number) => {
     const src = String(node.attrs.src ?? "");
@@ -1702,14 +1859,18 @@ function LabEditorSession() {
   }, [setPalette]);
 
   const syncInterface = useCallback(
-    (instance: Editor) => {
+    (instance: Editor, refreshOutline = false) => {
       requestAnimationFrame(() => positionCaret(instance));
+      if (outlineOpenRef.current) {
+        if (refreshOutline) syncOutlineItems(instance);
+        else syncOutlineActive(instance);
+      }
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
       setSelected(0);
     },
-    [findSlash, positionCaret, setPalette, setSelected],
+    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive, syncOutlineItems],
   );
 
   const editor = useEditor({
@@ -1988,6 +2149,12 @@ function LabEditorSession() {
         },
       },
       handleKeyDown: (view, event) => {
+        if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "o") {
+          event.preventDefault();
+          toggleOutline();
+          return true;
+        }
+
         if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e") {
           if (isCodeBlock(view.state.selection.$from.parent)) return false;
           event.preventDefault();
@@ -2098,7 +2265,7 @@ function LabEditorSession() {
     },
     onUpdate: ({ editor: instance }) => {
       if (migrateInlineMath(instance)) return;
-      syncInterface(instance);
+      syncInterface(instance, true);
       persistence.onEdit(instance.getMarkdown());
     },
     onSelectionUpdate: ({ editor: instance }) => syncInterface(instance),
@@ -2177,6 +2344,27 @@ function LabEditorSession() {
     return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode]);
 
+  useEffect(() => {
+    if (palette?.mode !== "search") return;
+    const frame = window.requestAnimationFrame(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "search" || searchLoading) return;
+    const activeResult = searchResults[selected];
+    if (!activeResult) return;
+    const frame = window.requestAnimationFrame(() => {
+      searchResultRefs.current
+        .get(activeResult.documentId)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode, searchLoading, searchResults, selected]);
+
   useLayoutEffect(() => {
     repositionMathEditor();
   }, [mathEditorState, repositionMathEditor]);
@@ -2211,10 +2399,18 @@ function LabEditorSession() {
       }
       return;
     }
+    if (palette?.mode === "search") {
+      // The searchbox owns the result list. The editor is only the command
+      // launcher and must not claim the search list as its active descendant.
+      documentElement.setAttribute("aria-expanded", "false");
+      documentElement.removeAttribute("aria-controls");
+      documentElement.removeAttribute("aria-activedescendant");
+      return;
+    }
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [editor, filtered, palette, selected, sessions]);
+  }, [editor, filtered, palette, searchResults, selected, sessions]);
 
   /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
   const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
@@ -2285,6 +2481,97 @@ function LabEditorSession() {
     navigateToSession(session);
     return true;
   }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
+
+  const searchSessionList = useCallback(() => {
+    const available = [...listDocumentSessions()];
+    const currentName = sessionName.trim() || "Untitled";
+    const current = available.find((session) => session.id === documentId);
+    if (current) {
+      current.name = currentName;
+    } else {
+      available.push({
+        id: documentId,
+        name: currentName,
+        createdAt: 0,
+        updatedAt: 0,
+      });
+    }
+    return available;
+  }, [documentId, sessionName]);
+
+  const refreshSearchIndex = useCallback(async () => {
+    const requestVersion = searchIndexVersionRef.current + 1;
+    searchIndexVersionRef.current = requestVersion;
+    setSearchLoading(true);
+    try {
+      // Include the current in-memory note even when a save is still debounced
+      // or an authority conflict has made the latest edit unsavable.
+      const available = searchSessionList();
+      setSessions(available);
+      const currentMarkdown = editor?.getMarkdown() ?? "";
+      const documents: LocalSearchDocument[] = (await Promise.all(available.map(async (session) => {
+        if (session.id === documentId) {
+          return {
+            id: session.id,
+            name: session.name,
+            markdown: currentMarkdown,
+            searchableText: searchableMarkdown(currentMarkdown),
+            updatedAt: session.updatedAt,
+          } satisfies LocalSearchDocument;
+        }
+
+        let markdown = "";
+        try {
+          const verifiedMarkdown = await readVerifiedLocalDocument(session.id);
+          if (verifiedMarkdown === null) return null;
+          markdown = verifiedMarkdown;
+        } catch {
+          // A readable session name is still searchable when one of its
+          // replicas is temporarily unavailable.
+        }
+        if (isLocalDocumentDeleted(session.id)) return null;
+        return {
+          id: session.id,
+          name: session.name,
+          markdown,
+          searchableText: searchableMarkdown(markdown),
+          updatedAt: session.updatedAt,
+        } satisfies LocalSearchDocument;
+      }))).flatMap((document) => document ? [document] : []);
+
+      if (requestVersion !== searchIndexVersionRef.current) return;
+      searchDocumentsRef.current = documents;
+      const currentPalette = paletteRef.current;
+      if (currentPalette?.mode === "search") {
+        setSearchResults(searchLocalDocuments(documents, currentPalette.query));
+      }
+    } finally {
+      if (requestVersion === searchIndexVersionRef.current) setSearchLoading(false);
+    }
+  }, [documentId, editor, searchSessionList]);
+
+  const updateSearchQuery = useCallback((query: string) => {
+    const current = paletteRef.current;
+    if (!current || current.mode !== "search") return;
+    setPalette({ ...current, query });
+    setSelected(0);
+    setSearchResults(searchLocalDocuments(searchDocumentsRef.current, query));
+  }, [setPalette, setSelected]);
+
+  const openSearchResult = useCallback((result: LocalSearchResult) => {
+    const session = sessions.find((candidate) => candidate.id === result.documentId) ?? {
+      id: result.documentId,
+      name: result.name,
+      createdAt: result.updatedAt,
+      updatedAt: result.updatedAt,
+    };
+    if (session.id === documentId) {
+      setPalette(null);
+      editor?.commands.focus();
+      return;
+    }
+    void resumeSession(session);
+  }, [documentId, editor, resumeSession, setPalette, sessions]);
 
   const deleteActiveSession = useCallback(async () => {
     if (documentId === DEFAULT_DOCUMENT_ID) {
@@ -2358,7 +2645,19 @@ function LabEditorSession() {
             if (paletteVersionRef.current === requestVersion && paletteRef.current === null) {
               setNotice("Could not inspect local storage.");
             }
-          });
+        });
+        return;
+      }
+      if (command.id === "search") {
+        setSearchResults([]);
+        setSelected(0);
+        setPalette({
+          ...anchor,
+          query: "",
+          range: { from: editor.state.selection.from, to: editor.state.selection.from },
+          mode: "search",
+        });
+        void refreshSearchIndex();
         return;
       }
       if (command.id === "backup") {
@@ -2454,6 +2753,10 @@ function LabEditorSession() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
         return;
       }
+      if (command.id === "outline") {
+        toggleOutline();
+        return;
+      }
       if (command.id === "undo") {
         editor.commands.undo();
         return;
@@ -2514,8 +2817,28 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, sessionTouchBarrier, setPalette, setSelected],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, refreshSearchIndex, savedSessionName, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
+
+  const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
+    const instance = editorRef.current;
+    if (!instance || instance.isDestroyed) return;
+    const node = instance.state.doc.nodeAt(item.position);
+    if (!node || node.type.name !== "heading") {
+      syncOutlineItems(instance);
+      return;
+    }
+
+    const targetPosition = Math.min(item.position + 1, instance.state.doc.content.size);
+    const chain = instance.chain();
+    if (!mobileOutline) chain.focus();
+    chain.setTextSelection(targetPosition).scrollIntoView().run();
+    setActiveOutlineIdState(item.id);
+
+    if (mobileOutline) {
+      closeOutline();
+    }
+  }, [closeOutline, mobileOutline, syncOutlineItems]);
 
   // Bind vault scope synchronously once the client hash is known. Layout effects
   // run before the passive hydration effect, so the persistence controller's
@@ -2688,7 +3011,13 @@ function LabEditorSession() {
 
   const onKeyDownCapture = (event: React.KeyboardEvent) => {
     const current = paletteRef.current;
-    if (!current) return;
+    if (!current) {
+      if (outlineOpenRef.current && event.key === "Escape") {
+        event.preventDefault();
+        closeOutline();
+      }
+      return;
+    }
 
     if (event.key === "Escape") {
       event.preventDefault();
@@ -2699,6 +3028,29 @@ function LabEditorSession() {
     }
 
     if (current.mode === "name") return;
+
+    if (current.mode === "search") {
+      const isComposing = searchComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, searchResults.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && searchResults.length > 0) {
+        event.preventDefault();
+        openSearchResult(searchResults[selectedRef.current] ?? searchResults[0]);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+      }
+      return;
+    }
 
     if (current.mode === "sessions") {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -2902,6 +3254,95 @@ function LabEditorSession() {
   return (
     <div className="lab-shell" ref={shellRef} onKeyDownCapture={onKeyDownCapture}>
       <EditorContent editor={editor} aria-busy={hydrating} />
+      {outlineOpen ? (
+        <>
+          <div
+            className="outline-backdrop"
+            aria-hidden="true"
+            onClick={() => closeOutline()}
+          />
+          <aside
+            ref={outlinePanelRef}
+            className="outline-panel"
+            data-testid="document-outline"
+            role={mobileOutline ? "dialog" : undefined}
+            aria-modal={mobileOutline ? "true" : undefined}
+            aria-labelledby="document-outline-title"
+            tabIndex={mobileOutline ? -1 : undefined}
+            onKeyDown={(event) => {
+              if (!mobileOutline || event.key !== "Tab") return;
+
+              const panel = outlinePanelRef.current;
+              if (!panel) return;
+              const focusable = Array.from(
+                panel.querySelectorAll<HTMLElement>(
+                  "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
+                ),
+              ).filter((element) => element !== panel && element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
+              if (focusable.length === 0) {
+                event.preventDefault();
+                panel.focus();
+                return;
+              }
+
+              const first = focusable[0];
+              const last = focusable[focusable.length - 1];
+              const active = document.activeElement;
+              if (
+                active === panel
+                || !panel.contains(active)
+                || (event.shiftKey && active === first)
+                || (!event.shiftKey && active === last)
+              ) {
+                event.preventDefault();
+                (event.shiftKey ? last : first).focus();
+              }
+            }}
+          >
+            <div className="outline-header">
+              <div>
+                <h2 id="document-outline-title">Outline</h2>
+                <p>{outlineItems.length === 0 ? "No sections yet" : `${outlineItems.length} ${outlineItems.length === 1 ? "section" : "sections"}`}</p>
+              </div>
+              <button
+                type="button"
+                className="outline-close"
+                aria-label="Close outline"
+                onClick={() => closeOutline()}
+              >
+                ×
+              </button>
+            </div>
+            {outlineItems.length > 0 ? (
+              <nav className="outline-navigation" aria-label="Document headings">
+                <ol className="outline-list">
+                  {outlineItems.map((item) => {
+                    const active = item.id === activeOutlineId;
+                    return (
+                      <li key={item.id} data-depth={item.depth}>
+                        <button
+                          type="button"
+                          className="outline-item"
+                          data-active={active}
+                          data-level={item.level}
+                          aria-current={active ? "location" : undefined}
+                          title={item.title}
+                          onClick={() => navigateToOutlineHeading(item)}
+                        >
+                          <span className="outline-item-marker" aria-hidden="true" />
+                          <span className="outline-item-label">{item.title}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </nav>
+            ) : (
+              <p className="outline-empty">Type a heading with <code>#</code> to build your outline.</p>
+            )}
+          </aside>
+        </>
+      ) : null}
       {imageCropTarget ? (
         <ImageCropDialog
           src={imageCropTarget.src}
@@ -2996,7 +3437,7 @@ function LabEditorSession() {
             theme="dark"
             staticColors
             duration={3.2}
-            active={palette.mode === "commands" && !prefersReducedMotion}
+            active={(palette.mode === "commands" || palette.mode === "search") && !prefersReducedMotion}
             strength={0.42}
             brightness={1.05}
             saturation={0}
@@ -3005,8 +3446,8 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" || palette.mode === "search" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "search" ? "Search local notes" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
@@ -3044,6 +3485,86 @@ function LabEditorSession() {
             ) : (
               <div className="palette-message">No command</div>
             )
+          ) : palette.mode === "search" ? (
+            <div className="search-panel" data-testid="search-panel">
+              <div className="search-field">
+                <span className="search-field-prefix" aria-hidden="true">/</span>
+                <input
+                  ref={searchInputRef}
+                  type="search"
+                  role="combobox"
+                  aria-label="Search local notes"
+                  aria-expanded="true"
+                  aria-controls={`${PALETTE_ID}-results`}
+                  aria-activedescendant={!searchLoading && searchResults[selected]
+                    ? `${PALETTE_ID}-search-${searchResults[selected].documentId}`
+                    : undefined}
+                  aria-autocomplete="list"
+                  aria-haspopup="listbox"
+                  autoComplete="off"
+                  placeholder="Search sessions and note text"
+                  value={palette.query}
+                  onChange={(event) => updateSearchQuery(event.target.value)}
+                  onCompositionStart={() => { searchComposingRef.current = true; }}
+                  onCompositionEnd={() => { searchComposingRef.current = false; }}
+                />
+                <kbd>Esc</kbd>
+              </div>
+              <div className="search-summary" role="status" aria-live="polite">
+                {searchLoading
+                  ? "Indexing local notes…"
+                  : palette.query.trim()
+                    ? `${searchResults.length} ${searchResults.length === 1 ? "match" : "matches"}`
+                    : `${sessions.length} local ${sessions.length === 1 ? "session" : "sessions"}`}
+              </div>
+              <div id={`${PALETTE_ID}-results`} className="search-results" role="listbox" aria-label="Search results">
+                {searchLoading ? (
+                  <div className="search-empty">Reading verified local copies…</div>
+                ) : palette.query.trim() && searchResults.length > 0 ? (
+                  searchResults.map((result, index) => (
+                    <div
+                      ref={(element) => {
+                        if (element) searchResultRefs.current.set(result.documentId, element);
+                        else searchResultRefs.current.delete(result.documentId);
+                      }}
+                      className="search-result"
+                      data-testid="search-result"
+                      data-selected={index === selected}
+                      data-current={result.documentId === documentId}
+                      id={`${PALETTE_ID}-search-${result.documentId}`}
+                      key={result.documentId}
+                      role="option"
+                      aria-selected={index === selected}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        openSearchResult(result);
+                      }}
+                      onMouseEnter={() => setSelected(index)}
+                    >
+                      <div className="search-result-heading">
+                        <span>{highlightSearchText(result.name, palette.query)}</span>
+                        <small>
+                          {result.documentId === documentId ? "Current session · " : ""}
+                          {result.match === "name"
+                            ? "Session name"
+                            : result.match === "content"
+                              ? "Note text"
+                              : "Name + note text"}
+                        </small>
+                      </div>
+                      <div className="search-result-excerpt">
+                        {highlightSearchText(result.excerpt || "Session name match", palette.query)}
+                      </div>
+                    </div>
+                  ))
+                ) : palette.query.trim() ? (
+                  <div className="search-empty">No local notes match “{palette.query.trim()}”.</div>
+                ) : (
+                  <div className="search-empty">Search session names and the text of every local note.</div>
+                )}
+              </div>
+              <div className="search-footer">↑↓ move · Enter open · Esc close · local only</div>
+            </div>
           ) : palette.mode === "name" ? (
             <div className="session-name-panel">
               <label htmlFor="session-name-input">Session name</label>

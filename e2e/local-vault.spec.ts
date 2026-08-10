@@ -225,6 +225,163 @@ test("new, name, and sessions keep independent documents resumable across tabs",
   await expect(newEditor).toContainText("separate session note");
 });
 
+test("search finds session names and verified note excerpts, then opens the result", async ({ page }) => {
+  const editor = await openEditor(page);
+  const originalNote = "Q3 launch planning notes with the final checklist.";
+  await editor.fill(originalNote);
+  await waitForAuthority(page, originalNote);
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/name");
+  await page.keyboard.press("Enter");
+  const originalName = page.getByLabel("Session name");
+  await originalName.fill("Planning");
+  await originalName.press("Enter");
+  await expect(originalName).toBeHidden();
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/new");
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const sessionId = new URL(page.url()).hash.replace("#session=", "");
+  const secondEditor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(secondEditor).toHaveAttribute("contenteditable", "true", { timeout: 15000 });
+  const secondNote = "Dinner recipe: coconut curry for Friday.";
+  await secondEditor.fill(secondNote);
+  await expect.poll(() => page.evaluate((key) => (
+    JSON.parse(localStorage.getItem(key) ?? "null")?.markdown?.trim() ?? null
+  ), `lab.document.v2.${sessionId}`), { timeout: 15000 }).toBe(secondNote);
+
+  await secondEditor.press("End");
+  await secondEditor.press("Enter");
+  await secondEditor.type("/name");
+  await page.keyboard.press("Enter");
+  const secondName = page.getByLabel("Session name");
+  await secondName.fill("Recipes");
+  await secondName.press("Enter");
+  await expect(secondName).toBeHidden();
+
+  await secondEditor.press("End");
+  await secondEditor.press("Enter");
+  await secondEditor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
+  await expect(searchInput).toBeVisible();
+  await expect(searchInput).toHaveAttribute("aria-expanded", "true");
+  await expect(searchInput).toHaveAttribute("aria-controls", "slash-command-palette-results");
+  await expect(page.locator("#slash-command-palette-results")).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "lab local-only Markdown note" }))
+    .not.toHaveAttribute("aria-controls", "slash-command-palette-results");
+
+  await searchInput.fill("planning launch");
+  const crossFieldResult = page.getByTestId("search-result").filter({ hasText: "Planning" });
+  await expect(crossFieldResult).toContainText("final checklist");
+  await expect(crossFieldResult).toContainText("Name + note text");
+  await expect(searchInput).toHaveAttribute("aria-activedescendant", "slash-command-palette-search-default");
+
+  await searchInput.fill("launch");
+  const launchResult = page.getByTestId("search-result").filter({ hasText: "Planning" });
+  await expect(launchResult).toContainText("final checklist");
+  await expect(launchResult).toContainText("Note text");
+
+  await searchInput.fill("recipes");
+  const nameResult = page.getByTestId("search-result").filter({ hasText: "Recipes" });
+  await expect(nameResult).toContainText("Session name");
+
+  await searchInput.fill("launch");
+  await searchInput.press("Enter");
+  await expect(page).not.toHaveURL(/#session=/);
+  await expect(page.getByRole("textbox", { name: "lab local-only Markdown note" })).toContainText(originalNote);
+});
+
+test("keyboard search selection scrolls the active result into view", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.evaluate(async () => {
+    const base = Date.now();
+    for (let index = 0; index < 6; index += 1) {
+      const id = `scroll-seeded-${index}`;
+      const markdown = `scroll token ${index}`;
+      const updatedAt = base + index;
+      const bytes = new TextEncoder().encode(JSON.stringify(["lab.snapshot.v2", updatedAt, markdown]));
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      const checksum = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem(`lab.session.v1.${id}`, JSON.stringify({
+        id,
+        name: `Scroll ${index}`,
+        createdAt: updatedAt,
+        updatedAt,
+      }));
+      localStorage.setItem(`lab.document.v2.${id}`, JSON.stringify({ markdown, updatedAt, checksum, version: 2 }));
+    }
+  });
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
+  await searchInput.fill("scroll token");
+  const results = page.getByTestId("search-result");
+  await expect(results).toHaveCount(6);
+
+  for (let index = 0; index < 5; index += 1) await searchInput.press("ArrowDown");
+  const selectedResult = page.locator('.search-result[data-selected="true"]');
+  await expect(selectedResult).toHaveCount(1);
+  await expect.poll(async () => page.evaluate(() => {
+    const container = document.getElementById("slash-command-palette-results")?.getBoundingClientRect();
+    const selected = document.querySelector('.search-result[data-selected="true"]')?.getBoundingClientRect();
+    if (!container || !selected) return false;
+    return selected.top >= container.top - 1 && selected.bottom <= container.bottom + 1;
+  }), { timeout: 5000 }).toBe(true);
+});
+
+test("search keyboard navigation waits for IME composition to finish", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.evaluate(async () => {
+    const base = Date.now();
+    for (let index = 0; index < 2; index += 1) {
+      const id = `composition-seeded-${index}`;
+      const markdown = `composition token ${index}`;
+      const updatedAt = base + index;
+      const bytes = new TextEncoder().encode(JSON.stringify(["lab.snapshot.v2", updatedAt, markdown]));
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      const checksum = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem(`lab.session.v1.${id}`, JSON.stringify({
+        id,
+        name: `Composition ${index}`,
+        createdAt: updatedAt,
+        updatedAt,
+      }));
+      localStorage.setItem(`lab.document.v2.${id}`, JSON.stringify({ markdown, updatedAt, checksum, version: 2 }));
+    }
+  });
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
+  await searchInput.fill("composition token");
+  await expect(page.getByTestId("search-result")).toHaveCount(2);
+  const selectedResult = page.locator('.search-result[data-selected="true"]');
+  await expect(selectedResult).toContainText("Composition 1");
+
+  await searchInput.dispatchEvent("compositionstart");
+  await searchInput.press("ArrowDown");
+  await searchInput.press("Enter");
+  await expect(selectedResult).toContainText("Composition 1");
+  await expect(searchInput).toBeVisible();
+  await expect(page).not.toHaveURL(/#session=composition-seeded-/);
+
+  await searchInput.dispatchEvent("compositionend");
+  await searchInput.press("ArrowDown");
+  await expect(selectedResult).toContainText("Composition 0");
+  await searchInput.press("Enter");
+  await expect(page).toHaveURL(/#session=composition-seeded-0$/);
+});
+
 test("delete removes an extra session and returns to the original note", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.fill("keep the original note");

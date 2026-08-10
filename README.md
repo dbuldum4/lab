@@ -2,6 +2,16 @@
 
 A local-only, local-first Markdown notepad. There is no toolbar: type `/` in an empty line to open every command.
 
+## Outline
+
+Use `/outline` (or `Cmd/Ctrl+Shift+O`) to toggle a side outline built from the
+note's `#`, `##`, and `###` headings. It updates as you edit, keeps heading
+levels indented, marks the section around the caret, and jumps to a heading
+when selected. The outline is keyboard accessible: use `Tab` to reach it,
+`Enter` or `Space` to navigate, and `Escape` to close it. On narrow screens it
+opens as a local overlay and closes after navigation. Its open/closed state is
+UI-only and is not saved with the document.
+
 ## Run locally
 
 Requires Node.js 22.6 or newer.
@@ -76,6 +86,8 @@ can retry safely.
 The original note remains the default, so existing users do not need to manage documents. Use `/new` to start a separate local document, `/name` to give the current document a recognizable name, `/sessions` to resume another document, and `/delete` to permanently remove an extra session (the original cannot be deleted; use `/clear` to empty it).
 
 Each session has its own URL hash and isolated redundant storage. Different sessions can stay open and save independently in different tabs. Two tabs opened to the same session still use atomic conflict resolution, with the losing edit retained for `/recover` rather than silently discarded.
+
+Use `/search` (or type `/find`) to search session names and the text of every local session. Results include a short excerpt and open the matching session with Enter or a click. Search reads verified on-device snapshots only; it makes no network requests and does not create a new remote index.
 
 ## Math
 
