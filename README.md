@@ -71,6 +71,8 @@ The original note remains the default, so existing users do not need to manage d
 
 Each session has its own URL hash and isolated redundant storage. Different sessions can stay open and save independently in different tabs. Two tabs opened to the same session still use atomic conflict resolution, with the losing edit retained for `/recover` rather than silently discarded.
 
+Use `/search` (or type `/find`) to search session names and the text of every local session. Results include a short excerpt and open the matching session with Enter or a click. Search reads verified on-device snapshots only; it makes no network requests and does not create a new remote index.
+
 ## Math
 
 Type `$$...$$` to turn an inline expression into KaTeX-rendered math. Use

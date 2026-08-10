@@ -23,7 +23,7 @@ import StarterKit from "@tiptap/starter-kit";
 import { BorderBeam } from "border-beam";
 import katex from "katex";
 import { LayoutGroup, motion, type Transition } from "motion/react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import {
   createEditorPersistenceController,
   type EditorPersistenceController,
@@ -33,6 +33,7 @@ import {
   inspectLocalStorage,
   isLocalDocumentDeleted,
   listLocalRecoveryDrafts,
+  readVerifiedLocalDocument,
   requestPersistentStorage,
   setLocalDocumentScope,
   type LocalRecoveryDraft,
@@ -51,6 +52,13 @@ import {
   touchDocumentSession,
   type DocumentSession,
 } from "@/lib/document-sessions";
+import {
+  normalizeSearchQuery,
+  searchableMarkdown,
+  searchLocalDocuments,
+  type LocalSearchDocument,
+  type LocalSearchResult,
+} from "@/lib/local-search";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
 import {
   activeOutlineIndex,
@@ -61,7 +69,7 @@ import {
 } from "@/lib/outline";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions";
+type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions" | "search";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -166,6 +174,7 @@ const COMMANDS: Command[] = [
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
+  { id: "search", label: "Search notes", detail: "Find across local sessions", terms: "find search notes text content sessions" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
@@ -420,6 +429,22 @@ function deleteMathNode(instance: Editor, current: MathEditorState) {
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function highlightSearchText(value: string, query: string): ReactNode {
+  const terms = [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))]
+    .sort((left, right) => right.length - left.length);
+  if (terms.length === 0) return value;
+  const matcher = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
+  return value.split(matcher).map((part, index) => (
+    terms.includes(part.toLowerCase())
+      ? <mark key={`${part}-${index}`}>{part}</mark>
+      : <span key={`${part}-${index}`}>{part}</span>
+  ));
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -1384,6 +1409,7 @@ function LabEditorSession() {
   const mathEditorElementRef = useRef<HTMLDivElement>(null);
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<Editor | null>(null);
@@ -1391,6 +1417,10 @@ function LabEditorSession() {
   const setNoticeRef = useRef<(message: string | null) => void>(() => undefined);
   const paletteRef = useRef<PaletteState | null>(null);
   const mathEditorRef = useRef<MathEditorState | null>(null);
+  const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
+  const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
+  const searchIndexVersionRef = useRef(0);
+  const searchComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
@@ -1398,6 +1428,8 @@ function LabEditorSession() {
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
+  const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
   const [outlineOpen, setOutlineOpenState] = useState(false);
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
@@ -1436,6 +1468,15 @@ function LabEditorSession() {
   });
 
   const setPalette = useCallback((value: PaletteState | null) => {
+    const previous = paletteRef.current;
+    if (previous?.mode === "search" && value?.mode !== "search") {
+      searchIndexVersionRef.current += 1;
+      searchComposingRef.current = false;
+      searchDocumentsRef.current = [];
+      searchResultRefs.current.clear();
+      setSearchResults([]);
+      setSearchLoading(false);
+    }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
     setPaletteState(value);
@@ -2276,6 +2317,27 @@ function LabEditorSession() {
     return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode]);
 
+  useEffect(() => {
+    if (palette?.mode !== "search") return;
+    const frame = window.requestAnimationFrame(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "search" || searchLoading) return;
+    const activeResult = searchResults[selected];
+    if (!activeResult) return;
+    const frame = window.requestAnimationFrame(() => {
+      searchResultRefs.current
+        .get(activeResult.documentId)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode, searchLoading, searchResults, selected]);
+
   useLayoutEffect(() => {
     repositionMathEditor();
   }, [mathEditorState, repositionMathEditor]);
@@ -2310,10 +2372,18 @@ function LabEditorSession() {
       }
       return;
     }
+    if (palette?.mode === "search") {
+      // The searchbox owns the result list. The editor is only the command
+      // launcher and must not claim the search list as its active descendant.
+      documentElement.setAttribute("aria-expanded", "false");
+      documentElement.removeAttribute("aria-controls");
+      documentElement.removeAttribute("aria-activedescendant");
+      return;
+    }
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [editor, filtered, palette, selected, sessions]);
+  }, [editor, filtered, palette, searchResults, selected, sessions]);
 
   /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
   const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
@@ -2384,6 +2454,97 @@ function LabEditorSession() {
     navigateToSession(session);
     return true;
   }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
+
+  const searchSessionList = useCallback(() => {
+    const available = [...listDocumentSessions()];
+    const currentName = sessionName.trim() || "Untitled";
+    const current = available.find((session) => session.id === documentId);
+    if (current) {
+      current.name = currentName;
+    } else {
+      available.push({
+        id: documentId,
+        name: currentName,
+        createdAt: 0,
+        updatedAt: 0,
+      });
+    }
+    return available;
+  }, [documentId, sessionName]);
+
+  const refreshSearchIndex = useCallback(async () => {
+    const requestVersion = searchIndexVersionRef.current + 1;
+    searchIndexVersionRef.current = requestVersion;
+    setSearchLoading(true);
+    try {
+      // Include the current in-memory note even when a save is still debounced
+      // or an authority conflict has made the latest edit unsavable.
+      const available = searchSessionList();
+      setSessions(available);
+      const currentMarkdown = editor?.getMarkdown() ?? "";
+      const documents: LocalSearchDocument[] = (await Promise.all(available.map(async (session) => {
+        if (session.id === documentId) {
+          return {
+            id: session.id,
+            name: session.name,
+            markdown: currentMarkdown,
+            searchableText: searchableMarkdown(currentMarkdown),
+            updatedAt: session.updatedAt,
+          } satisfies LocalSearchDocument;
+        }
+
+        let markdown = "";
+        try {
+          const verifiedMarkdown = await readVerifiedLocalDocument(session.id);
+          if (verifiedMarkdown === null) return null;
+          markdown = verifiedMarkdown;
+        } catch {
+          // A readable session name is still searchable when one of its
+          // replicas is temporarily unavailable.
+        }
+        if (isLocalDocumentDeleted(session.id)) return null;
+        return {
+          id: session.id,
+          name: session.name,
+          markdown,
+          searchableText: searchableMarkdown(markdown),
+          updatedAt: session.updatedAt,
+        } satisfies LocalSearchDocument;
+      }))).flatMap((document) => document ? [document] : []);
+
+      if (requestVersion !== searchIndexVersionRef.current) return;
+      searchDocumentsRef.current = documents;
+      const currentPalette = paletteRef.current;
+      if (currentPalette?.mode === "search") {
+        setSearchResults(searchLocalDocuments(documents, currentPalette.query));
+      }
+    } finally {
+      if (requestVersion === searchIndexVersionRef.current) setSearchLoading(false);
+    }
+  }, [documentId, editor, searchSessionList]);
+
+  const updateSearchQuery = useCallback((query: string) => {
+    const current = paletteRef.current;
+    if (!current || current.mode !== "search") return;
+    setPalette({ ...current, query });
+    setSelected(0);
+    setSearchResults(searchLocalDocuments(searchDocumentsRef.current, query));
+  }, [setPalette, setSelected]);
+
+  const openSearchResult = useCallback((result: LocalSearchResult) => {
+    const session = sessions.find((candidate) => candidate.id === result.documentId) ?? {
+      id: result.documentId,
+      name: result.name,
+      createdAt: result.updatedAt,
+      updatedAt: result.updatedAt,
+    };
+    if (session.id === documentId) {
+      setPalette(null);
+      editor?.commands.focus();
+      return;
+    }
+    void resumeSession(session);
+  }, [documentId, editor, resumeSession, setPalette, sessions]);
 
   const deleteActiveSession = useCallback(async () => {
     if (documentId === DEFAULT_DOCUMENT_ID) {
@@ -2457,7 +2618,19 @@ function LabEditorSession() {
             if (paletteVersionRef.current === requestVersion && paletteRef.current === null) {
               setNotice("Could not inspect local storage.");
             }
-          });
+        });
+        return;
+      }
+      if (command.id === "search") {
+        setSearchResults([]);
+        setSelected(0);
+        setPalette({
+          ...anchor,
+          query: "",
+          range: { from: editor.state.selection.from, to: editor.state.selection.from },
+          mode: "search",
+        });
+        void refreshSearchIndex();
         return;
       }
       if (command.id === "clear") {
@@ -2584,7 +2757,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, savedSessionName, setPalette, setSelected, toggleOutline],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, refreshSearchIndex, savedSessionName, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
@@ -2795,6 +2968,29 @@ function LabEditorSession() {
     }
 
     if (current.mode === "name") return;
+
+    if (current.mode === "search") {
+      const isComposing = searchComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, searchResults.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && searchResults.length > 0) {
+        event.preventDefault();
+        openSearchResult(searchResults[selectedRef.current] ?? searchResults[0]);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+      }
+      return;
+    }
 
     if (current.mode === "sessions") {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -3119,7 +3315,7 @@ function LabEditorSession() {
             theme="dark"
             staticColors
             duration={3.2}
-            active={palette.mode === "commands" && !prefersReducedMotion}
+            active={(palette.mode === "commands" || palette.mode === "search") && !prefersReducedMotion}
             strength={0.42}
             brightness={1.05}
             saturation={0}
@@ -3128,8 +3324,8 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" || palette.mode === "search" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "search" ? "Search local notes" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
@@ -3167,6 +3363,86 @@ function LabEditorSession() {
             ) : (
               <div className="palette-message">No command</div>
             )
+          ) : palette.mode === "search" ? (
+            <div className="search-panel" data-testid="search-panel">
+              <div className="search-field">
+                <span className="search-field-prefix" aria-hidden="true">/</span>
+                <input
+                  ref={searchInputRef}
+                  type="search"
+                  role="combobox"
+                  aria-label="Search local notes"
+                  aria-expanded="true"
+                  aria-controls={`${PALETTE_ID}-results`}
+                  aria-activedescendant={!searchLoading && searchResults[selected]
+                    ? `${PALETTE_ID}-search-${searchResults[selected].documentId}`
+                    : undefined}
+                  aria-autocomplete="list"
+                  aria-haspopup="listbox"
+                  autoComplete="off"
+                  placeholder="Search sessions and note text"
+                  value={palette.query}
+                  onChange={(event) => updateSearchQuery(event.target.value)}
+                  onCompositionStart={() => { searchComposingRef.current = true; }}
+                  onCompositionEnd={() => { searchComposingRef.current = false; }}
+                />
+                <kbd>Esc</kbd>
+              </div>
+              <div className="search-summary" role="status" aria-live="polite">
+                {searchLoading
+                  ? "Indexing local notes…"
+                  : palette.query.trim()
+                    ? `${searchResults.length} ${searchResults.length === 1 ? "match" : "matches"}`
+                    : `${sessions.length} local ${sessions.length === 1 ? "session" : "sessions"}`}
+              </div>
+              <div id={`${PALETTE_ID}-results`} className="search-results" role="listbox" aria-label="Search results">
+                {searchLoading ? (
+                  <div className="search-empty">Reading verified local copies…</div>
+                ) : palette.query.trim() && searchResults.length > 0 ? (
+                  searchResults.map((result, index) => (
+                    <div
+                      ref={(element) => {
+                        if (element) searchResultRefs.current.set(result.documentId, element);
+                        else searchResultRefs.current.delete(result.documentId);
+                      }}
+                      className="search-result"
+                      data-testid="search-result"
+                      data-selected={index === selected}
+                      data-current={result.documentId === documentId}
+                      id={`${PALETTE_ID}-search-${result.documentId}`}
+                      key={result.documentId}
+                      role="option"
+                      aria-selected={index === selected}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        openSearchResult(result);
+                      }}
+                      onMouseEnter={() => setSelected(index)}
+                    >
+                      <div className="search-result-heading">
+                        <span>{highlightSearchText(result.name, palette.query)}</span>
+                        <small>
+                          {result.documentId === documentId ? "Current session · " : ""}
+                          {result.match === "name"
+                            ? "Session name"
+                            : result.match === "content"
+                              ? "Note text"
+                              : "Name + note text"}
+                        </small>
+                      </div>
+                      <div className="search-result-excerpt">
+                        {highlightSearchText(result.excerpt || "Session name match", palette.query)}
+                      </div>
+                    </div>
+                  ))
+                ) : palette.query.trim() ? (
+                  <div className="search-empty">No local notes match “{palette.query.trim()}”.</div>
+                ) : (
+                  <div className="search-empty">Search session names and the text of every local note.</div>
+                )}
+              </div>
+              <div className="search-footer">↑↓ move · Enter open · Esc close · local only</div>
+            </div>
           ) : palette.mode === "name" ? (
             <div className="session-name-panel">
               <label htmlFor="session-name-input">Session name</label>
