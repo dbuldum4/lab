@@ -116,6 +116,38 @@ test("automatic titles, pinning, and archive views stay in sync", async ({ page 
   await expect(archived).toContainText("◆ Project Atlas");
 });
 
+test("hydration refreshes an existing automatic Untitled session title", async ({ page }) => {
+  const markdown = "# Legacy hydration title\n\nText";
+  await page.addInitScript(({ markdown: seededMarkdown, checksum }) => {
+    localStorage.setItem("lab.session.v1.default", JSON.stringify({
+      id: "default",
+      name: "Untitled",
+      titleSource: "automatic",
+      pinned: false,
+      archived: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    // v1 snapshots authenticate Markdown only and are still accepted by the
+    // migration path used by legacy local notes.
+    localStorage.setItem("lab.document.v1", JSON.stringify({
+      markdown: seededMarkdown,
+      updatedAt: 1,
+      checksum,
+      version: 1,
+    }));
+  }, {
+    markdown,
+    checksum: "0e89692f0d0348386d43f104aefc25055ae79ed9df74fe82979a60ffc4945b95",
+  });
+
+  const editor = await openEditor(page);
+  await expect(editor.locator("h1")).toHaveText("Legacy hydration title");
+  await appendSlash(page, editor, "sessions");
+  await expect(page.getByTestId("session-list")).toContainText("Legacy hydration title");
+  await page.keyboard.press("Escape");
+});
+
 test("callouts and collapsible sections survive Markdown persistence and reload", async ({ page }) => {
   const editor = await openEditor(page);
   const markdown = [
@@ -299,6 +331,40 @@ test("the external link editor updates both label and destination", async ({ pag
   await page.reload();
   const restored = await openEditor(page);
   await expect(restored.locator('a[href="https://openai.com/docs"]')).toHaveText("New label");
+});
+
+test("link editor maps its range when the note changes before the link", async ({ page }) => {
+  const editor = await openEditor(page);
+  await importMarkdown(page, "Before [Old label](https://example.com/old) after");
+  await editor.evaluate((element) => {
+    const text = element.querySelector("a")?.firstChild;
+    if (!text || text.nodeType !== Node.TEXT_NODE) throw new Error("Expected link text.");
+    const range = document.createRange();
+    range.setStart(text, 2);
+    range.collapse(true);
+    const selection = getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    (element as HTMLElement).focus();
+    document.dispatchEvent(new Event("selectionchange"));
+  });
+
+  await editor.press("ControlOrMeta+Shift+k");
+  const dialog = page.getByRole("dialog", { name: "Edit link" });
+  await expect(dialog).toBeVisible();
+
+  // Move the editor caret out of the link and to the document start while the
+  // panel remains open. This keeps the editor editable and forces the stored
+  // link range to move. Arrow keys use ProseMirror's live selection, unlike a
+  // DOM-only selection change while the panel owns focus.
+  for (let index = 0; index < 32; index += 1) await editor.press("ArrowLeft");
+  await page.keyboard.type("Prefix ");
+  await dialog.getByLabel("Link text").fill("New label");
+  await dialog.getByRole("button", { name: "Save link" }).click();
+
+  await expect(editor).toContainText("Prefix Before New label after");
+  await expect(editor.locator("a")).toHaveText("New label");
+  await expect(editor.locator("a")).toHaveAttribute("href", "https://example.com/old");
 });
 
 test("image alt text and title round-trip through the metadata dialog", async ({ page }) => {

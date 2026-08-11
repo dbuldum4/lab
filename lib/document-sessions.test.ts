@@ -15,6 +15,7 @@ import {
   pinDocumentSession,
   purgeDocumentSession,
   renameDocumentSession,
+  restoreExistingDocumentSession,
   touchDocumentSession,
   unarchiveDocumentSession,
   unpinDocumentSession,
@@ -30,6 +31,28 @@ class MemoryStorage implements Storage {
   key(index: number) { return [...this.values.keys()][index] ?? null; }
   removeItem(key: string) { this.values.delete(key); }
   setItem(key: string, value: string) { this.values.set(key, value); }
+}
+
+class InterleavingStorage extends MemoryStorage {
+  onSet?: (key: string, value: string) => boolean | void;
+
+  override setItem(key: string, value: string) {
+    super.setItem(key, value);
+    const callback = this.onSet;
+    if (callback && callback(key, value) !== false) this.onSet = undefined;
+  }
+}
+
+class ThrowOnceStorage extends MemoryStorage {
+  throwOnKey: string | null = null;
+
+  override setItem(key: string, value: string) {
+    super.setItem(key, value);
+    if (key === this.throwOnKey) {
+      this.throwOnKey = null;
+      throw new Error("storage quota exceeded after metadata write");
+    }
+  }
 }
 
 const descriptors = new Map<string, PropertyDescriptor | undefined>();
@@ -393,4 +416,119 @@ test("createDocumentSession retries when the chosen id already has live metadata
     JSON.parse(localStorage.getItem(`lab.session.v1.${taken}`) ?? "null").name,
     "Existing",
   );
+});
+
+test("fallback metadata writes keep unrelated concurrent fields", async () => {
+  const session = await createDocumentSession();
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {},
+  });
+
+  await Promise.all([
+    updateAutomaticSessionTitle(session.id, "Concurrent heading"),
+    pinDocumentSession(session.id),
+    archiveDocumentSession(session.id),
+  ]);
+
+  const merged = await getDocumentSession(session.id);
+  assert.ok(merged);
+  assert.equal(merged.name, "Concurrent heading");
+  assert.equal(merged.titleSource, "automatic");
+  assert.equal(merged.pinned, true);
+  assert.equal(merged.archived, true);
+  assert.equal(merged.createdAt, session.createdAt);
+  assert.ok(merged.updatedAt >= session.updatedAt);
+});
+
+test("per-field fallback writes survive an interleaved peer field write", async () => {
+  const session = await createDocumentSession();
+  const existing = localStorage as unknown as MemoryStorage;
+  const racing = new InterleavingStorage();
+  for (const [key, value] of existing.values) racing.values.set(key, value);
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: racing,
+  });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {},
+  });
+
+  const nameKey = `lab.session.field.v1.${session.id}.name`;
+  const pinnedKey = `lab.session.field.v1.${session.id}.pinned`;
+  racing.onSet = (key) => {
+    if (key !== nameKey) return false;
+    racing.setItem(pinnedKey, JSON.stringify(true));
+  };
+
+  await renameDocumentSession(session.id, "Interleaved rename");
+
+  const merged = await getDocumentSession(session.id);
+  assert.ok(merged);
+  assert.equal(merged.name, "Interleaved rename");
+  assert.equal(merged.pinned, true);
+});
+
+test("a racing automatic title cannot replace a manual rename", async () => {
+  const session = await createDocumentSession();
+  const existing = localStorage as unknown as MemoryStorage;
+  const racing = new InterleavingStorage();
+  for (const [key, value] of existing.values) racing.values.set(key, value);
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: racing,
+  });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {},
+  });
+
+  const nameKey = `lab.session.field.v1.${session.id}.name`;
+  const titleSourceKey = `lab.session.field.v1.${session.id}.titleSource`;
+  const manualTitleKey = `lab.session.manual-title.v1.${session.id}`;
+  racing.onSet = (key) => {
+    if (key !== nameKey) return;
+    racing.setItem(manualTitleKey, JSON.stringify("Manual wins"));
+    racing.setItem(nameKey, JSON.stringify("Manual wins"));
+    racing.setItem(titleSourceKey, JSON.stringify("manual"));
+  };
+
+  await updateAutomaticSessionTitle(session.id, "Automatic loses");
+
+  const merged = await getDocumentSession(session.id);
+  assert.ok(merged);
+  assert.equal(merged.name, "Manual wins");
+  assert.equal(merged.titleSource, "manual");
+});
+
+test("restore rollback restores field keys after a committed metadata failure", async () => {
+  const original = await createDocumentSession();
+  const expected = await getDocumentSession(original.id);
+  assert.ok(expected);
+  const restored = {
+    ...expected,
+    name: "Restored title",
+    pinned: true,
+    updatedAt: expected.updatedAt + 10,
+  };
+
+  const existing = localStorage as unknown as MemoryStorage;
+  const failing = new ThrowOnceStorage();
+  for (const [key, value] of existing.values) failing.values.set(key, value);
+  failing.throwOnKey = `lab.session.field.v1.${original.id}.name`;
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: failing,
+  });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {},
+  });
+
+  await assert.rejects(
+    () => restoreExistingDocumentSession(restored, expected),
+    /could not be restored/i,
+  );
+  assert.deepEqual(await getDocumentSession(original.id), expected);
 });

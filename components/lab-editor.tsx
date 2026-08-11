@@ -1571,6 +1571,12 @@ function LabEditorSession() {
   // useEditor freezes editorProps on first create; keep notices current via ref.
   const setNoticeRef = useRef<(message: string | null) => void>(() => undefined);
   const paletteRef = useRef<PaletteState | null>(null);
+  // Link clicks happen inside the editorProps callback, which is created before
+  // the session-switch callback below. Keep the latest safe switch path in a
+  // ref so local links do not fall back to direct hash navigation.
+  const resumeSessionRef = useRef<(session: DocumentSession, hash?: string) => Promise<boolean>>(
+    async () => false,
+  );
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
@@ -1585,6 +1591,7 @@ function LabEditorSession() {
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [imageMetadataTarget, setImageMetadataTarget] = useState<ImageMetadataTarget | null>(null);
   const [linkEditorState, setLinkEditorState] = useState<LinkEditorState | null>(null);
+  const linkEditorStateRef = useRef<LinkEditorState | null>(null);
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
@@ -2112,9 +2119,13 @@ function LabEditorSession() {
         const linkedDocumentId = documentIdFromLocalHref(link?.getAttribute("href"));
         if (link && linkedDocumentId) {
           event.preventDefault();
-          const href = localSessionHref(linkedDocumentId);
-          if (window.location.hash === href) window.location.reload();
-          else window.location.hash = href;
+          const session = listDocumentSessions({ archived: "all" })
+            .find((candidate) => candidate.id === linkedDocumentId);
+          if (!session) {
+            setNoticeRef.current("That session link is no longer available.");
+            return true;
+          }
+          void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
           return true;
         }
 
@@ -2463,6 +2474,26 @@ function LabEditorSession() {
     onCreate: ({ editor: instance }) => {
       editorRef.current = instance;
     },
+    onTransaction: ({ transaction }) => {
+      if (!transaction.docChanged) return;
+      const current = linkEditorStateRef.current;
+      if (!current) return;
+      // The panel keeps a ProseMirror document range. Map both boundaries
+      // through every edit while it is open so text inserted before the link
+      // cannot make Save replace an unrelated range.
+      const from = transaction.mapping.map(current.from, 1);
+      const to = transaction.mapping.map(current.to, -1);
+      if (from >= to) {
+        linkEditorStateRef.current = null;
+        setLinkEditorState(null);
+        setPalette(null);
+        setNoticeRef.current("The link is no longer available.");
+        return;
+      }
+      const next = { ...current, from, to };
+      linkEditorStateRef.current = next;
+      setLinkEditorState(next);
+    },
     onUpdate: ({ editor: instance }) => {
       if (migrateInlineMath(instance)) return;
       syncInterface(instance, true);
@@ -2685,8 +2716,11 @@ function LabEditorSession() {
     return false;
   }, [editor, persistence]);
 
-  const navigateToSession = useCallback((session: DocumentSession) => {
-    const hash = documentSessionHash(session.id);
+  const navigateToSession = useCallback((session: DocumentSession, hashOverride?: string) => {
+    // Preserve an explicit local-link hash, including the legacy
+    // `#session=default` form. Command/session-list navigation still uses the
+    // canonical hash from documentSessionHash when no override is supplied.
+    const hash = hashOverride ?? documentSessionHash(session.id);
     const target = `${window.location.pathname}${window.location.search}${hash}`;
     const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     // Same-path hash changes do not load a new document by themselves. Push a
@@ -2702,13 +2736,22 @@ function LabEditorSession() {
     window.location.reload();
   }, []);
 
-  const resumeSession = useCallback(async (session: DocumentSession) => {
+  const resumeSession = useCallback(async (session: DocumentSession, hashOverride?: string) => {
     const flushResult = await flushBeforeSessionSwitch();
     if (flushResult === "cancel") return false;
     if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return false;
-    navigateToSession(session);
+    navigateToSession(session, hashOverride);
     return true;
   }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
+
+  // Keep local-link clicks wired to the current persistence/session boundary.
+  useEffect(() => {
+    resumeSessionRef.current = resumeSession;
+  }, [resumeSession]);
+
+  useEffect(() => {
+    linkEditorStateRef.current = linkEditorState;
+  }, [linkEditorState]);
 
   const searchSessionList = useCallback(() => {
     const available = [...listDocumentSessions({ archived: "all" })];
@@ -3389,10 +3432,11 @@ function LabEditorSession() {
           redirectToOriginalAfterDelete();
           return;
         }
+        let activeSession: DocumentSession | null = null;
         try {
           // Do not ensure/create metadata for arbitrary hashes — only load existing
           // names. First durable save (touchDocumentSession) creates the entry.
-          const activeSession = await getDocumentSession(documentId);
+          activeSession = await getDocumentSession(documentId);
           if (active && activeSession) {
             setSessionName(activeSession.name);
             setSavedSessionName(activeSession.name);
@@ -3416,6 +3460,25 @@ function LabEditorSession() {
         latestMarkdown.set(markdown);
         recordVersion(documentId, markdown);
         persistence.markLoaded(markdown);
+        // Legacy automatic sessions can still be named "Untitled" even when
+        // their saved Markdown already has a readable heading. Refresh only
+        // automatic metadata; updateAutomaticSessionTitle re-checks the stored
+        // title source while locked, so a concurrent manual rename wins.
+        if (activeSession?.titleSource === "automatic") {
+          try {
+            const titled = await updateAutomaticSessionTitle(
+              documentId,
+              automaticTitleFromMarkdown(markdown),
+            );
+            if (active) {
+              setSessionName(titled.name);
+              setSavedSessionName(titled.name);
+              setSessionTitleSource(titled.titleSource);
+            }
+          } catch {
+            // A metadata failure must not prevent the note from loading.
+          }
+        }
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);

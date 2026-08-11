@@ -769,7 +769,8 @@ export async function restoreLocalVault(
       const canFillEmptyDefault = session.id === DEFAULT_DOCUMENT_ID
         && !tombstoned
         && existingMarkdown === ""
-        && existingMetadata?.name === "Untitled";
+        && existingMetadata?.name === "Untitled"
+        && existingMetadata.titleSource === "automatic";
       if (canFillEmptyDefault && existingMetadata) {
         filledDefault = {
           originalMetadata: existingMetadata,

@@ -21,6 +21,27 @@ class MemoryStorage implements Storage {
   setItem(key: string, value: string) { this.values.set(key, value); }
 }
 
+class RacingStorage extends MemoryStorage {
+  raceAfterEntry: { aggregate: string; entry: string } | null = null;
+  private raced = false;
+
+  override setItem(storageKey: string, value: string) {
+    super.setItem(storageKey, value);
+    if (
+      storageKey.startsWith("lab.version-history.v1.entry.alpha.")
+      && !this.raced
+      && this.raceAfterEntry
+    ) {
+      this.raced = true;
+      super.setItem(key("alpha"), this.raceAfterEntry.aggregate);
+      super.setItem(
+        "lab.version-history.v1.entry.alpha.v2-peer",
+        this.raceAfterEntry.entry,
+      );
+    }
+  }
+}
+
 const key = (documentId: string) => `lab.version-history.v1.${documentId}`;
 let originalStorage: PropertyDescriptor | undefined;
 
@@ -54,6 +75,51 @@ test("records unique states per document and lists them deterministically newest
     [laterTieA, laterTieB].sort((left, right) => right.id.localeCompare(left.id)).concat(first),
   );
   assert.deepEqual(listVersions("beta"), [other]);
+});
+
+test("per-entry records survive a later aggregate overwrite by another tab", () => {
+  const racing = new RacingStorage();
+  racing.raceAfterEntry = {
+    aggregate: JSON.stringify({
+      schemaVersion: 1,
+      documentId: "alpha",
+      entries: [{ id: "v2-peer", createdAt: 2, markdown: "from peer" }],
+    }),
+    entry: JSON.stringify({
+      documentId: "alpha",
+      recordedAt: 2,
+      entry: { id: "v2-peer", createdAt: 2, markdown: "from peer" },
+    }),
+  };
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: racing,
+  });
+
+  const recorded = recordVersion("alpha", "from this tab", 1);
+
+  assert.ok(recorded);
+  assert.deepEqual(listVersions("alpha").map((entry) => entry.markdown), [
+    "from peer",
+    "from this tab",
+  ]);
+});
+
+test("legacy aggregate history remains readable and migrates on removal", () => {
+  const legacy = {
+    schemaVersion: 1,
+    documentId: "alpha",
+    entries: [
+      { id: "v1-first", createdAt: 1, markdown: "first" },
+      { id: "v2-second", createdAt: 2, markdown: "second" },
+    ],
+  };
+  localStorage.setItem(key("alpha"), JSON.stringify(legacy));
+
+  assert.deepEqual(listVersions("alpha").map((entry) => entry.markdown), ["second", "first"]);
+  assert.equal(removeVersion("alpha", "v1-first"), true);
+  assert.deepEqual(listVersions("alpha").map((entry) => entry.markdown), ["second"]);
+  assert.ok(localStorage.getItem("lab.version-history.v1.entry.alpha.v2-second"));
 });
 
 test("returned entries cannot mutate stored history", () => {
@@ -108,6 +174,22 @@ test("prunes oldest snapshots to keep the serialized history under its byte cap"
   assert.ok(raw);
   assert.ok(new TextEncoder().encode(raw).byteLength <= VERSION_HISTORY_MAX_BYTES);
   assert.deepEqual(listVersions("alpha").map((entry) => entry.createdAt), [4, 3]);
+});
+
+test("bounds total retained history storage, including per-entry payloads", () => {
+  const block = "x".repeat(120_000);
+  for (let index = 0; index < 12; index += 1) {
+    assert.ok(recordVersion("alpha", `${block}${index}`, index + 1));
+  }
+
+  const values = (localStorage as unknown as MemoryStorage).values;
+  const totalBytes = [...values].reduce((total, [storageKey, value]) => (
+    total
+    + new TextEncoder().encode(storageKey).byteLength
+    + new TextEncoder().encode(value).byteLength
+  ), 0);
+  assert.ok(totalBytes <= VERSION_HISTORY_MAX_BYTES);
+  assert.equal(listVersions("alpha").length < 12, true);
 });
 
 test("rejects oversized snapshots and invalid public identifiers without writing", () => {

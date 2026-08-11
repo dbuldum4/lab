@@ -13,3 +13,29 @@ test("ignores fenced code and returns Untitled for empty notes", () => {
   assert.equal(automaticTitleFromMarkdown("```md\n# Not a title\n```\n\nActual text"), "Actual text");
   assert.equal(automaticTitleFromMarkdown(" \n\n"), "Untitled");
 });
+
+test("requires a matching fence type and length with a valid closing line", () => {
+  assert.equal(
+    automaticTitleFromMarkdown("````md\n# Not a title\n```\n# Still code\n````\n# Actual title"),
+    "Actual title",
+  );
+  assert.equal(
+    automaticTitleFromMarkdown("~~~md\n# Not a title\n```\n# Still code\n~~~\n# Actual title"),
+    "Actual title",
+  );
+  assert.equal(
+    automaticTitleFromMarkdown("```md\n# Not a title\n``` with text\n# Still code"),
+    "Untitled",
+  );
+});
+
+test("uses summary text without HTML wrapper tags", () => {
+  assert.equal(
+    automaticTitleFromMarkdown("<details open>\n<summary>Read **more**</summary>\n\nBody"),
+    "Read more",
+  );
+  assert.equal(
+    automaticTitleFromMarkdown("<details open><summary>Read **more**</summary></details>"),
+    "Read more",
+  );
+});

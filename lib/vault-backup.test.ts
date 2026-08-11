@@ -328,6 +328,32 @@ test("default restore preserves backup metadata while filling the empty editor s
   assert.equal(await loadLocalDocument(), source.markdown);
 });
 
+test("default restore does not replace an empty manual Untitled session", async () => {
+  const manualMetadata: DocumentSession = {
+    ...session(DEFAULT_DOCUMENT_ID, "Untitled"),
+    titleSource: "manual",
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  local.setItem("lab.session.v1.default", JSON.stringify(manualMetadata));
+  const source = {
+    ...session(DEFAULT_DOCUMENT_ID, "Restored home"),
+    createdAt: 111,
+    updatedAt: 222,
+    markdown: "restored default",
+  };
+
+  const result = await restoreLocalVault(buildVaultBackup([source]));
+  const importedId = result.importedSessionIds[0];
+  assert.equal(result.imported, 1);
+  assert.equal(result.renamed, 1);
+  assert.notEqual(importedId, DEFAULT_DOCUMENT_ID);
+  assert.equal(result.activeDocumentUpdated, false);
+  assert.deepEqual(await getDocumentSession(DEFAULT_DOCUMENT_ID), manualMetadata);
+  assert.equal(await loadLocalDocument(), "");
+  assert.equal(await loadLocalDocumentForDocument(importedId!), source.markdown);
+});
+
 test("default fill CAS preserves a peer save and imports the backup under a fresh id", async () => {
   await saveLocalDocument("peer edit");
   const peerSnapshot = local.getItem("lab.document.v1");
