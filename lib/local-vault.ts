@@ -379,6 +379,18 @@ async function normalizeSnapshot(value: unknown): Promise<CanonicalSnapshot | nu
     : null;
 }
 
+async function normalizeSnapshotPair(left: unknown, right: unknown) {
+  if (isSnapshotShape(left) && isSnapshotShape(right) && sameSnapshot(left, right)) {
+    const normalized = await normalizeSnapshot(left);
+    return [normalized, normalized] as const;
+  }
+  const [normalizedLeft, normalizedRight] = await Promise.all([
+    normalizeSnapshot(left),
+    normalizeSnapshot(right),
+  ]);
+  return [normalizedLeft, normalizedRight] as const;
+}
+
 export function sameSnapshot(left: LocalSnapshot | null, right: LocalSnapshot | null) {
   return Boolean(
     left
@@ -530,10 +542,10 @@ async function readIndexedDb(): Promise<LocalSnapshot | null> {
   const authority = authorityRecord(raw.authority);
   // The authority record is a convenience for atomic commits, not a reason to
   // hide a healthy `current` replica when the authority payload is corrupt.
-  const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-    normalizeSnapshot(authority?.snapshot),
-    normalizeSnapshot(raw.current),
-  ]);
+  const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+    authority?.snapshot,
+    raw.current,
+  );
   return selectCurrentSnapshot(
     [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
   ) as CanonicalSnapshot | null;
@@ -689,10 +701,10 @@ async function commitIndexedDb(candidate: CanonicalSnapshot): Promise<AuthorityC
       };
     }
     const authority = authorityRecord(observed.authority);
-    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-      normalizeSnapshot(authority?.snapshot),
-      normalizeSnapshot(observed.current),
-    ]);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      observed.current,
+    );
     const existing = selectCurrentSnapshot(
       [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
     ) as CanonicalSnapshot | null;
@@ -729,10 +741,10 @@ async function commitIndexedDbIfSnapshot(
     const observed = await readIndexedDbRawState();
     if (isDeletedRecord(observed.deleted)) return null;
     const authority = authorityRecord(observed.authority);
-    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-      normalizeSnapshot(authority?.snapshot),
-      normalizeSnapshot(observed.current),
-    ]);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      observed.current,
+    );
     const existing = selectCurrentSnapshot(
       [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
     ) as CanonicalSnapshot | null;
@@ -754,10 +766,10 @@ async function commitIndexedDbDeletionIfSnapshot(
     const observed = await readIndexedDbRawState();
     if (isDeletedRecord(observed.deleted)) return false;
     const authority = authorityRecord(observed.authority);
-    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-      normalizeSnapshot(authority?.snapshot),
-      normalizeSnapshot(observed.current),
-    ]);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      observed.current,
+    );
     const existing = selectCurrentSnapshot(
       [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
     ) as CanonicalSnapshot | null;
@@ -1255,10 +1267,10 @@ async function writeReplicaIfCurrent(target: StorageTarget, snapshot: CanonicalS
       return false;
     }
     const authority = authorityRecord(raw.authority);
-    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-      normalizeSnapshot(authority?.snapshot),
-      normalizeSnapshot(raw.current),
-    ]);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      raw.current,
+    );
     const current = selectCurrentSnapshot(
       [verifiedAuthority, verifiedCurrent].filter((candidate): candidate is CanonicalSnapshot => Boolean(candidate)),
     );
