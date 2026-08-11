@@ -1847,6 +1847,10 @@ function LabEditorSession() {
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
   const outlineItemsRef = useRef<OutlineItem[]>([]);
+  const largeExecCommandRef = useRef<{
+    original: Document["execCommand"];
+    patched: Document["execCommand"];
+  } | null>(null);
   const inlineMathMigrationPendingRef = useRef(true);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
@@ -2763,6 +2767,47 @@ function LabEditorSession() {
     },
     onCreate: ({ editor: instance }) => {
       editorRef.current = instance;
+      const originalExecCommand = document.execCommand.bind(document);
+      const patchedExecCommand: Document["execCommand"] = (commandId, showUI, value) => {
+        if (commandId.toLowerCase() === "inserttext" && value && value.length <= 256) {
+          const selection = window.getSelection();
+          if (
+            selection
+            && !selection.isCollapsed
+            && selection.anchorNode
+            && selection.focusNode
+            && instance.view.dom.contains(selection.anchorNode)
+            && instance.view.dom.contains(selection.focusNode)
+          ) {
+            try {
+              const anchor = instance.view.posAtDOM(selection.anchorNode, selection.anchorOffset);
+              const head = instance.view.posAtDOM(selection.focusNode, selection.focusOffset);
+              const from = Math.min(anchor, head);
+              const to = Math.max(anchor, head);
+              if (to - from >= 4096) {
+                instance.view.dispatch(
+                  closeHistory(
+                    instance.view.state.tr.insertText(value, from, to).scrollIntoView(),
+                  ),
+                );
+                return true;
+              }
+            } catch {
+              // Keep native editing when the DOM range is transient.
+            }
+          }
+        }
+        return originalExecCommand(commandId, showUI, value);
+      };
+      document.execCommand = patchedExecCommand;
+      largeExecCommandRef.current = { original: originalExecCommand, patched: patchedExecCommand };
+    },
+    onDestroy: () => {
+      const execCommandPatch = largeExecCommandRef.current;
+      if (execCommandPatch && document.execCommand === execCommandPatch.patched) {
+        document.execCommand = execCommandPatch.original;
+      }
+      largeExecCommandRef.current = null;
     },
     onTransaction: ({ editor: instance, transaction, appendedTransactions }) => {
       if (outlineOpenRef.current) {
