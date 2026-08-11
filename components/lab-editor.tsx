@@ -18,7 +18,7 @@ import Image, { type ImageOptions } from "@tiptap/extension-image";
 import { Markdown } from "@tiptap/markdown";
 import { closeHistory } from "@tiptap/pm/history";
 import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
-import { NodeSelection } from "@tiptap/pm/state";
+import { NodeSelection, type Transaction } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { BorderBeam } from "border-beam";
@@ -410,6 +410,38 @@ function outlineFromEditor(instance: Editor): OutlineItem[] {
     });
   });
   return buildOutline(headings);
+}
+
+function rangeTouchesHeading(doc: PMNode, from: number, to: number) {
+  const start = Math.max(0, Math.min(from, doc.content.size));
+  const end = Math.max(start, Math.min(to, doc.content.size));
+  if (doc.resolve(start).parent.type.name === "heading") return true;
+  if (end > start && doc.resolve(end).parent.type.name === "heading") return true;
+
+  let found = false;
+  if (end > start) {
+    doc.nodesBetween(start, end, (node) => {
+      if (node.type.name === "heading") found = true;
+    });
+  }
+  return found;
+}
+
+function transactionTouchesHeading(transaction: Transaction) {
+  if (!transaction.docChanged) return false;
+  for (const map of transaction.mapping.maps) {
+    let found = false;
+    map.forEach((oldStart, oldEnd, newStart, newEnd) => {
+      if (
+        rangeTouchesHeading(transaction.before, oldStart, oldEnd)
+        || rangeTouchesHeading(transaction.doc, newStart, newEnd)
+      ) {
+        found = true;
+      }
+    });
+    if (found) return true;
+  }
+  return false;
 }
 
 /** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
@@ -1710,6 +1742,29 @@ function LabEditorSession() {
     syncOutlineActive(instance);
   }, [syncOutlineActive]);
 
+  const syncOutlineTransactions = useCallback((instance: Editor, transactions: readonly Transaction[]) => {
+    if (!outlineOpenRef.current) return;
+
+    let nextItems = outlineItemsRef.current;
+    let positionsChanged = false;
+    for (const transaction of transactions) {
+      if (!transaction.docChanged) continue;
+      if (transactionTouchesHeading(transaction)) {
+        syncOutlineItems(instance);
+        return;
+      }
+      nextItems = nextItems.map((item) => {
+        const position = transaction.mapping.map(item.position, 1);
+        if (position === item.position) return item;
+        positionsChanged = true;
+        return { ...item, position };
+      });
+    }
+
+    if (positionsChanged) outlineItemsRef.current = nextItems;
+    syncOutlineActive(instance);
+  }, [syncOutlineActive, syncOutlineItems]);
+
   const toggleOutline = useCallback(() => {
     const nextOpen = !outlineOpenRef.current;
     if (nextOpen) {
@@ -2055,18 +2110,17 @@ function LabEditorSession() {
   }, [setPalette]);
 
   const syncInterface = useCallback(
-    (instance: Editor, refreshOutline = false) => {
+    (instance: Editor) => {
       requestAnimationFrame(() => positionCaret(instance));
       if (outlineOpenRef.current) {
-        if (refreshOutline) syncOutlineItems(instance);
-        else syncOutlineActive(instance);
+        syncOutlineActive(instance);
       }
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
       setSelected(0);
     },
-    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive, syncOutlineItems],
+    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive],
   );
 
   const editor = useEditor({
@@ -2474,7 +2528,8 @@ function LabEditorSession() {
     onCreate: ({ editor: instance }) => {
       editorRef.current = instance;
     },
-    onTransaction: ({ transaction }) => {
+    onTransaction: ({ editor: instance, transaction, appendedTransactions }) => {
+      syncOutlineTransactions(instance, [transaction, ...appendedTransactions]);
       if (!transaction.docChanged) return;
       const current = linkEditorStateRef.current;
       if (!current) return;
@@ -2496,7 +2551,7 @@ function LabEditorSession() {
     },
     onUpdate: ({ editor: instance }) => {
       if (migrateInlineMath(instance)) return;
-      syncInterface(instance, true);
+      syncInterface(instance);
       const markdown = instance.getMarkdown();
       latestMarkdown.set(markdown);
       persistence.onEdit(markdown);
@@ -3332,9 +3387,11 @@ function LabEditorSession() {
     [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
-  const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
+  const navigateToOutlineHeading = useCallback((itemId: string) => {
     const instance = editorRef.current;
     if (!instance || instance.isDestroyed) return;
+    const item = outlineItemsRef.current.find((candidate) => candidate.id === itemId);
+    if (!item) return;
     const node = instance.state.doc.nodeAt(item.position);
     if (!node || node.type.name !== "heading") {
       syncOutlineItems(instance);
@@ -3951,7 +4008,7 @@ function LabEditorSession() {
                           data-level={item.level}
                           aria-current={active ? "location" : undefined}
                           title={item.title}
-                          onClick={() => navigateToOutlineHeading(item)}
+                          onClick={() => navigateToOutlineHeading(item.id)}
                         >
                           <span className="outline-item-marker" aria-hidden="true" />
                           <span className="outline-item-label">{item.title}</span>
