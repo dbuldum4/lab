@@ -341,6 +341,53 @@ const MarkdownLinkInput = Extension.create({
  * inline nodes with single-dollar delimiters, so its Markdown handlers are
  * intentionally narrowed here to avoid confusing `$$x$$` with a block node.
  */
+const deferredMathRenders = new Map<Element, () => void>();
+let deferredMathObserver: IntersectionObserver | null = null;
+
+function createDeferredMathRenderer(element: HTMLElement, render: () => void) {
+  if (typeof IntersectionObserver === "undefined") {
+    render();
+    return {
+      renderNow: () => {},
+      destroy: () => {},
+    };
+  }
+
+  const stopObserver = () => {
+    deferredMathObserver?.unobserve(element);
+    if (deferredMathRenders.size === 0) {
+      deferredMathObserver?.disconnect();
+      deferredMathObserver = null;
+    }
+  };
+
+  const renderOnce = () => {
+    if (!deferredMathRenders.has(element)) return;
+    deferredMathRenders.delete(element);
+    stopObserver();
+    render();
+  };
+
+  if (!deferredMathObserver) {
+    deferredMathObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) deferredMathRenders.get(entry.target)?.();
+      }
+    }, { rootMargin: "600px 0px" });
+  }
+
+  deferredMathRenders.set(element, renderOnce);
+  deferredMathObserver.observe(element);
+
+  return {
+    renderNow: renderOnce,
+    destroy: () => {
+      deferredMathRenders.delete(element);
+      stopObserver();
+    },
+  };
+}
+
 const InlineMathMarkdown = InlineMath.extend({
   renderMarkdown: (node) => `$$${String(node.attrs?.latex ?? "")}$$`,
   markdownTokenizer: {
@@ -358,6 +405,52 @@ const InlineMathMarkdown = InlineMath.extend({
     // upstream input rule assumes a synchronous DOM range and can throw when
     // an IME or browser automation reports the range before reconciliation.
     return [];
+  },
+  addNodeView() {
+    const { katexOptions } = this.options;
+
+    return ({ node, getPos }) => {
+      const wrapper = document.createElement("span");
+      wrapper.className = "tiptap-mathematics-render";
+
+      if (this.editor.isEditable) {
+        wrapper.classList.add("tiptap-mathematics-render--editable");
+      }
+
+      wrapper.dataset.type = "inline-math";
+      wrapper.setAttribute("data-latex", node.attrs.latex);
+
+      function renderMath() {
+        try {
+          katex.render(node.attrs.latex, wrapper, katexOptions);
+          wrapper.classList.remove("inline-math-error");
+        } catch {
+          wrapper.textContent = node.attrs.latex;
+          wrapper.classList.add("inline-math-error");
+        }
+      }
+
+      const deferredRender = createDeferredMathRenderer(wrapper, renderMath);
+      const handleClick = (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        deferredRender.renderNow();
+        const pos = getPos();
+
+        if (pos == null) return;
+        this.options.onClick?.(node, pos);
+      };
+
+      if (this.options.onClick) wrapper.addEventListener("click", handleClick);
+
+      return {
+        dom: wrapper,
+        destroy() {
+          wrapper.removeEventListener("click", handleClick);
+          deferredRender.destroy();
+        },
+      };
+    };
   },
 });
 
@@ -383,6 +476,55 @@ const BlockMathMarkdown = BlockMath.extend({
       if (!match) return undefined;
       return { type: "blockMath", raw: match[0], latex: match[1].trim() };
     },
+  },
+  addNodeView() {
+    const { katexOptions } = this.options;
+
+    return ({ node, getPos }) => {
+      const wrapper = document.createElement("div");
+      const innerWrapper = document.createElement("div");
+      wrapper.className = "tiptap-mathematics-render";
+
+      if (this.editor.isEditable) {
+        wrapper.classList.add("tiptap-mathematics-render--editable");
+      }
+
+      innerWrapper.className = "block-math-inner";
+      wrapper.dataset.type = "block-math";
+      wrapper.setAttribute("data-latex", node.attrs.latex);
+      wrapper.appendChild(innerWrapper);
+
+      function renderMath() {
+        try {
+          katex.render(node.attrs.latex, innerWrapper, katexOptions);
+          wrapper.classList.remove("block-math-error");
+        } catch {
+          wrapper.textContent = node.attrs.latex;
+          wrapper.classList.add("block-math-error");
+        }
+      }
+
+      const deferredRender = createDeferredMathRenderer(wrapper, renderMath);
+      const handleClick = (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        deferredRender.renderNow();
+        const pos = getPos();
+
+        if (pos == null) return;
+        this.options.onClick?.(node, pos);
+      };
+
+      if (this.options.onClick) wrapper.addEventListener("click", handleClick);
+
+      return {
+        dom: wrapper,
+        destroy() {
+          wrapper.removeEventListener("click", handleClick);
+          deferredRender.destroy();
+        },
+      };
+    };
   },
 });
 
