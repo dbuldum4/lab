@@ -2001,6 +2001,32 @@ function LabEditorSession() {
     [openImageCrop, openImageMetadata],
   );
 
+  const editorExtensions = useMemo(() => [
+    StarterKit.configure({
+      heading: { levels: [1, 2, 3] },
+      link: {
+        openOnClick: true,
+        linkOnPaste: true,
+        // The built-in autolinker runs before MarkdownLinkInput and consumes URLs
+        // inside `[label](https://...)`. Plain URLs are handled by PlainUrlInput below.
+        autolink: false,
+        defaultProtocol: "https",
+        HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
+      },
+    }),
+    TaskList,
+    TaskItem.configure({ nested: true }),
+    TableKit.configure({ table: { resizable: false } }),
+    Placeholder.configure({ placeholder: "" }),
+    imageExtension,
+    ...mathExtensions,
+    ...EditorBlockExtensions,
+    Markdown.configure({ markedOptions: { gfm: true } }),
+    MarkdownLinkInput,
+    PlainUrlInput,
+    SlashCommandInput,
+  ], [imageExtension, mathExtensions]);
+
   const stopCaretBlink = useCallback(() => {
     caretStrokeRef.current?.removeAttribute("data-blinking");
   }, []);
@@ -2143,31 +2169,7 @@ function LabEditorSession() {
     // Tiptap's default style tag has no nonce. The equivalent base rules live
     // in the static global stylesheet so nonce-only CSP remains effective.
     injectCSS: false,
-    extensions: [
-      StarterKit.configure({
-        heading: { levels: [1, 2, 3] },
-        link: {
-          openOnClick: true,
-          linkOnPaste: true,
-          // The built-in autolinker runs before MarkdownLinkInput and consumes URLs
-          // inside `[label](https://...)`. Plain URLs are handled by PlainUrlInput below.
-          autolink: false,
-          defaultProtocol: "https",
-          HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
-        },
-      }),
-      TaskList,
-      TaskItem.configure({ nested: true }),
-      TableKit.configure({ table: { resizable: false } }),
-      Placeholder.configure({ placeholder: "" }),
-      imageExtension,
-      ...mathExtensions,
-      ...EditorBlockExtensions,
-      Markdown.configure({ markedOptions: { gfm: true } }),
-      MarkdownLinkInput,
-      PlainUrlInput,
-      SlashCommandInput,
-    ],
+    extensions: editorExtensions,
     content: "",
     contentType: "markdown",
     autofocus: false,
