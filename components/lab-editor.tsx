@@ -1162,17 +1162,7 @@ const LabImage = Image.extend({
       };
       syncImage(props.node);
 
-      const overlay = document.createElement("div");
-      overlay.className = "image-selection-overlay";
-      overlay.setAttribute("contenteditable", "false");
-      overlay.setAttribute("data-image-overlay", "true");
-      overlay.setAttribute("aria-hidden", "true");
-
-      const toolbar = document.createElement("div");
-      toolbar.className = "image-edit-toolbar";
-      toolbar.setAttribute("contenteditable", "false");
-      toolbar.setAttribute("role", "toolbar");
-      toolbar.setAttribute("aria-label", "Image actions");
+      let overlay: HTMLDivElement | null = null;
 
       const getCurrentImage = () => {
         const pos = props.getPos();
@@ -1195,7 +1185,7 @@ const LabImage = Image.extend({
       } | null = null;
 
       const updateOverlay = () => {
-        if (!selected) return;
+        if (!selected || !overlay) return;
         const rect = image.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
         overlay.style.left = `${rect.left}px`;
@@ -1203,68 +1193,6 @@ const LabImage = Image.extend({
         overlay.style.width = `${rect.width}px`;
         overlay.style.height = `${rect.height}px`;
       };
-
-      const makeButton = (label: string, action: () => void) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "image-edit-button";
-        button.textContent = label;
-        button.setAttribute("aria-label", `${label} image`);
-        button.addEventListener("pointerdown", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-        });
-        button.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          action();
-        });
-        return button;
-      };
-
-      const cropButton = makeButton("Crop", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        (this.options as LabImageOptions).onCrop?.(current.node, current.pos);
-      });
-      const metadataButton = makeButton("Details", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        (this.options as LabImageOptions).onMetadata?.(current.node, current.pos);
-      });
-      const deleteButton = makeButton("Delete", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        props.editor.commands.deleteSelection();
-        props.editor.commands.focus();
-      });
-      centerButton = makeButton("Center", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        props.editor.commands.updateAttributes("image", {
-          align: current.node.attrs.align === "center" ? null : "center",
-        });
-        props.editor.commands.focus();
-      });
-      syncCenterButton(props.node);
-      toolbar.append(cropButton, metadataButton, centerButton, deleteButton);
-      overlay.append(toolbar);
-
-      const resizeHandles = CROP_HANDLES
-        .map((direction) => {
-          const handle = document.createElement("button");
-          handle.type = "button";
-          handle.className = `image-resize-handle image-resize-handle-${direction}`;
-          handle.setAttribute("data-image-resize-handle", direction);
-          handle.setAttribute("aria-label", `Resize image ${direction}`);
-          handle.tabIndex = -1;
-          overlay.append(handle);
-          return { direction, handle };
-        });
 
       const finishResize = () => {
         if (!resizing) return;
@@ -1335,16 +1263,93 @@ const LabImage = Image.extend({
         document.addEventListener("pointercancel", finishResize);
       };
 
-      resizeHandles.forEach(({ direction, handle }) => {
-        handle.addEventListener("pointerdown", (event) => startResize(event, direction));
-      });
+      const ensureOverlay = () => {
+        if (overlay) return;
+
+        const nextOverlay = document.createElement("div");
+        nextOverlay.className = "image-selection-overlay";
+        nextOverlay.setAttribute("contenteditable", "false");
+        nextOverlay.setAttribute("data-image-overlay", "true");
+        nextOverlay.setAttribute("aria-hidden", "true");
+
+        const toolbar = document.createElement("div");
+        toolbar.className = "image-edit-toolbar";
+        toolbar.setAttribute("contenteditable", "false");
+        toolbar.setAttribute("role", "toolbar");
+        toolbar.setAttribute("aria-label", "Image actions");
+
+        const makeButton = (label: string, action: () => void) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "image-edit-button";
+          button.textContent = label;
+          button.setAttribute("aria-label", `${label} image`);
+          button.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          });
+          button.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            action();
+          });
+          return button;
+        };
+
+        const cropButton = makeButton("Crop", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          (this.options as LabImageOptions).onCrop?.(current.node, current.pos);
+        });
+        const metadataButton = makeButton("Details", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          (this.options as LabImageOptions).onMetadata?.(current.node, current.pos);
+        });
+        const deleteButton = makeButton("Delete", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          props.editor.commands.deleteSelection();
+          props.editor.commands.focus();
+        });
+        centerButton = makeButton("Center", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          props.editor.commands.updateAttributes("image", {
+            align: current.node.attrs.align === "center" ? null : "center",
+          });
+          props.editor.commands.focus();
+        });
+        syncCenterButton(props.node);
+        toolbar.append(cropButton, metadataButton, centerButton, deleteButton);
+        nextOverlay.append(toolbar);
+
+        CROP_HANDLES.forEach((direction) => {
+          const handle = document.createElement("button");
+          handle.type = "button";
+          handle.className = `image-resize-handle image-resize-handle-${direction}`;
+          handle.setAttribute("data-image-resize-handle", direction);
+          handle.setAttribute("aria-label", `Resize image ${direction}`);
+          handle.tabIndex = -1;
+          handle.addEventListener("pointerdown", (event) => startResize(event, direction));
+          nextOverlay.append(handle);
+        });
+
+        overlay = nextOverlay;
+        document.body.append(nextOverlay);
+      };
 
       const selectNode = () => {
+        ensureOverlay();
         selected = true;
         attachWindowListeners();
         image.classList.add("ProseMirror-selectednode");
-        overlay.style.display = "block";
-        overlay.setAttribute("aria-hidden", "false");
+        overlay?.style.setProperty("display", "block");
+        overlay?.setAttribute("aria-hidden", "false");
         updateOverlay();
       };
       const deselectNode = () => {
@@ -1352,8 +1357,8 @@ const LabImage = Image.extend({
         resizing = null;
         detachWindowListeners();
         image.classList.remove("ProseMirror-selectednode");
-        overlay.style.display = "none";
-        overlay.setAttribute("aria-hidden", "true");
+        overlay?.style.setProperty("display", "none");
+        overlay?.setAttribute("aria-hidden", "true");
       };
       const onImageClick = (event: MouseEvent) => {
         event.preventDefault();
@@ -1379,7 +1384,6 @@ const LabImage = Image.extend({
 
       image.addEventListener("click", onImageClick);
       image.addEventListener("load", onImageLoad);
-      document.body.append(overlay);
       deselectNode();
 
       return {
@@ -1400,7 +1404,7 @@ const LabImage = Image.extend({
           document.removeEventListener("pointercancel", finishResize);
           image.removeEventListener("click", onImageClick);
           image.removeEventListener("load", onImageLoad);
-          overlay.remove();
+          overlay?.remove();
         },
       };
     };
