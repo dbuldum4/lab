@@ -1855,6 +1855,7 @@ function LabEditorSession() {
 
   const setPalette = useCallback((value: PaletteState | null) => {
     const previous = paletteRef.current;
+    if (previous === value) return;
     if (previous?.mode === "search" && value?.mode !== "search") {
       searchIndexVersionRef.current += 1;
       searchComposingRef.current = false;
@@ -1869,6 +1870,7 @@ function LabEditorSession() {
   }, []);
 
   const setSelected = useCallback((value: number) => {
+    if (selectedRef.current === value) return;
     selectedRef.current = value;
     setSelectedState(value);
   }, []);
