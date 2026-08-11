@@ -554,6 +554,62 @@ function outlineFromEditor(instance: Editor): OutlineItem[] {
   return buildOutline(headings);
 }
 
+/**
+ * Serialize only top-level ProseMirror nodes that changed since the last call.
+ * ProseMirror nodes are immutable, so an unchanged node keeps the same object
+ * identity across transactions. The Markdown manager still renders every
+ * changed block, which preserves the canonical Tiptap Markdown format.
+ */
+function createIncrementalMarkdownSerializer() {
+  let cachedNodes: PMNode[] = [];
+  let cachedFragments: string[] = [];
+  let cachedMarkdown = "";
+
+  return (instance: Editor) => {
+    const manager = instance.markdown;
+    if (!manager) return instance.getMarkdown();
+
+    const documentNode = instance.state.doc;
+    const nextNodes: PMNode[] = [];
+    const nextFragments: string[] = [];
+    let changed = cachedNodes.length !== documentNode.childCount;
+
+    for (let index = 0; index < documentNode.childCount; index += 1) {
+      const node = documentNode.child(index);
+      nextNodes.push(node);
+      const nodeChanged = cachedNodes[index] !== node;
+      const previousNodeChanged = index > 0
+        && cachedNodes[index - 1] !== documentNode.child(index - 1);
+      changed ||= nodeChanged;
+      if (!nodeChanged && !previousNodeChanged) {
+        nextFragments.push(cachedFragments[index] ?? "");
+        continue;
+      }
+
+      const parentContent = index > 0 ? new Array<JSONContent>(index) : undefined;
+      if (parentContent) parentContent[index - 1] = documentNode.child(index - 1).toJSON() as JSONContent;
+      nextFragments.push(
+        manager.renderNodeToMarkdown(
+          node.toJSON() as JSONContent,
+          parentContent ? { type: "doc", content: parentContent } : { type: "doc" },
+          index,
+          0,
+        ),
+      );
+    }
+
+    if (!changed) return cachedMarkdown;
+
+    cachedNodes = nextNodes;
+    cachedFragments = nextFragments;
+    const renderedMarkdown = nextFragments.join("\n\n");
+    cachedMarkdown = renderedMarkdown.replace(/&nbsp;/g, "").replace(/\u00a0/g, "").trim() === ""
+      ? ""
+      : renderedMarkdown;
+    return cachedMarkdown;
+  };
+}
+
 function rangeTouchesHeading(doc: PMNode, from: number, to: number) {
   const start = Math.max(0, Math.min(from, doc.content.size));
   const end = Math.max(start, Math.min(to, doc.content.size));
@@ -2325,6 +2381,8 @@ function LabEditorSession() {
     [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive],
   );
 
+  const serializeMarkdown = useMemo(() => createIncrementalMarkdownSerializer(), []);
+
   const editor = useEditor({
     immediatelyRender: false,
     // Tiptap's default style tag has no nonce. The equivalent base rules live
@@ -2738,7 +2796,7 @@ function LabEditorSession() {
         if (migrateInlineMath(instance)) return;
       }
       syncInterface(instance);
-      const markdown = instance.getMarkdown();
+      const markdown = serializeMarkdown(instance);
       latestMarkdown.set(markdown);
       persistence.onEdit(markdown);
     },
@@ -3023,7 +3081,7 @@ function LabEditorSession() {
       // or an authority conflict has made the latest edit unsavable.
       const available = searchSessionList();
       setSessions(available);
-      const currentMarkdown = editor?.getMarkdown() ?? "";
+      const currentMarkdown = editor ? serializeMarkdown(editor) : "";
       const documents: LocalSearchDocument[] = (await Promise.all(available.map(async (session) => {
         if (session.id === documentId) {
           return {
@@ -3063,7 +3121,7 @@ function LabEditorSession() {
     } finally {
       if (requestVersion === searchIndexVersionRef.current) setSearchLoading(false);
     }
-  }, [documentId, editor, searchSessionList]);
+  }, [documentId, editor, searchSessionList, serializeMarkdown]);
 
   const updateSearchQuery = useCallback((query: string) => {
     const current = paletteRef.current;
@@ -3077,7 +3135,7 @@ function LabEditorSession() {
     setBacklinksLoading(true);
     try {
       const available = searchSessionList();
-      const currentMarkdown = editor?.getMarkdown() ?? "";
+      const currentMarkdown = editor ? serializeMarkdown(editor) : "";
       const documents: BacklinkDocument[] = (await Promise.all(available.map(async (session) => {
         if (session.id === documentId) {
           return { id: session.id, name: session.name, markdown: currentMarkdown, updatedAt: session.updatedAt };
@@ -3094,7 +3152,7 @@ function LabEditorSession() {
     } finally {
       setBacklinksLoading(false);
     }
-  }, [documentId, editor, searchSessionList]);
+  }, [documentId, editor, searchSessionList, serializeMarkdown]);
 
   const openCurrentLinkEditor = useCallback((anchor?: PaletteState) => {
     if (!editor) return false;
@@ -3195,12 +3253,12 @@ function LabEditorSession() {
       `Restore the version from ${new Date(version.createdAt).toLocaleString()}? The current note will be kept in version history.`,
     );
     if (!confirmed) return;
-    recordVersion(documentId, editor.getMarkdown());
+    recordVersion(documentId, serializeMarkdown(editor));
     editor.commands.setContent(version.markdown, { contentType: "markdown" });
     setPalette(null);
     editor.commands.focus("start");
     setNotice("Restored an earlier local version.");
-  }, [documentId, editor, setPalette]);
+  }, [documentId, editor, serializeMarkdown, setPalette]);
 
   const openBacklink = useCallback((backlink: Backlink) => {
     const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
@@ -3319,7 +3377,7 @@ function LabEditorSession() {
         return;
       }
       if (command.id === "stats") {
-        setStats(calculateDocumentStats(editor.getMarkdown()));
+        setStats(calculateDocumentStats(serializeMarkdown(editor)));
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "stats" });
         return;
       }
@@ -3565,12 +3623,12 @@ function LabEditorSession() {
         case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
-          downloadMarkdown("lab.md", editor.getMarkdown());
+          downloadMarkdown("lab.md", serializeMarkdown(editor));
           break;
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3747,7 +3805,7 @@ function LabEditorSession() {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       } finally {
         if (!active || !finishHydration) return;
-        if (!persistence.getState().loaded) persistence.markLoaded(editor.getMarkdown());
+        if (!persistence.getState().loaded) persistence.markLoaded(serializeMarkdown(editor));
         editor.setEditable(true, false);
         setHydrating(false);
         editor.commands.focus("end");
@@ -3758,7 +3816,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, syncInterface]);
+  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3927,7 +3985,7 @@ function LabEditorSession() {
     if (current.mode === "confirm-clear") {
       if (event.key === "Enter") {
         event.preventDefault();
-        if (editor) recordVersion(documentId, editor.getMarkdown());
+        if (editor) recordVersion(documentId, serializeMarkdown(editor));
         editor?.commands.clearContent(true);
         setPalette(null);
         editor?.commands.focus("start");
