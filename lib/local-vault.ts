@@ -494,6 +494,7 @@ async function readIndexedDbRawState(): Promise<IndexedDbRawState> {
  */
 async function refreshDeletedFromIndexedDb(): Promise<boolean> {
   const id = currentDocumentId();
+  if (isDefaultDocument(id)) return false;
   if (isLocalDocumentDeleted(id)) return true;
   if (!hasIndexedDb()) return false;
   try {
