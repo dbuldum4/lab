@@ -3,6 +3,7 @@ import { webcrypto } from "node:crypto";
 import test, { afterEach, beforeEach } from "node:test";
 import {
   activeDocumentIdFromLocation,
+  archiveDocumentSession,
   clearInvalidDocumentSessionHash,
   createDocumentSession,
   deleteDocumentSession,
@@ -11,9 +12,13 @@ import {
   getDocumentSession,
   listDocumentSessions,
   parseActiveDocumentLocation,
+  pinDocumentSession,
   purgeDocumentSession,
   renameDocumentSession,
   touchDocumentSession,
+  unarchiveDocumentSession,
+  unpinDocumentSession,
+  updateAutomaticSessionTitle,
 } from "./document-sessions.ts";
 import { deleteLocalDocument, isLocalDocumentDeleted, resetLocalVaultStateForTests } from "./local-vault.ts";
 
@@ -118,8 +123,108 @@ test("sessions are independent, resumable, and rename atomically per id", async 
   assert.equal(sessions.length, 3);
   assert.equal(sessions.find((session) => session.id === alpha.id)?.name, "Research notes");
   assert.equal(sessions.find((session) => session.id === beta.id)?.name, "Beta");
+  assert.equal(sessions.find((session) => session.id === beta.id)?.titleSource, "manual");
   assert.ok(touched.updatedAt > beforeTouch);
   assert.equal(sessions.find((session) => session.id === alpha.id)?.updatedAt, touched.updatedAt);
+});
+
+test("legacy session rows receive safe metadata defaults", async () => {
+  localStorage.setItem("lab.session.v1.default", JSON.stringify({
+    id: "default",
+    name: "Untitled",
+    createdAt: 1,
+    updatedAt: 2,
+  }));
+  localStorage.setItem("lab.session.v1.legacy", JSON.stringify({
+    id: "legacy",
+    name: "Existing title",
+    createdAt: 3,
+    updatedAt: 4,
+  }));
+
+  assert.deepEqual(await getDocumentSession("default"), {
+    id: "default",
+    name: "Untitled",
+    titleSource: "automatic",
+    pinned: false,
+    archived: false,
+    createdAt: 1,
+    updatedAt: 2,
+  });
+  assert.deepEqual(await getDocumentSession("legacy"), {
+    id: "legacy",
+    name: "Existing title",
+    titleSource: "manual",
+    pinned: false,
+    archived: false,
+    createdAt: 3,
+    updatedAt: 4,
+  });
+});
+
+test("automatic titles track headings but never override a manual name", async () => {
+  const draft = await createDocumentSession();
+  const titled = await updateAutomaticSessionTitle(draft.id, "  First   heading  ");
+  assert.equal(titled.name, "First heading");
+  assert.equal(titled.titleSource, "automatic");
+
+  await pinDocumentSession(draft.id);
+  const changed = await updateAutomaticSessionTitle(draft.id, "Second heading");
+  assert.equal(changed.name, "Second heading");
+  assert.equal(changed.pinned, true);
+
+  const manual = await renameDocumentSession(draft.id, "My title");
+  assert.equal(manual.titleSource, "manual");
+  const protectedTitle = await updateAutomaticSessionTitle(draft.id, "Ignored heading");
+  assert.deepEqual(protectedTitle, manual);
+
+  const manualUntitled = await renameDocumentSession(draft.id, "Untitled");
+  assert.equal(manualUntitled.titleSource, "manual");
+  assert.equal((await updateAutomaticSessionTitle(draft.id, "Still ignored")).name, "Untitled");
+
+  const explicitlyNamed = await createDocumentSession("Untitled");
+  assert.equal(explicitlyNamed.titleSource, "manual");
+  assert.equal((await updateAutomaticSessionTitle(explicitlyNamed.id, "Ignored too")).name, "Untitled");
+});
+
+test("pinning is explicit, idempotent, and sorts pinned sessions first", async () => {
+  const alpha = await createDocumentSession("Alpha");
+  const beta = await createDocumentSession("Beta");
+  await touchDocumentSession(beta.id);
+
+  const pinned = await pinDocumentSession(alpha.id);
+  assert.equal(pinned.pinned, true);
+  assert.equal(listDocumentSessions()[0]?.id, alpha.id);
+  assert.deepEqual(await pinDocumentSession(alpha.id), pinned);
+
+  const unpinned = await unpinDocumentSession(alpha.id);
+  assert.equal(unpinned.pinned, false);
+  assert.equal((await getDocumentSession(alpha.id))?.pinned, false);
+
+  const original = await pinDocumentSession("default");
+  assert.equal(original.id, "default");
+  assert.equal(original.pinned, true);
+});
+
+test("archived sessions are hidden by default and available through filtered views", async () => {
+  const alpha = await createDocumentSession("Alpha");
+  const beta = await createDocumentSession("Beta");
+  await pinDocumentSession(alpha.id);
+  const archived = await archiveDocumentSession(alpha.id);
+
+  assert.equal(archived.archived, true);
+  assert.equal(archived.pinned, true);
+  assert.equal(listDocumentSessions().some((item) => item.id === alpha.id), false);
+  assert.deepEqual(listDocumentSessions({ archived: true }).map((item) => item.id), [alpha.id]);
+  assert.equal(listDocumentSessions({ archived: "all" }).some((item) => item.id === alpha.id), true);
+  assert.equal(listDocumentSessions({ archived: "all" }).some((item) => item.id === beta.id), true);
+
+  const restored = await unarchiveDocumentSession(alpha.id);
+  assert.equal(restored.archived, false);
+  assert.equal(listDocumentSessions().some((item) => item.id === alpha.id), true);
+  assert.deepEqual(await unarchiveDocumentSession(alpha.id), restored);
+  await assert.rejects(() => archiveDocumentSession("default"), /original session cannot be archived/i);
+  assert.equal(listDocumentSessions().some((item) => item.id === "default"), true);
 });
 
 test("unknown hashes do not create session metadata until first durable touch", async () => {
@@ -181,6 +286,9 @@ test("tombstoned sessions cannot be renamed, touched, or re-listed as ghosts", a
 
   assert.equal(listDocumentSessions().some((session) => session.id === alpha.id), false);
   await assert.rejects(() => renameDocumentSession(alpha.id, "BackFromDead"), /deleted/i);
+  await assert.rejects(() => updateAutomaticSessionTitle(alpha.id, "BackFromDead"), /deleted/i);
+  await assert.rejects(() => pinDocumentSession(alpha.id), /deleted/i);
+  await assert.rejects(() => archiveDocumentSession(alpha.id), /deleted/i);
   await assert.rejects(() => touchDocumentSession(alpha.id), /deleted/i);
   await assert.rejects(() => ensureDocumentSession(alpha.id), /deleted/i);
   assert.equal(await getDocumentSession(alpha.id), null);

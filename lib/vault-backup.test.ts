@@ -20,8 +20,10 @@ import {
   setLocalDocumentScope,
 } from "./local-vault.ts";
 import {
+  archiveDocumentSession,
   createDocumentSession,
   getDocumentSession,
+  pinDocumentSession,
   purgeDocumentSession,
   type DocumentSession,
 } from "./document-sessions.ts";
@@ -101,19 +103,36 @@ afterEach(() => {
 });
 
 function session(id: string, name: string): DocumentSession {
-  return { id, name, createdAt: 10, updatedAt: 20 };
+  return {
+    id,
+    name,
+    titleSource: name === "Untitled" ? "automatic" : "manual",
+    pinned: false,
+    archived: false,
+    createdAt: 10,
+    updatedAt: 20,
+  };
 }
 
 test("portable backup deduplicates embedded images and round-trips the vault", async () => {
   await saveLocalDocument(`Original\n\n![pixel](${TEST_IMAGE})`);
   const extra = await createDocumentSession("Research");
   await saveLocalDocumentForDocument(extra.id, `Research\n\n![same image](${TEST_IMAGE})`);
+  await pinDocumentSession(extra.id);
+  await archiveDocumentSession(extra.id);
 
   const backup = await exportLocalVault();
   assert.equal(backup.format, "lab-local-vault");
   assert.equal(backup.version, 1);
   assert.equal(backup.counts.sessions, 2);
   assert.equal(backup.counts.assets, 1);
+  assert.deepEqual(
+    backup.sessions.find((item) => item.id === extra.id),
+    {
+      ...(await getDocumentSession(extra.id)),
+      markdown: "Research\n\n![same image](lab-asset://asset-1)",
+    },
+  );
   assert.equal(backup.assets[0]?.dataUrl, TEST_IMAGE);
   assert.match(backup.sessions.find((item) => item.id === "default")?.markdown ?? "", /lab-asset:\/\/asset-1/);
   const serialized = serializeVaultBackup(backup);
@@ -136,6 +155,8 @@ test("portable backup deduplicates embedded images and round-trips the vault", a
   assert.equal(await loadLocalDocument(), `Original\n\n![pixel](${TEST_IMAGE})`);
   setLocalDocumentScope(extra.id);
   assert.equal(await loadLocalDocument(), `Research\n\n![same image](${TEST_IMAGE})`);
+  assert.equal((await getDocumentSession(extra.id))?.pinned, true);
+  assert.equal((await getDocumentSession(extra.id))?.archived, true);
 
   const secondRestore = await restoreLocalVault(parsed);
   assert.deepEqual(
@@ -162,6 +183,33 @@ test("malformed or partial backups fail validation before storage changes", asyn
   badCounts.counts.sessions = 2;
   assert.throws(() => parseVaultBackup(badCounts), /manifest counts/);
   assert.equal(await loadLocalDocument(), "keep this note");
+});
+
+test("legacy backups receive metadata defaults and invalid new metadata is rejected", () => {
+  const legacy = JSON.parse(JSON.stringify(buildVaultBackup([{
+    id: "legacy",
+    name: "Existing title",
+    createdAt: 10,
+    updatedAt: 20,
+    markdown: "legacy note",
+  }]))) as { sessions: Array<Record<string, unknown>> };
+  delete legacy.sessions[0]?.titleSource;
+  delete legacy.sessions[0]?.pinned;
+  delete legacy.sessions[0]?.archived;
+
+  assert.deepEqual(parseVaultBackup(legacy).sessions[0], {
+    id: "legacy",
+    name: "Existing title",
+    titleSource: "manual",
+    pinned: false,
+    archived: false,
+    createdAt: 10,
+    updatedAt: 20,
+    markdown: "legacy note",
+  });
+
+  legacy.sessions[0]!.pinned = "yes";
+  assert.throws(() => parseVaultBackup(legacy), /invalid pinned state/i);
 });
 
 test("restoring a tombstoned session allocates a new id without reviving the old one", async () => {
@@ -271,6 +319,9 @@ test("default restore preserves backup metadata while filling the empty editor s
   assert.deepEqual(await getDocumentSession("default"), {
     id: source.id,
     name: source.name,
+    titleSource: source.titleSource,
+    pinned: source.pinned,
+    archived: source.archived,
     createdAt: source.createdAt,
     updatedAt: source.updatedAt,
   });
@@ -309,6 +360,9 @@ test("a later restore failure rolls back an earlier default fill", async () => {
   const originalMetadata = {
     id: "default",
     name: "Untitled",
+    titleSource: "automatic" as const,
+    pinned: false,
+    archived: false,
     createdAt: 1,
     updatedAt: 2,
   };
@@ -351,6 +405,9 @@ test("rollback preserves a concurrently renamed imported session and reports inc
   assert.deepEqual(await getDocumentSession("a-imported"), {
     id: "a-imported",
     name: "Peer rename",
+    titleSource: "manual",
+    pinned: false,
+    archived: false,
     createdAt: 10,
     updatedAt: 21,
   });

@@ -13,8 +13,17 @@ const SESSION_HASH_PREFIX = "#session=";
 export type DocumentSession = {
   id: string;
   name: string;
+  /** Automatic names may track the document heading; manual names never do. */
+  titleSource: "automatic" | "manual";
+  pinned: boolean;
+  archived: boolean;
   createdAt: number;
   updatedAt: number;
+};
+
+export type DocumentSessionListOptions = {
+  /** Active sessions are returned by default. Use true for archived only. */
+  archived?: boolean | "all";
 };
 
 export type DocumentSessionList = {
@@ -73,6 +82,34 @@ function normalizeName(value: string) {
   return value.trim().replace(/\s+/g, " ").slice(0, 80) || "Untitled";
 }
 
+function inferredTitleSource(name: string): DocumentSession["titleSource"] {
+  return normalizeName(name) === "Untitled" ? "automatic" : "manual";
+}
+
+function normalizeSessionMetadata(session: Pick<DocumentSession, "id" | "name" | "createdAt" | "updatedAt">
+  & Partial<Pick<DocumentSession, "titleSource" | "pinned" | "archived">>): DocumentSession {
+  return {
+    id: session.id,
+    name: normalizeName(session.name),
+    titleSource: session.titleSource ?? inferredTitleSource(session.name),
+    pinned: session.pinned ?? false,
+    // The original document is the navigation fallback and must stay active.
+    archived: session.id === DEFAULT_DOCUMENT_ID ? false : (session.archived ?? false),
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+  };
+}
+
+function sameSessionMetadata(left: DocumentSession, right: DocumentSession) {
+  return left.id === right.id
+    && left.name === right.name
+    && left.titleSource === right.titleSource
+    && left.pinned === right.pinned
+    && left.archived === right.archived
+    && left.createdAt === right.createdAt
+    && left.updatedAt === right.updatedAt;
+}
+
 function sessionKey(id: string) {
   return `${SESSION_KEY_PREFIX}${id}`;
 }
@@ -89,15 +126,21 @@ function parseSession(value: string | null): DocumentSession | null {
       typeof session.id !== "string"
       || normalizeId(session.id) !== session.id
       || typeof session.name !== "string"
+      || (session.titleSource !== undefined && session.titleSource !== "automatic" && session.titleSource !== "manual")
+      || (session.pinned !== undefined && typeof session.pinned !== "boolean")
+      || (session.archived !== undefined && typeof session.archived !== "boolean")
       || !Number.isFinite(session.createdAt)
       || !Number.isFinite(session.updatedAt)
     ) return null;
-    return {
+    return normalizeSessionMetadata({
       id: session.id,
-      name: normalizeName(session.name),
+      name: session.name,
+      titleSource: session.titleSource,
+      pinned: session.pinned,
+      archived: session.archived,
       createdAt: session.createdAt as number,
       updatedAt: session.updatedAt as number,
-    };
+    });
   } catch {
     return null;
   }
@@ -229,6 +272,9 @@ export async function ensureDocumentSession(id: string) {
     return writeSession({
       id: normalized,
       name: "Untitled",
+      titleSource: "automatic",
+      pinned: false,
+      archived: false,
       createdAt: now,
       updatedAt: now,
     });
@@ -257,7 +303,8 @@ function randomDocumentSessionId() {
     || fallbackId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
 }
 
-export async function createDocumentSession(name = "Untitled") {
+export async function createDocumentSession(name?: string) {
+  const initialName = name ?? "Untitled";
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const id = randomDocumentSessionId();
     if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
@@ -269,7 +316,12 @@ export async function createDocumentSession(name = "Untitled") {
       if (readSession(id)) return null;
       return writeSession({
         id,
-        name: normalizeName(name),
+        name: normalizeName(initialName),
+        // Passing any name is an explicit user/programmatic naming decision,
+        // even when that name happens to be "Untitled".
+        titleSource: name === undefined ? "automatic" : "manual",
+        pinned: false,
+        archived: false,
         createdAt: now,
         updatedAt: now,
       });
@@ -296,12 +348,15 @@ export async function restoreDocumentSession(
     const created = await withSessionLock(id, () => {
       if (id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(id)) return null;
       if (readSessionStrict(id)) return null;
-      const restored = {
+      const restored = normalizeSessionMetadata({
         id,
-        name: normalizeName(session.name),
+        name: session.name,
+        titleSource: session.titleSource,
+        pinned: session.pinned,
+        archived: session.archived,
         createdAt: Number.isFinite(session.createdAt) ? session.createdAt : 0,
         updatedAt: Number.isFinite(session.updatedAt) ? session.updatedAt : 0,
-      };
+      });
       try {
         return writeSession(restored);
       } catch (error) {
@@ -312,9 +367,7 @@ export async function restoreDocumentSession(
           if (
             current
             && current.id === restored.id
-            && current.name === restored.name
-            && current.createdAt === restored.createdAt
-            && current.updatedAt === restored.updatedAt
+            && sameSessionMetadata(current, restored)
           ) {
             const local = storage();
             local?.removeItem(sessionKey(id));
@@ -349,19 +402,19 @@ export async function restoreExistingDocumentSession(
     const existing = readSessionStrict(normalized);
     if (
       !existing
-      || existing.id !== expected.id
-      || existing.name !== expected.name
-      || existing.createdAt !== expected.createdAt
-      || existing.updatedAt !== expected.updatedAt
+      || !sameSessionMetadata(existing, expected)
     ) return null;
     const local = storage();
     if (!local) throw new Error("Session metadata storage is unavailable.");
-    const restored = {
+    const restored = normalizeSessionMetadata({
       id: normalized,
-      name: normalizeName(session.name),
+      name: session.name,
+      titleSource: session.titleSource,
+      pinned: session.pinned,
+      archived: session.archived,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
-    };
+    });
     try {
       if (!await mutateContent()) return null;
       local.removeItem(activityKey(normalized));
@@ -374,10 +427,7 @@ export async function restoreExistingDocumentSession(
         const current = readSessionStrict(normalized);
         if (
           current
-          && current.id === restored.id
-          && current.name === restored.name
-          && current.createdAt === restored.createdAt
-          && current.updatedAt === restored.updatedAt
+          && sameSessionMetadata(current, restored)
         ) writeSession(expected);
       } catch {
         // Surface the original failure; the restore caller will report any
@@ -404,10 +454,7 @@ export async function rollbackDocumentSessionMetadata(
     const existing = readSessionStrict(normalized);
     if (
       !existing
-      || existing.id !== expected.id
-      || existing.name !== expected.name
-      || existing.createdAt !== expected.createdAt
-      || existing.updatedAt !== expected.updatedAt
+      || !sameSessionMetadata(existing, expected)
     ) return false;
     const local = storage();
     if (!local) throw new Error("Session metadata storage is unavailable.");
@@ -434,10 +481,104 @@ export async function renameDocumentSession(id: string, name: string) {
     return writeSession({
       id: normalized,
       name: normalizeName(name),
+      titleSource: "manual",
+      pinned: existing?.pinned ?? false,
+      archived: existing?.archived ?? false,
       createdAt: existing?.createdAt ?? now,
       updatedAt: Math.max(now, (existing?.updatedAt ?? 0) + 1),
     });
   });
+}
+
+/**
+ * Update a heading-derived session title. A manual rename permanently wins,
+ * including a manual rename back to "Untitled".
+ */
+export async function updateAutomaticSessionTitle(id: string, name: string) {
+  const normalized = normalizeId(id);
+  await ensureDocumentNotDeleted(normalized);
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
+    const existing = readSession(normalized);
+    if (existing?.titleSource === "manual") return existing;
+    const nextName = normalizeName(name);
+    if (existing && existing.name === nextName) return existing;
+    const now = Date.now();
+    return writeSession({
+      id: normalized,
+      name: nextName,
+      titleSource: "automatic",
+      pinned: existing?.pinned ?? false,
+      archived: existing?.archived ?? false,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: Math.max(now, (existing?.updatedAt ?? 0) + 1),
+    });
+  });
+}
+
+async function setDocumentSessionPinned(id: string, pinned: boolean) {
+  const normalized = normalizeId(id);
+  await ensureDocumentNotDeleted(normalized);
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
+    const existing = readSession(normalized);
+    if (existing?.pinned === pinned) return existing;
+    const now = Date.now();
+    return writeSession({
+      id: normalized,
+      name: existing?.name ?? "Untitled",
+      titleSource: existing?.titleSource ?? "automatic",
+      pinned,
+      archived: existing?.archived ?? false,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: Math.max(now, (existing?.updatedAt ?? 0) + 1),
+    });
+  });
+}
+
+export function pinDocumentSession(id: string) {
+  return setDocumentSessionPinned(id, true);
+}
+
+export function unpinDocumentSession(id: string) {
+  return setDocumentSessionPinned(id, false);
+}
+
+async function setDocumentSessionArchived(id: string, archived: boolean) {
+  const normalized = normalizeId(id);
+  if (normalized === DEFAULT_DOCUMENT_ID && archived) {
+    throw new Error("The original session cannot be archived.");
+  }
+  await ensureDocumentNotDeleted(normalized);
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
+    const existing = readSession(normalized);
+    if (existing?.archived === archived) return existing;
+    const now = Date.now();
+    return writeSession({
+      id: normalized,
+      name: existing?.name ?? "Untitled",
+      titleSource: existing?.titleSource ?? "automatic",
+      pinned: existing?.pinned ?? false,
+      archived,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: Math.max(now, (existing?.updatedAt ?? 0) + 1),
+    });
+  });
+}
+
+export function archiveDocumentSession(id: string) {
+  return setDocumentSessionArchived(id, true);
+}
+
+export function unarchiveDocumentSession(id: string) {
+  return setDocumentSessionArchived(id, false);
 }
 
 /**
@@ -465,14 +606,15 @@ export async function touchDocumentSession(id: string) {
       return writeSession({
         id: normalized,
         name: "Untitled",
+        titleSource: "automatic",
+        pinned: false,
+        archived: false,
         createdAt: now,
         updatedAt: now,
       });
     }
     return {
-      id: normalized,
-      name: existing.name,
-      createdAt: existing.createdAt,
+      ...existing,
       updatedAt: now,
     };
   });
@@ -511,7 +653,9 @@ export async function purgeDocumentSession(id: string) {
   return deleteDocumentSession(normalized);
 }
 
-export function listDocumentSessionsWithStatus(): DocumentSessionList {
+export function listDocumentSessionsWithStatus(
+  options: DocumentSessionListOptions = {},
+): DocumentSessionList {
   const local = storage();
   const sessions: DocumentSession[] = [];
   let complete = Boolean(local);
@@ -527,7 +671,10 @@ export function listDocumentSessionsWithStatus(): DocumentSessionList {
           continue;
         }
         if (session.id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(session.id)) continue;
-        sessions.push(mergeActivity(local, session));
+        const merged = mergeActivity(local, session);
+        if (options.archived === "all" || merged.archived === (options.archived ?? false)) {
+          sessions.push(merged);
+        }
       }
     } catch {
       // Return any metadata that was readable before enumeration failed, but
@@ -535,12 +682,24 @@ export function listDocumentSessionsWithStatus(): DocumentSessionList {
       complete = false;
     }
   }
-  if (!sessions.some((session) => session.id === DEFAULT_DOCUMENT_ID)) {
-    sessions.push({ id: DEFAULT_DOCUMENT_ID, name: "Untitled", createdAt: 0, updatedAt: 0 });
+  if (
+    options.archived !== true
+    && !sessions.some((session) => session.id === DEFAULT_DOCUMENT_ID)
+  ) {
+    sessions.push({
+      id: DEFAULT_DOCUMENT_ID,
+      name: "Untitled",
+      titleSource: "automatic",
+      pinned: false,
+      archived: false,
+      createdAt: 0,
+      updatedAt: 0,
+    });
   }
   return {
     sessions: sessions.sort((left, right) => (
-      right.updatedAt - left.updatedAt
+      Number(right.pinned) - Number(left.pinned)
+      || right.updatedAt - left.updatedAt
       || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
       || left.id.localeCompare(right.id)
     )),
@@ -548,6 +707,6 @@ export function listDocumentSessionsWithStatus(): DocumentSessionList {
   };
 }
 
-export function listDocumentSessions(): DocumentSession[] {
-  return listDocumentSessionsWithStatus().sessions;
+export function listDocumentSessions(options: DocumentSessionListOptions = {}): DocumentSession[] {
+  return listDocumentSessionsWithStatus(options).sessions;
 }

@@ -60,7 +60,8 @@ export type VaultBackup = {
   assets: VaultBackupAsset[];
 };
 
-export type VaultBackupSourceSession = DocumentSession & {
+export type VaultBackupSourceSession = Omit<DocumentSession, "titleSource" | "pinned" | "archived"> &
+Partial<Pick<DocumentSession, "titleSource" | "pinned" | "archived">> & {
   markdown: string;
 };
 
@@ -354,12 +355,21 @@ function restoreEmbeddedImages(markdown: string, assets: Map<string, VaultBackup
 
 function validateSession(value: unknown, index: number): VaultBackupSession {
   if (!isRecord(value)) fail(`session ${index + 1} is not an object`);
-  const { id, name, createdAt, updatedAt, markdown } = value;
+  const { id, name, titleSource, pinned, archived, createdAt, updatedAt, markdown } = value;
   if (typeof id !== "string" || !DOCUMENT_ID_PATTERN.test(id)) {
     fail(`session ${index + 1} has an invalid id`);
   }
   if (typeof name !== "string" || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) {
     fail(`session ${id} has an invalid name`);
+  }
+  if (titleSource !== undefined && titleSource !== "automatic" && titleSource !== "manual") {
+    fail(`session ${id} has an invalid title source`);
+  }
+  if (pinned !== undefined && typeof pinned !== "boolean") {
+    fail(`session ${id} has an invalid pinned state`);
+  }
+  if (archived !== undefined && typeof archived !== "boolean") {
+    fail(`session ${id} has an invalid archived state`);
   }
   if (!isFiniteTimestamp(createdAt) || !isFiniteTimestamp(updatedAt)) {
     fail(`session ${id} has invalid timestamps`);
@@ -367,7 +377,16 @@ function validateSession(value: unknown, index: number): VaultBackupSession {
   if (typeof markdown !== "string" || markdown.length > MAX_MARKDOWN_CHARS) {
     fail(`session ${id} has invalid or oversized Markdown`);
   }
-  return { id, name, createdAt, updatedAt, markdown };
+  return {
+    id,
+    name,
+    titleSource: titleSource ?? (name.trim().replace(/\s+/g, " ") === "Untitled" ? "automatic" : "manual"),
+    pinned: pinned ?? false,
+    archived: id === DEFAULT_DOCUMENT_ID ? false : (archived ?? false),
+    createdAt,
+    updatedAt,
+    markdown,
+  };
 }
 
 function validateAsset(value: unknown, index: number): VaultBackupAsset {
@@ -466,10 +485,19 @@ export function buildVaultBackup(
         throw new Error("The vault contains duplicate or invalid session metadata.");
       }
       sourceIds.add(session.id);
+      const titleSource = session.titleSource
+        ?? (typeof session.name === "string" && session.name.trim().replace(/\s+/g, " ") === "Untitled"
+          ? "automatic"
+          : "manual");
+      const pinned = session.pinned ?? false;
+      const archived = session.id === DEFAULT_DOCUMENT_ID ? false : (session.archived ?? false);
       if (
         typeof session.name !== "string"
         || session.name.length > 80
         || /[\u0000-\u001f\u007f]/.test(session.name)
+        || (titleSource !== "automatic" && titleSource !== "manual")
+        || typeof pinned !== "boolean"
+        || typeof archived !== "boolean"
         || !isFiniteTimestamp(session.createdAt)
         || !isFiniteTimestamp(session.updatedAt)
         || typeof session.markdown !== "string"
@@ -480,6 +508,9 @@ export function buildVaultBackup(
       return {
         id: session.id,
         name: session.name,
+        titleSource,
+        pinned,
+        archived,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         markdown: externalizeEmbeddedImages(session.markdown, assets),
@@ -523,6 +554,9 @@ function sameSessionIdentity(left: readonly DocumentSession[], right: readonly D
       other
       && other.id === session.id
       && other.name === session.name
+      && other.titleSource === session.titleSource
+      && other.pinned === session.pinned
+      && other.archived === session.archived
       && other.createdAt === session.createdAt,
     );
   });
@@ -559,7 +593,7 @@ async function readExportSession(session: DocumentSession): Promise<VaultBackupS
  * creates, deletes, renames, or edits a session during the export.
  */
 export async function exportLocalVault(): Promise<VaultBackup> {
-  let catalog = listDocumentSessionsWithStatus();
+  let catalog = listDocumentSessionsWithStatus({ archived: "all" });
   if (!catalog.complete) throw new Error("The session catalog could not be read completely.");
   let sourceSessions = await Promise.all(catalog.sessions.map(readExportSession));
 
@@ -569,7 +603,7 @@ export async function exportLocalVault(): Promise<VaultBackup> {
   // identity change still fails closed, and content is re-read after each
   // timestamp change.
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const next = listDocumentSessionsWithStatus();
+    const next = listDocumentSessionsWithStatus({ archived: "all" });
     if (!next.complete || !sameSessionIdentity(catalog.sessions, next.sessions)) {
       throw new Error("The session catalog changed while the backup was being prepared.");
     }
@@ -579,7 +613,7 @@ export async function exportLocalVault(): Promise<VaultBackup> {
       if (verified.some((session) => session.markdown !== sourceById.get(session.id))) {
         throw new Error("A session changed while the backup was being prepared.");
       }
-      const final = listDocumentSessionsWithStatus();
+      const final = listDocumentSessionsWithStatus({ archived: "all" });
       if (!final.complete || !sameSessionIdentity(next.sessions, final.sessions)) {
         throw new Error("The session catalog changed while the backup was being finalized.");
       }
@@ -599,6 +633,9 @@ function sameSessionMetadata(left: DocumentSession | null, right: VaultBackupSes
     left
     && left.id === right.id
     && left.name === right.name
+    && left.titleSource === right.titleSource
+    && left.pinned === right.pinned
+    && left.archived === right.archived
     && left.createdAt === right.createdAt
     && left.updatedAt === right.updatedAt,
   );

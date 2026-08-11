@@ -2,6 +2,7 @@
 
 import {
   Extension,
+  getMarkRange,
   InputRule,
   type Editor,
   type JSONContent,
@@ -24,6 +25,12 @@ import { BorderBeam } from "border-beam";
 import katex from "katex";
 import { LayoutGroup, motion, type Transition } from "motion/react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import {
+  ImageMetadataDialog,
+  LinkEditorPanel,
+  ShortcutsPanel,
+  StatsPanel,
+} from "@/components/editor-feature-panels";
 import {
   createEditorPersistenceController,
   type EditorPersistenceController,
@@ -51,17 +58,25 @@ import {
 import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
+  archiveDocumentSession,
   clearInvalidDocumentSessionHash,
   createDocumentSession,
   documentSessionHash,
   getDocumentSession,
   listDocumentSessions,
+  pinDocumentSession,
   parseActiveDocumentLocation,
   purgeDocumentSession,
   renameDocumentSession,
   touchDocumentSession,
+  unarchiveDocumentSession,
+  unpinDocumentSession,
+  updateAutomaticSessionTitle,
   type DocumentSession,
 } from "@/lib/document-sessions";
+import { automaticTitleFromMarkdown } from "@/lib/automatic-title";
+import { calculateDocumentStats, type DocumentStats } from "@/lib/document-stats";
+import { EditorBlockExtensions } from "@/lib/editor-blocks";
 import {
   normalizeSearchQuery,
   searchableMarkdown,
@@ -69,6 +84,13 @@ import {
   type LocalSearchDocument,
   type LocalSearchResult,
 } from "@/lib/local-search";
+import {
+  documentIdFromLocalHref,
+  findBacklinks,
+  localSessionHref,
+  type Backlink,
+  type BacklinkDocument,
+} from "@/lib/note-links";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
 import {
   activeOutlineIndex,
@@ -77,9 +99,30 @@ import {
   type HeadingLevel,
   type OutlineItem,
 } from "@/lib/outline";
+import {
+  clearVersions,
+  listVersions,
+  recordVersion,
+  type VersionHistoryEntry,
+} from "@/lib/version-history";
 
 type SlashRange = { from: number; to: number };
-type PaletteMode = "commands" | "status" | "confirm-clear" | "confirm-delete" | "name" | "sessions" | "search";
+type PaletteMode =
+  | "commands"
+  | "status"
+  | "confirm-clear"
+  | "confirm-delete"
+  | "name"
+  | "sessions"
+  | "archives"
+  | "link-session"
+  | "search"
+  | "stats"
+  | "shortcuts"
+  | "language"
+  | "backlinks"
+  | "history"
+  | "link-editor";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -112,6 +155,24 @@ type ImageCropTarget = {
   pos: number;
   src: string;
   alt: string;
+};
+
+type ImageMetadataTarget = {
+  pos: number;
+  alt: string;
+  title: string;
+};
+
+type LinkEditorState = {
+  from: number;
+  to: number;
+  label: string;
+  href: string;
+};
+
+type ShortcutDescription = {
+  keys: string;
+  action: string;
 };
 
 type CropRect = {
@@ -159,6 +220,41 @@ const SLASH_SELECTION_TRANSITION: Transition = {
   mass: 0.58,
 };
 
+const CODE_LANGUAGES = [
+  { id: "", label: "Plain text" },
+  { id: "typescript", label: "TypeScript" },
+  { id: "javascript", label: "JavaScript" },
+  { id: "tsx", label: "TSX" },
+  { id: "jsx", label: "JSX" },
+  { id: "python", label: "Python" },
+  { id: "bash", label: "Shell" },
+  { id: "json", label: "JSON" },
+  { id: "html", label: "HTML" },
+  { id: "css", label: "CSS" },
+  { id: "sql", label: "SQL" },
+  { id: "rust", label: "Rust" },
+  { id: "go", label: "Go" },
+  { id: "java", label: "Java" },
+  { id: "c", label: "C" },
+  { id: "cpp", label: "C++" },
+  { id: "yaml", label: "YAML" },
+  { id: "markdown", label: "Markdown" },
+] as const;
+
+const KEYBOARD_SHORTCUTS: ShortcutDescription[] = [
+  { keys: "⌘/Ctrl K", action: "Open sessions" },
+  { keys: "⌘/Ctrl ⇧ F", action: "Search every note" },
+  { keys: "⌘/Ctrl ⇧ O", action: "Toggle outline" },
+  { keys: "⌘/Ctrl ⇧ S", action: "Show document stats" },
+  { keys: "⌘/Ctrl ⌥ H", action: "Open version history" },
+  { keys: "⌘/Ctrl ⌥ L", action: "Choose code-block language" },
+  { keys: "⌘/Ctrl ⇧ K", action: "Edit the current link" },
+  { keys: "⌘/Ctrl ⇧ N", action: "Create a new session" },
+  { keys: "⌘/Ctrl ⇧ E", action: "Insert an equation" },
+  { keys: "⌘/Ctrl S", action: "Export the current note" },
+  { keys: "⌘/Ctrl /", action: "Show shortcuts" },
+];
+
 const COMMANDS: Command[] = [
   { id: "text", label: "Text", detail: "Plain paragraph", terms: "paragraph normal" },
   { id: "h1", label: "Heading 1", detail: "Large section title", terms: "title h1" },
@@ -172,10 +268,28 @@ const COMMANDS: Command[] = [
   { id: "code", label: "Code block", detail: "Write preformatted code", terms: "pre snippet" },
   { id: "divider", label: "Divider", detail: "Separate sections", terms: "rule hr line" },
   { id: "table", label: "Table", detail: "Insert a 3 × 3 Markdown table", terms: "grid rows columns" },
+  { id: "table-row-before", label: "Table row above", detail: "Add a row before the current row", terms: "table insert row above" },
+  { id: "table-row-after", label: "Table row below", detail: "Add a row after the current row", terms: "table insert row below" },
+  { id: "table-delete-row", label: "Delete table row", detail: "Remove the current row", terms: "table remove row" },
+  { id: "table-column-before", label: "Table column left", detail: "Add a column before the current one", terms: "table insert column left" },
+  { id: "table-column-after", label: "Table column right", detail: "Add a column after the current one", terms: "table insert column right" },
+  { id: "table-delete-column", label: "Delete table column", detail: "Remove the current column", terms: "table remove column" },
+  { id: "table-toggle-header", label: "Toggle table header", detail: "Toggle the current row as a header", terms: "table heading header row" },
+  { id: "table-delete", label: "Delete table", detail: "Remove the current table", terms: "table remove grid" },
+  { id: "language", label: "Code language", detail: "Set the current code block language", terms: "code block syntax language fence" },
+  { id: "callout-note", label: "Note callout", detail: "Insert a note callout", terms: "alert info block" },
+  { id: "callout-tip", label: "Tip callout", detail: "Insert a tip callout", terms: "alert advice block" },
+  { id: "callout-warning", label: "Warning callout", detail: "Insert a warning callout", terms: "alert caution block" },
+  { id: "callout-important", label: "Important callout", detail: "Insert an important callout", terms: "alert critical block" },
+  { id: "details", label: "Collapsible section", detail: "Insert a summary with collapsible content", terms: "details disclosure toggle fold" },
   { id: "inline-math", label: "Inline equation", detail: "Write LaTeX within a line", terms: "math latex formula inline equation" },
   { id: "math", label: "Block equation", detail: "Write a centered LaTeX equation", terms: "math latex formula display equation" },
   { id: "link", label: "Link", detail: "Type a URL, then close with )", terms: "url href markdown" },
+  { id: "link-note", label: "Link to session", detail: "Insert a link to another local note", terms: "internal wiki note relation" },
+  { id: "backlinks", label: "Backlinks", detail: "Show sessions linking here", terms: "incoming internal links references" },
+  { id: "edit-link", label: "Edit link", detail: "Edit the selected link label and URL", terms: "url href rename unlink" },
   { id: "image", label: "Image", detail: "Insert a local image", terms: "photo picture upload paste" },
+  { id: "image-metadata", label: "Image metadata", detail: "Edit alt text and title", terms: "photo accessibility caption alt title" },
   { id: "undo", label: "Undo", detail: "Undo the last change", terms: "back history" },
   { id: "redo", label: "Redo", detail: "Redo the last change", terms: "forward history" },
   { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
@@ -185,8 +299,16 @@ const COMMANDS: Command[] = [
   { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
   { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
   { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
+  { id: "pin", label: "Pin session", detail: "Keep this session at the top", terms: "favorite important document" },
+  { id: "unpin", label: "Unpin session", detail: "Return this session to date ordering", terms: "favorite document" },
+  { id: "archive", label: "Archive session", detail: "Hide this session from active lists", terms: "hide store document" },
+  { id: "unarchive", label: "Unarchive session", detail: "Return this session to active lists", terms: "restore show document" },
   { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
+  { id: "archives", label: "Archived sessions", detail: "Browse locally archived notes", terms: "documents hidden stored" },
   { id: "search", label: "Search notes", detail: "Find across local sessions", terms: "find search notes text content sessions" },
+  { id: "stats", label: "Document stats", detail: "Words, characters, blocks, and reading time", terms: "count reading time metrics" },
+  { id: "history", label: "Version history", detail: "Restore an earlier local version", terms: "revisions snapshots time machine" },
+  { id: "shortcuts", label: "Keyboard shortcuts", detail: "Show every app shortcut", terms: "keys hotkeys help" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
@@ -673,13 +795,19 @@ async function insertImageFiles(
  * Local-first image node: base64/same-origin only, and safe Markdown alt.
  */
 type ImageCropHandler = (node: PMNode, pos: number) => void;
+type ImageMetadataHandler = (node: PMNode, pos: number) => void;
+type LabImageOptions = ImageOptions & {
+  onCrop: ImageCropHandler | null;
+  onMetadata: ImageMetadataHandler | null;
+};
 
 const LabImage = Image.extend({
   addOptions() {
     return {
       ...this.parent?.(),
       onCrop: null as ImageCropHandler | null,
-    } as ImageOptions & { onCrop: ImageCropHandler | null };
+      onMetadata: null as ImageMetadataHandler | null,
+    } as LabImageOptions;
   },
   addAttributes() {
     return {
@@ -910,7 +1038,13 @@ const LabImage = Image.extend({
         const current = getCurrentImage();
         if (!current) return;
         props.editor.commands.setNodeSelection(current.pos);
-        (this.options as ImageOptions & { onCrop?: ImageCropHandler }).onCrop?.(current.node, current.pos);
+        (this.options as LabImageOptions).onCrop?.(current.node, current.pos);
+      });
+      const metadataButton = makeButton("Details", () => {
+        const current = getCurrentImage();
+        if (!current) return;
+        props.editor.commands.setNodeSelection(current.pos);
+        (this.options as LabImageOptions).onMetadata?.(current.node, current.pos);
       });
       const deleteButton = makeButton("Delete", () => {
         const current = getCurrentImage();
@@ -929,7 +1063,7 @@ const LabImage = Image.extend({
         props.editor.commands.focus();
       });
       syncCenterButton(props.node);
-      toolbar.append(cropButton, centerButton, deleteButton);
+      toolbar.append(cropButton, metadataButton, centerButton, deleteButton);
       overlay.append(toolbar);
 
       const resizeHandles = CROP_HANDLES
@@ -1449,6 +1583,8 @@ function LabEditorSession() {
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
+  const [imageMetadataTarget, setImageMetadataTarget] = useState<ImageMetadataTarget | null>(null);
+  const [linkEditorState, setLinkEditorState] = useState<LinkEditorState | null>(null);
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
@@ -1456,6 +1592,13 @@ function LabEditorSession() {
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
   const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
+  const [latestMarkdown] = useState(() => {
+    let value = "";
+    return {
+      get: () => value,
+      set: (next: string) => { value = next; },
+    };
+  });
   // This chain must be observable synchronously. A successful flush calls
   // onHealth before its promise resolves; React state would leave /backup and
   // /restore awaiting the render-time (stale) chain instead of that new touch.
@@ -1472,6 +1615,13 @@ function LabEditorSession() {
   const [sessionName, setSessionName] = useState("Untitled");
   const [savedSessionName, setSavedSessionName] = useState("Untitled");
   const [sessions, setSessions] = useState<DocumentSession[]>([]);
+  const [sessionPinned, setSessionPinned] = useState(false);
+  const [sessionArchived, setSessionArchived] = useState(false);
+  const [sessionTitleSource, setSessionTitleSource] = useState<"automatic" | "manual">("automatic");
+  const [stats, setStats] = useState<DocumentStats>(() => calculateDocumentStats(""));
+  const [backlinks, setBacklinks] = useState<Backlink[]>([]);
+  const [backlinksLoading, setBacklinksLoading] = useState(false);
+  const [versions, setVersions] = useState<VersionHistoryEntry[]>([]);
   const prefersReducedMotion = usePrefersReducedMotion();
   const mobileOutline = useMobileOutline();
 
@@ -1486,7 +1636,20 @@ function LabEditorSession() {
         // documentId is stable for the mount lifetime (session switches reload),
         // so capturing it here is intentional and avoids a ref.
         if (nextHealth.saved === true) {
-          sessionTouchBarrier.enqueue(() => touchDocumentSession(documentId).then(() => undefined));
+          const markdown = latestMarkdown.get();
+          recordVersion(documentId, markdown);
+          sessionTouchBarrier.enqueue(async () => {
+            await touchDocumentSession(documentId);
+            const titled = await updateAutomaticSessionTitle(
+              documentId,
+              automaticTitleFromMarkdown(markdown),
+            );
+            if (titled.titleSource === "automatic") {
+              setSessionName(titled.name);
+              setSavedSessionName(titled.name);
+              setSessionTitleSource("automatic");
+            }
+          });
         }
       },
       onNotice: setNotice,
@@ -1597,6 +1760,14 @@ function LabEditorSession() {
       pos,
       src,
       alt: String(node.attrs.alt ?? "Image"),
+    });
+  }, []);
+
+  const openImageMetadata = useCallback((node: PMNode, pos: number) => {
+    setImageMetadataTarget({
+      pos,
+      alt: String(node.attrs.alt ?? ""),
+      title: String(node.attrs.title ?? ""),
     });
   }, []);
 
@@ -1749,8 +1920,8 @@ function LabEditorSession() {
   /* eslint-enable react-hooks/refs */
 
   const imageExtension = useMemo(
-    () => LabImage.configure({ onCrop: openImageCrop } as Partial<ImageOptions>),
-    [openImageCrop],
+    () => LabImage.configure({ onCrop: openImageCrop, onMetadata: openImageMetadata } as Partial<LabImageOptions>),
+    [openImageCrop, openImageMetadata],
   );
 
   const stopCaretBlink = useCallback(() => {
@@ -1825,6 +1996,24 @@ function LabEditorSession() {
     return { query: match[1], range: { from, to: instance.state.selection.from }, left, top, mode: "commands", anchor };
   }, []);
 
+  const paletteAtSelection = useCallback((instance: Editor, mode: PaletteMode): PaletteState => {
+    const point = instance.view.coordsAtPos(instance.state.selection.from);
+    const shellBox = shellRef.current?.getBoundingClientRect();
+    const width = Math.min(384, Math.max(1, (shellBox?.width ?? window.innerWidth) - 16));
+    const shellLeft = shellBox?.left ?? 0;
+    const shellTop = shellBox?.top ?? 0;
+    const left = clamp(point.left - shellLeft, 8, (shellBox?.width ?? window.innerWidth) - width - 8);
+    const top = Math.max(8, point.bottom + 10 - shellTop);
+    return {
+      query: "",
+      range: { from: instance.state.selection.from, to: instance.state.selection.from },
+      left,
+      top,
+      mode,
+      anchor: { left: point.left, top: point.top, bottom: point.bottom },
+    };
+  }, []);
+
   const repositionPalette = useCallback(() => {
     const current = paletteRef.current;
     const paletteElement = paletteElementRef.current;
@@ -1897,6 +2086,7 @@ function LabEditorSession() {
       Placeholder.configure({ placeholder: "" }),
       imageExtension,
       ...mathExtensions,
+      ...EditorBlockExtensions,
       Markdown.configure({ markedOptions: { gfm: true } }),
       MarkdownLinkInput,
       PlainUrlInput,
@@ -1917,6 +2107,16 @@ function LabEditorSession() {
       handleClick: (view, pos, event) => {
         const target = event.target instanceof HTMLElement ? event.target : null;
         if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
+
+        const link = target?.closest<HTMLAnchorElement>("a[href]");
+        const linkedDocumentId = documentIdFromLocalHref(link?.getAttribute("href"));
+        if (link && linkedDocumentId) {
+          event.preventDefault();
+          const href = localSessionHref(linkedDocumentId);
+          if (window.location.hash === href) window.location.reload();
+          else window.location.hash = href;
+          return true;
+        }
 
         const candidates = [pos, pos - 1, pos + 1, pos - 2, pos + 2];
         const image = target?.closest("img.lab-image");
@@ -2266,7 +2466,9 @@ function LabEditorSession() {
     onUpdate: ({ editor: instance }) => {
       if (migrateInlineMath(instance)) return;
       syncInterface(instance, true);
-      persistence.onEdit(instance.getMarkdown());
+      const markdown = instance.getMarkdown();
+      latestMarkdown.set(markdown);
+      persistence.onEdit(markdown);
     },
     onSelectionUpdate: ({ editor: instance }) => syncInterface(instance),
     onFocus: ({ editor: instance }) => syncInterface(instance),
@@ -2277,6 +2479,8 @@ function LabEditorSession() {
     if (!palette || palette.mode !== "commands") return [];
     const query = palette.query.toLowerCase();
     return COMMANDS
+      .filter((command) => command.id !== (sessionPinned ? "pin" : "unpin"))
+      .filter((command) => command.id !== (sessionArchived ? "archive" : "unarchive"))
       .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
       .sort((left, right) => {
         const score = (command: Command) => command.id === query
@@ -2286,7 +2490,7 @@ function LabEditorSession() {
             : 2;
         return score(left) - score(right);
       });
-  }, [palette]);
+  }, [palette, sessionArchived, sessionPinned]);
 
   const mathError = useMemo(() => {
     if (!mathEditorState) return null;
@@ -2385,7 +2589,7 @@ function LabEditorSession() {
       }
       return;
     }
-    if (palette?.mode === "sessions") {
+    if (palette?.mode === "sessions" || palette?.mode === "archives" || palette?.mode === "link-session") {
       const activeSession = sessions[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
@@ -2399,6 +2603,30 @@ function LabEditorSession() {
       }
       return;
     }
+    if (palette?.mode === "language") {
+      const activeLanguage = CODE_LANGUAGES[selected];
+      documentElement.setAttribute("aria-expanded", "true");
+      documentElement.setAttribute("aria-controls", PALETTE_ID);
+      if (activeLanguage) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-language-${activeLanguage.id || "plain"}`);
+      else documentElement.removeAttribute("aria-activedescendant");
+      return;
+    }
+    if (palette?.mode === "backlinks") {
+      const activeBacklink = backlinks[selected];
+      documentElement.setAttribute("aria-expanded", "true");
+      documentElement.setAttribute("aria-controls", PALETTE_ID);
+      if (activeBacklink) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-backlink-${activeBacklink.documentId}`);
+      else documentElement.removeAttribute("aria-activedescendant");
+      return;
+    }
+    if (palette?.mode === "history") {
+      const activeVersion = versions[selected];
+      documentElement.setAttribute("aria-expanded", "true");
+      documentElement.setAttribute("aria-controls", PALETTE_ID);
+      if (activeVersion) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-version-${activeVersion.id}`);
+      else documentElement.removeAttribute("aria-activedescendant");
+      return;
+    }
     if (palette?.mode === "search") {
       // The searchbox owns the result list. The editor is only the command
       // launcher and must not claim the search list as its active descendant.
@@ -2410,7 +2638,7 @@ function LabEditorSession() {
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [editor, filtered, palette, searchResults, selected, sessions]);
+  }, [backlinks, editor, filtered, palette, searchResults, selected, sessions, versions]);
 
   /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
   const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
@@ -2483,7 +2711,7 @@ function LabEditorSession() {
   }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
 
   const searchSessionList = useCallback(() => {
-    const available = [...listDocumentSessions()];
+    const available = [...listDocumentSessions({ archived: "all" })];
     const currentName = sessionName.trim() || "Untitled";
     const current = available.find((session) => session.id === documentId);
     if (current) {
@@ -2492,12 +2720,15 @@ function LabEditorSession() {
       available.push({
         id: documentId,
         name: currentName,
+        titleSource: sessionTitleSource,
+        pinned: sessionPinned,
+        archived: sessionArchived,
         createdAt: 0,
         updatedAt: 0,
       });
     }
     return available;
-  }, [documentId, sessionName]);
+  }, [documentId, sessionArchived, sessionName, sessionPinned, sessionTitleSource]);
 
   const refreshSearchIndex = useCallback(async () => {
     const requestVersion = searchIndexVersionRef.current + 1;
@@ -2558,10 +2789,151 @@ function LabEditorSession() {
     setSearchResults(searchLocalDocuments(searchDocumentsRef.current, query));
   }, [setPalette, setSelected]);
 
+  const refreshBacklinks = useCallback(async () => {
+    setBacklinksLoading(true);
+    try {
+      const available = searchSessionList();
+      const currentMarkdown = editor?.getMarkdown() ?? "";
+      const documents: BacklinkDocument[] = (await Promise.all(available.map(async (session) => {
+        if (session.id === documentId) {
+          return { id: session.id, name: session.name, markdown: currentMarkdown, updatedAt: session.updatedAt };
+        }
+        try {
+          const markdown = await readVerifiedLocalDocument(session.id);
+          if (markdown === null || isLocalDocumentDeleted(session.id)) return null;
+          return { id: session.id, name: session.name, markdown, updatedAt: session.updatedAt };
+        } catch {
+          return null;
+        }
+      }))).flatMap((document) => document ? [document] : []);
+      setBacklinks(findBacklinks(documents, documentId));
+    } finally {
+      setBacklinksLoading(false);
+    }
+  }, [documentId, editor, searchSessionList]);
+
+  const openCurrentLinkEditor = useCallback((anchor?: PaletteState) => {
+    if (!editor) return false;
+    const linkType = editor.schema.marks.link;
+    const range = linkType ? getMarkRange(editor.state.selection.$from, linkType) : undefined;
+    if (!range) {
+      setNotice("Place the caret inside a link to edit it.");
+      return false;
+    }
+    const mark = editor.state.doc.resolve(range.from + 1).marks().find((candidate) => candidate.type === linkType)
+      ?? editor.state.selection.$from.marks().find((candidate) => candidate.type === linkType);
+    if (!mark) {
+      setNotice("That link could not be read.");
+      return false;
+    }
+    setLinkEditorState({
+      from: range.from,
+      to: range.to,
+      label: editor.state.doc.textBetween(range.from, range.to, " ", " "),
+      href: String(mark.attrs.href ?? ""),
+    });
+    setPalette({
+      ...(anchor ?? paletteAtSelection(editor, "link-editor")),
+      query: "",
+      mode: "link-editor",
+      range: { from: editor.state.selection.from, to: editor.state.selection.from },
+    });
+    return true;
+  }, [editor, paletteAtSelection, setPalette]);
+
+  const saveEditedLink = useCallback((label: string, href: string) => {
+    const state = linkEditorState;
+    if (!editor || !state) return;
+    const nextLabel = label.trim();
+    const nextHref = href.trim();
+    if (!nextLabel || !nextHref) {
+      setNotice("Enter both link text and a destination.");
+      return;
+    }
+    const isLocal = documentIdFromLocalHref(nextHref) !== null;
+    let valid = isLocal;
+    if (!valid) {
+      try {
+        const parsed = new URL(nextHref);
+        valid = parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:";
+      } catch {
+        valid = false;
+      }
+    }
+    if (!valid) {
+      setNotice("Use an HTTP, HTTPS, email, or local session link.");
+      return;
+    }
+    const link = editor.schema.marks.link.create({ href: nextHref });
+    editor.view.dispatch(
+      editor.state.tr.replaceWith(state.from, state.to, editor.schema.text(nextLabel, [link])).scrollIntoView(),
+    );
+    setLinkEditorState(null);
+    setPalette(null);
+    editor.commands.focus();
+  }, [editor, linkEditorState, setPalette]);
+
+  const removeEditedLink = useCallback(() => {
+    const state = linkEditorState;
+    if (!editor || !state) return;
+    editor.view.dispatch(
+      editor.state.tr.replaceWith(state.from, state.to, editor.schema.text(state.label)).scrollIntoView(),
+    );
+    setLinkEditorState(null);
+    setPalette(null);
+    editor.commands.focus();
+  }, [editor, linkEditorState, setPalette]);
+
+  const insertSessionLink = useCallback((session: DocumentSession) => {
+    if (!editor) return;
+    const href = localSessionHref(session.id);
+    const mark = editor.schema.marks.link.create({ href });
+    editor.view.dispatch(editor.state.tr.replaceSelectionWith(editor.schema.text(session.name, [mark]), false).scrollIntoView());
+    setPalette(null);
+    editor.commands.focus();
+    setNotice(`Linked to “${session.name}”.`);
+  }, [editor, setPalette]);
+
+  const chooseCodeLanguage = useCallback((language: string) => {
+    if (!editor || !editor.isActive("codeBlock")) {
+      setNotice("The code block is no longer selected.");
+      setPalette(null);
+      return;
+    }
+    editor.chain().focus().updateAttributes("codeBlock", { language: language || null }).run();
+    setPalette(null);
+    setNotice(language ? `Set code language to ${language}.` : "Cleared the code language.");
+  }, [editor, setPalette]);
+
+  const restoreHistoryVersion = useCallback((version: VersionHistoryEntry) => {
+    if (!editor) return;
+    const confirmed = window.confirm(
+      `Restore the version from ${new Date(version.createdAt).toLocaleString()}? The current note will be kept in version history.`,
+    );
+    if (!confirmed) return;
+    recordVersion(documentId, editor.getMarkdown());
+    editor.commands.setContent(version.markdown, { contentType: "markdown" });
+    setPalette(null);
+    editor.commands.focus("start");
+    setNotice("Restored an earlier local version.");
+  }, [documentId, editor, setPalette]);
+
+  const openBacklink = useCallback((backlink: Backlink) => {
+    const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
+    if (!session) {
+      setNotice("That linking session is no longer available.");
+      return;
+    }
+    void resumeSession(session);
+  }, [resumeSession]);
+
   const openSearchResult = useCallback((result: LocalSearchResult) => {
     const session = sessions.find((candidate) => candidate.id === result.documentId) ?? {
       id: result.documentId,
       name: result.name,
+      titleSource: "automatic" as const,
+      pinned: false,
+      archived: false,
       createdAt: result.updatedAt,
       updatedAt: result.updatedAt,
     };
@@ -2585,6 +2957,7 @@ function LabEditorSession() {
     await persistence.abandon();
     try {
       await purgeDocumentSession(documentId);
+      clearVersions(documentId);
     } catch {
       // abandon() is irreversible; reload restores a live persistence controller.
       // Tombstones are only published after a durable delete marker succeeds, so
@@ -2610,6 +2983,7 @@ function LabEditorSession() {
       .then((session) => {
         setSessionName(session.name);
         setSavedSessionName(session.name);
+        setSessionTitleSource("manual");
         setNotice(`Named this session “${session.name}”.`);
         setPalette(null);
         editor?.commands.focus();
@@ -2658,6 +3032,57 @@ function LabEditorSession() {
           mode: "search",
         });
         void refreshSearchIndex();
+        return;
+      }
+      if (command.id === "stats") {
+        setStats(calculateDocumentStats(editor.getMarkdown()));
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "stats" });
+        return;
+      }
+      if (command.id === "shortcuts") {
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "shortcuts" });
+        return;
+      }
+      if (command.id === "history") {
+        const available = listVersions(documentId);
+        setVersions(available);
+        setSelected(0);
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "history" });
+        return;
+      }
+      if (command.id === "backlinks") {
+        setBacklinks([]);
+        setSelected(0);
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "backlinks" });
+        void refreshBacklinks();
+        return;
+      }
+      if (command.id === "edit-link") {
+        openCurrentLinkEditor(anchor);
+        return;
+      }
+      if (command.id === "link-note") {
+        const available = listDocumentSessions({ archived: "all" }).filter((session) => session.id !== documentId);
+        setSessions(available);
+        setSelected(0);
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "link-session" });
+        return;
+      }
+      if (command.id === "language") {
+        if (!editor.isActive("codeBlock")) {
+          editor.chain().focus().setCodeBlock().run();
+        }
+        const currentLanguage = String(editor.getAttributes("codeBlock").language ?? "");
+        setSelected(Math.max(0, CODE_LANGUAGES.findIndex((language) => language.id === currentLanguage)));
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "language" });
+        return;
+      }
+      if (command.id === "image-metadata") {
+        if (!(editor.state.selection instanceof NodeSelection) || editor.state.selection.node.type.name !== "image") {
+          setNotice("Select an image to edit its metadata.");
+          return;
+        }
+        openImageMetadata(editor.state.selection.node, editor.state.selection.from);
         return;
       }
       if (command.id === "backup") {
@@ -2745,12 +3170,43 @@ function LabEditorSession() {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "name" });
         return;
       }
+      if (command.id === "pin" || command.id === "unpin") {
+        const pinning = command.id === "pin";
+        void (pinning ? pinDocumentSession(documentId) : unpinDocumentSession(documentId))
+          .then((session) => {
+            setSessionPinned(session.pinned);
+            setNotice(session.pinned ? "Pinned this session." : "Unpinned this session.");
+          })
+          .catch(() => setNotice("This session's pin state could not be saved."));
+        return;
+      }
+      if (command.id === "archive" || command.id === "unarchive") {
+        const archiving = command.id === "archive";
+        if (archiving && documentId === DEFAULT_DOCUMENT_ID) {
+          setNotice("The original session cannot be archived.");
+          return;
+        }
+        void (archiving ? archiveDocumentSession(documentId) : unarchiveDocumentSession(documentId))
+          .then((session) => {
+            setSessionArchived(session.archived);
+            setNotice(session.archived ? "Archived this session. Use /archives to find it." : "Returned this session to the active list.");
+          })
+          .catch(() => setNotice("This session's archive state could not be saved."));
+        return;
+      }
       if (command.id === "sessions") {
         const available = listDocumentSessions();
         setSessions(available);
         const activeIndex = available.findIndex((session) => session.id === documentId);
         setSelected(Math.max(0, activeIndex));
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
+        return;
+      }
+      if (command.id === "archives") {
+        const available = listDocumentSessions({ archived: true });
+        setSessions(available);
+        setSelected(0);
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "archives" });
         return;
       }
       if (command.id === "outline") {
@@ -2778,6 +3234,19 @@ function LabEditorSession() {
         case "code": chain.toggleCodeBlock().run(); break;
         case "divider": chain.setHorizontalRule().run(); break;
         case "table": chain.insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run(); break;
+        case "table-row-before": if (!chain.addRowBefore().run()) setNotice("Place the caret inside a table first."); break;
+        case "table-row-after": if (!chain.addRowAfter().run()) setNotice("Place the caret inside a table first."); break;
+        case "table-delete-row": if (!chain.deleteRow().run()) setNotice("Place the caret inside a table first."); break;
+        case "table-column-before": if (!chain.addColumnBefore().run()) setNotice("Place the caret inside a table first."); break;
+        case "table-column-after": if (!chain.addColumnAfter().run()) setNotice("Place the caret inside a table first."); break;
+        case "table-delete-column": if (!chain.deleteColumn().run()) setNotice("Place the caret inside a table first."); break;
+        case "table-toggle-header": if (!chain.toggleHeaderRow().run()) setNotice("Place the caret inside a table first."); break;
+        case "table-delete": if (!chain.deleteTable().run()) setNotice("Place the caret inside a table first."); break;
+        case "callout-note": chain.insertCallout({ type: "note" }).run(); break;
+        case "callout-tip": chain.insertCallout({ type: "tip" }).run(); break;
+        case "callout-warning": chain.insertCallout({ type: "warning" }).run(); break;
+        case "callout-important": chain.insertCallout({ type: "important" }).run(); break;
+        case "details": chain.insertCollapsibleSection({ summary: "Summary", open: true }).run(); break;
         case "inline-math": {
           const pos = editor.state.selection.from;
           const node = editor.schema.nodes.inlineMath.create({ latex: "" });
@@ -2817,7 +3286,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openMathEditor, persistence, refreshSearchIndex, savedSessionName, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
@@ -2927,6 +3396,9 @@ function LabEditorSession() {
           if (active && activeSession) {
             setSessionName(activeSession.name);
             setSavedSessionName(activeSession.name);
+            setSessionPinned(activeSession.pinned);
+            setSessionArchived(activeSession.archived);
+            setSessionTitleSource(activeSession.titleSource);
           }
         } catch {
           if (active) setNotice("Session names are unavailable, but this note can still be loaded.");
@@ -2941,6 +3413,8 @@ function LabEditorSession() {
         }
         if (!active) return;
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
+        latestMarkdown.set(markdown);
+        recordVersion(documentId, markdown);
         persistence.markLoaded(markdown);
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
@@ -2967,7 +3441,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, openedWithInvalidSessionHash, persistence, syncInterface]);
+  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -2990,7 +3464,7 @@ function LabEditorSession() {
 
   useLayoutEffect(() => {
     repositionPalette();
-  }, [palette, filtered.length, repositionPalette]);
+  }, [backlinks.length, filtered.length, palette, repositionPalette, sessions.length, versions.length]);
 
   useEffect(() => {
     const flush = () => {
@@ -3010,11 +3484,32 @@ function LabEditorSession() {
   }, [persistence]);
 
   const onKeyDownCapture = (event: React.KeyboardEvent) => {
+    if (imageCropTarget || imageMetadataTarget) return;
     const current = paletteRef.current;
     if (!current) {
       if (outlineOpenRef.current && event.key === "Escape") {
         event.preventDefault();
         closeOutline();
+        return;
+      }
+      if (!editor || !(event.metaKey || event.ctrlKey)) return;
+      const key = event.key.toLowerCase();
+      let commandId: string | null = null;
+      if (key === "k" && !event.shiftKey && !event.altKey) commandId = "sessions";
+      else if (key === "f" && event.shiftKey) commandId = "search";
+      else if (key === "s" && event.shiftKey) commandId = "stats";
+      else if (key === "h" && event.altKey) commandId = "history";
+      else if (key === "l" && event.altKey) commandId = "language";
+      else if (key === "k" && event.shiftKey) commandId = "edit-link";
+      else if (key === "n" && event.shiftKey) commandId = "new";
+      else if (key === "s" && !event.shiftKey && !event.altKey) commandId = "export";
+      else if (key === "/") commandId = "shortcuts";
+      if (commandId) {
+        event.preventDefault();
+        const command = COMMANDS.find((candidate) => candidate.id === commandId);
+        if (!command) return;
+        setPalette(paletteAtSelection(editor, "commands"));
+        runCommand(command);
       }
       return;
     }
@@ -3022,12 +3517,13 @@ function LabEditorSession() {
     if (event.key === "Escape") {
       event.preventDefault();
       if (current.mode === "name") setSessionName(savedSessionName);
+      if (current.mode === "link-editor") setLinkEditorState(null);
       setPalette(null);
       editor?.commands.focus();
       return;
     }
 
-    if (current.mode === "name") return;
+    if (current.mode === "name" || current.mode === "link-editor") return;
 
     if (current.mode === "search") {
       const isComposing = searchComposingRef.current || event.nativeEvent.isComposing;
@@ -3052,7 +3548,7 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "sessions") {
+    if (current.mode === "sessions" || current.mode === "archives" || current.mode === "link-session") {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -3061,7 +3557,9 @@ function LabEditorSession() {
       } else if ((event.key === "Enter" || event.key === "Tab") && sessions.length > 0) {
         event.preventDefault();
         const session = sessions[selectedRef.current] ?? sessions[0];
-        if (session.id === documentId) {
+        if (current.mode === "link-session") {
+          insertSessionLink(session);
+        } else if (session.id === documentId) {
           setPalette(null);
           editor?.commands.focus();
         } else {
@@ -3071,9 +3569,48 @@ function LabEditorSession() {
       return;
     }
 
+    if (current.mode === "language") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        setSelected((selectedRef.current + direction + CODE_LANGUAGES.length) % CODE_LANGUAGES.length);
+      } else if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        chooseCodeLanguage(CODE_LANGUAGES[selectedRef.current]?.id ?? "");
+      }
+      return;
+    }
+
+    if (current.mode === "backlinks") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, backlinks.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && backlinks.length > 0) {
+        event.preventDefault();
+        openBacklink(backlinks[selectedRef.current] ?? backlinks[0]);
+      }
+      return;
+    }
+
+    if (current.mode === "history") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, versions.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && versions.length > 0) {
+        event.preventDefault();
+        restoreHistoryVersion(versions[selectedRef.current] ?? versions[0]);
+      }
+      return;
+    }
+
     if (current.mode === "confirm-clear") {
       if (event.key === "Enter") {
         event.preventDefault();
+        if (editor) recordVersion(documentId, editor.getMarkdown());
         editor?.commands.clearContent(true);
         setPalette(null);
         editor?.commands.focus("start");
@@ -3094,7 +3631,7 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "status") {
+    if (current.mode === "status" || current.mode === "stats" || current.mode === "shortcuts") {
       if (event.key === "Enter") event.preventDefault();
       if (event.key.length === 1 || event.key === "Enter") setPalette(null);
       return;
@@ -3226,6 +3763,30 @@ function LabEditorSession() {
     window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
+  const applyImageMetadata = useCallback((metadata: { alt: string; title: string }) => {
+    const target = imageMetadataTarget;
+    const instance = editorRef.current;
+    if (!target || !instance) return;
+    const node = instance.state.doc.nodeAt(target.pos);
+    if (!node || node.type.name !== "image") {
+      setImageMetadataTarget(null);
+      return;
+    }
+    instance.commands.setNodeSelection(target.pos);
+    instance.commands.updateAttributes("image", {
+      alt: metadata.alt.trim(),
+      title: metadata.title.trim() || null,
+    });
+    setImageMetadataTarget(null);
+    instance.commands.focus();
+    setNotice("Updated image alt text and title.");
+  }, [imageMetadataTarget]);
+
+  const cancelImageMetadata = useCallback(() => {
+    setImageMetadataTarget(null);
+    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+  }, []);
+
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -3351,6 +3912,13 @@ function LabEditorSession() {
           onApply={applyImageCrop}
         />
       ) : null}
+      {imageMetadataTarget ? (
+        <ImageMetadataDialog
+          target={{ alt: imageMetadataTarget.alt, title: imageMetadataTarget.title }}
+          onSave={applyImageMetadata}
+          onCancel={cancelImageMetadata}
+        />
+      ) : null}
       {mathEditorState ? (
         <div
           ref={mathEditorElementRef}
@@ -3446,8 +4014,8 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" ? "listbox" : palette.mode === "name" || palette.mode === "search" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "search" ? "Search local notes" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "link-editor" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
@@ -3584,9 +4152,9 @@ function LabEditorSession() {
               />
               <small>Enter to save · Esc to cancel</small>
             </div>
-          ) : palette.mode === "sessions" ? (
+          ) : palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" ? (
             <div className="command-list session-list" data-testid="session-list">
-              {sessions.map((session, index) => (
+              {sessions.length > 0 ? sessions.map((session, index) => (
                 <div
                   className="command-item"
                   data-selected={index === selected}
@@ -3598,7 +4166,9 @@ function LabEditorSession() {
                   aria-current={session.id === documentId ? "true" : undefined}
                   onMouseDown={(event) => {
                     event.preventDefault();
-                    if (session.id === documentId) {
+                    if (palette.mode === "link-session") {
+                      insertSessionLink(session);
+                    } else if (session.id === documentId) {
                       setPalette(null);
                       editor?.commands.focus();
                     } else {
@@ -3607,11 +4177,125 @@ function LabEditorSession() {
                   }}
                   onMouseEnter={() => setSelected(index)}
                 >
-                  <span>{session.name}</span>
-                  <small>{session.id === documentId ? "Current session" : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}</small>
+                  <span>{session.pinned ? "◆ " : ""}{session.name}</span>
+                  <small>
+                    {palette.mode === "link-session"
+                      ? session.archived ? "Archived · insert local link" : "Insert local link"
+                      : session.id === documentId
+                        ? "Current session"
+                        : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}
+                  </small>
+                </div>
+              )) : (
+                <div className="palette-message">
+                  <span>{palette.mode === "archives" ? "No archived sessions" : palette.mode === "link-session" ? "No other sessions to link" : "No sessions"}</span>
+                  <small>Esc to return to the editor</small>
+                </div>
+              )}
+            </div>
+          ) : palette.mode === "stats" ? (
+            <StatsPanel stats={stats} />
+          ) : palette.mode === "shortcuts" ? (
+            <ShortcutsPanel shortcuts={KEYBOARD_SHORTCUTS} />
+          ) : palette.mode === "language" ? (
+            <div className="command-list language-list" data-testid="language-list">
+              {CODE_LANGUAGES.map((language, index) => (
+                <div
+                  className="command-item"
+                  data-selected={index === selected}
+                  id={`${PALETTE_ID}-language-${language.id || "plain"}`}
+                  key={language.id || "plain"}
+                  role="option"
+                  aria-selected={index === selected}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    chooseCodeLanguage(language.id);
+                  }}
+                  onMouseEnter={() => setSelected(index)}
+                >
+                  <span>{language.label}</span>
+                  <small>{language.id ? `\`\`\`${language.id}` : "No fence identifier"}</small>
                 </div>
               ))}
             </div>
+          ) : palette.mode === "backlinks" ? (
+            <div className="feature-list-panel" data-testid="backlinks-panel">
+              <div className="feature-list-header">
+                <span>Backlinks</span>
+                <small>{backlinksLoading ? "Reading local notes…" : `${backlinks.length} incoming ${backlinks.length === 1 ? "link" : "links"}`}</small>
+              </div>
+              <div className="command-list feature-result-list">
+                {backlinksLoading ? (
+                  <div className="palette-message"><span>Finding links…</span><small>Verified local copies only</small></div>
+                ) : backlinks.length > 0 ? backlinks.map((backlink, index) => (
+                  <div
+                    className="command-item feature-result-item"
+                    data-selected={index === selected}
+                    id={`${PALETTE_ID}-backlink-${backlink.documentId}`}
+                    key={backlink.documentId}
+                    role="option"
+                    aria-selected={index === selected}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      openBacklink(backlink);
+                    }}
+                    onMouseEnter={() => setSelected(index)}
+                  >
+                    <span>{backlink.name}</span>
+                    <small>{backlink.excerpt}</small>
+                  </div>
+                )) : (
+                  <div className="palette-message"><span>No backlinks yet</span><small>Use /link-note in another session to create one</small></div>
+                )}
+              </div>
+            </div>
+          ) : palette.mode === "history" ? (
+            <div className="feature-list-panel" data-testid="version-history-panel">
+              <div className="feature-list-header">
+                <span>Version history</span>
+                <small>{versions.length} local {versions.length === 1 ? "version" : "versions"}</small>
+              </div>
+              <div className="command-list feature-result-list">
+                {versions.length > 0 ? versions.map((version, index) => {
+                  const versionStats = calculateDocumentStats(version.markdown);
+                  return (
+                    <div
+                      className="command-item feature-result-item"
+                      data-selected={index === selected}
+                      id={`${PALETTE_ID}-version-${version.id}`}
+                      key={version.id}
+                      role="option"
+                      aria-selected={index === selected}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        restoreHistoryVersion(version);
+                      }}
+                      onMouseEnter={() => setSelected(index)}
+                    >
+                      <span>{new Date(version.createdAt).toLocaleString()}</span>
+                      <small>{versionStats.words} {versionStats.words === 1 ? "word" : "words"} · Enter to restore</small>
+                    </div>
+                  );
+                }) : (
+                  <div className="palette-message"><span>No saved versions yet</span><small>Versions appear after durable local saves</small></div>
+                )}
+              </div>
+            </div>
+          ) : palette.mode === "link-editor" && linkEditorState ? (
+            <LinkEditorPanel
+              label={linkEditorState.label}
+              href={linkEditorState.href}
+              onLabelChange={(label) => setLinkEditorState((current) => current ? { ...current, label } : current)}
+              onHrefChange={(href) => setLinkEditorState((current) => current ? { ...current, href } : current)}
+              onSave={() => saveEditedLink(linkEditorState.label, linkEditorState.href)}
+              onRemove={removeEditedLink}
+              onCancel={() => {
+                setLinkEditorState(null);
+                setPalette(null);
+                editor?.commands.focus();
+              }}
+              saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
+            />
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
               <span>Clear the note?</span>
