@@ -1055,6 +1055,7 @@ const LabImage = Image.extend({
       const image = document.createElement("img");
       image.className = String(props.HTMLAttributes.class ?? "lab-image");
       image.draggable = false;
+      image.loading = "lazy";
       image.setAttribute("contenteditable", "false");
       let centerButton: HTMLButtonElement | null = null;
       let alignmentAnimationFrame: number | null = null;
