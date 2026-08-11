@@ -1519,11 +1519,6 @@ export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
 }
 
 async function saveLocalDocumentInScope(markdown: string): Promise<StorageHealth> {
-    if (await refreshDeletedFromIndexedDb()) {
-      const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
-      return { ...health, saved: false };
-    }
-
     const pending = readPendingDocument();
     const pendingRead = await readPendingSnapshot(pending);
     const trustedPending = pendingRead.snapshot ? pending : null;
