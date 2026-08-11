@@ -2713,8 +2713,10 @@ function LabEditorSession() {
       setLinkEditorState(next);
     },
     onUpdate: ({ editor: instance, transaction, appendedTransactions }) => {
-      const transactions = [transaction, ...appendedTransactions];
-      if (inlineMathMigrationPendingRef.current || transactions.some(transactionContainsDollar)) {
+      const hasMathMigration = inlineMathMigrationPendingRef.current
+        || transactionContainsDollar(transaction)
+        || appendedTransactions.some(transactionContainsDollar);
+      if (hasMathMigration) {
         inlineMathMigrationPendingRef.current = false;
         if (migrateInlineMath(instance)) return;
       }
