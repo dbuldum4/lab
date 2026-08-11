@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import type { Page } from "@playwright/test";
+import type { BrowserContext, Page } from "@playwright/test";
 
 export const LARGE_PAGE_SECTIONS = 800;
 export const LARGE_STRUCTURED_PASTE_SECTIONS = 600;
 export const LARGE_PLAIN_TEXT_PARAGRAPHS = 1_200;
 const SNAPSHOT_UPDATED_AT = 1_750_000_000_000;
-const EDITOR_SELECTOR = '[contenteditable="true"]';
+export const EDITOR_SELECTOR = '[contenteditable="true"]';
 
 export function structuredMarkdown(label: string, sectionCount: number) {
   return Array.from({ length: sectionCount }, (_, index) => [
@@ -56,6 +56,25 @@ function snapshotChecksum(markdown: string, updatedAt: number) {
     .digest("hex");
 }
 
+function snapshotRecord(markdown: string) {
+  return {
+    markdown,
+    updatedAt: SNAPSHOT_UPDATED_AT,
+    checksum: snapshotChecksum(markdown, SNAPSHOT_UPDATED_AT),
+    version: 2,
+  };
+}
+
+export async function installSnapshotBeforeNavigation(context: BrowserContext, markdown: string) {
+  await context.addInitScript((snapshot) => {
+    try {
+      localStorage.setItem("lab.document.v1", JSON.stringify(snapshot));
+    } catch {
+      // The first opaque about:blank document has no local storage. The target origin does.
+    }
+  }, snapshotRecord(markdown));
+}
+
 export async function openEditor(page: Page, baseURL: string) {
   await page.goto(baseURL, { waitUntil: "domcontentloaded" });
   await page.locator(EDITOR_SELECTOR).waitFor({ state: "visible", timeout: 30_000 });
@@ -67,17 +86,10 @@ export async function openEditor(page: Page, baseURL: string) {
 }
 
 export async function seedDefaultSnapshot(page: Page, markdown: string) {
-  const updatedAt = SNAPSHOT_UPDATED_AT;
-  const checksum = snapshotChecksum(markdown, updatedAt);
-  await page.evaluate(async ({ nextMarkdown, nextUpdatedAt, nextChecksum }) => {
+  await page.evaluate(async (snapshot) => {
     localStorage.clear();
     sessionStorage.clear();
-    localStorage.setItem("lab.document.v1", JSON.stringify({
-      markdown: nextMarkdown,
-      updatedAt: nextUpdatedAt,
-      checksum: nextChecksum,
-      version: 2,
-    }));
+    localStorage.setItem("lab.document.v1", JSON.stringify(snapshot));
 
     await Promise.all([
       new Promise<void>((resolve) => {
@@ -95,14 +107,10 @@ export async function seedDefaultSnapshot(page: Page, markdown: string) {
         }
       })(),
     ]);
-  }, {
-    nextMarkdown: markdown,
-    nextUpdatedAt: updatedAt,
-    nextChecksum: checksum,
-  });
+  }, snapshotRecord(markdown));
 }
 
-async function waitForDocument(page: Page, input: {
+export async function waitForDocument(page: Page, input: {
   headingCount?: number;
   marker: string;
 }) {
@@ -118,7 +126,7 @@ async function waitForDocument(page: Page, input: {
   );
 }
 
-async function afterStablePaint(page: Page) {
+export async function afterStablePaint(page: Page) {
   return page.evaluate((selector) => new Promise<number>((resolve, reject) => {
     const editor = document.querySelector(selector);
     if (!editor) {
@@ -151,15 +159,27 @@ async function afterStablePaint(page: Page) {
   }), EDITOR_SELECTOR);
 }
 
-export async function prepareLargeLoad(page: Page, baseURL: string) {
+export async function preparePersistedDocument(page: Page, baseURL: string, input: {
+  markdown: string;
+  headingCount?: number;
+  marker: string;
+}) {
   await openEditor(page, baseURL);
-  await seedDefaultSnapshot(page, LARGE_PAGE_MARKDOWN);
+  await seedDefaultSnapshot(page, input.markdown);
   await page.reload({ waitUntil: "domcontentloaded" });
   await waitForDocument(page, {
+    headingCount: input.headingCount,
+    marker: input.marker,
+  });
+  await afterStablePaint(page);
+}
+
+export async function prepareLargeLoad(page: Page, baseURL: string) {
+  await preparePersistedDocument(page, baseURL, {
+    markdown: LARGE_PAGE_MARKDOWN,
     headingCount: LARGE_PAGE_SECTIONS,
     marker: `marker-Large-page-${LARGE_PAGE_SECTIONS - 1}`,
   });
-  await afterStablePaint(page);
 }
 
 /** Returns navigation-start through a stable painted editor, in milliseconds. */
@@ -183,7 +203,7 @@ export async function prepareEmptyEditor(page: Page, baseURL: string) {
   await afterStablePaint(page);
 }
 
-async function clearEditor(page: Page) {
+export async function clearEditor(page: Page) {
   const editor = page.locator(EDITOR_SELECTOR);
   await editor.focus();
   await editor.press("ControlOrMeta+A");

@@ -8,3 +8,4 @@ out/
 !.env.example
 implementation-*.png
 test-results/
+.perf-results/

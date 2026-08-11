@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { BROWSER_SCENARIOS } from "../perf/browser-workloads";
-import { summarizeSamples } from "../perf/statistics";
+import { recordPerformanceMetric } from "../perf/results";
 
 const PERF_SAMPLES = Number.parseInt(process.env.LAB_PERF_SAMPLES ?? "7", 10);
 
@@ -9,7 +9,7 @@ if (!Number.isInteger(PERF_SAMPLES) || PERF_SAMPLES < 3) {
 }
 
 for (const scenario of BROWSER_SCENARIOS) {
-  test(`@perf ${scenario.label} stays within its coarse regression budget`, async ({ page, baseURL }) => {
+  test(`@perf-score ${scenario.label} stays within its coarse regression budget`, async ({ page, baseURL }) => {
     test.setTimeout(240_000);
     if (!baseURL) throw new Error("The performance test needs a base URL.");
     await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
@@ -25,22 +25,15 @@ for (const scenario of BROWSER_SCENARIOS) {
       samples.push(await scenario.sample(page));
     }
 
-    const summary = summarizeSamples(samples);
-    console.log(JSON.stringify({
-      kind: "lab.performance.smoke.v1",
-      scenario: scenario.id,
+    const result = recordPerformanceMetric({
+      id: scenario.id,
       label: scenario.label,
       samplesMs: samples,
-      summary,
       budgetMs: scenario.budgetMs,
-    }));
-    console.log(
-      `[perf:e2e] ${scenario.label}: median=${summary.median.toFixed(2)}ms `
-      + `p95=${summary.p95.toFixed(2)}ms MAD=${summary.mad.toFixed(2)}ms`,
-    );
+    });
 
     if (process.env.LAB_PERF_REPORT_ONLY !== "1") {
-      expect(summary.median, `${scenario.label} exceeded its ${scenario.budgetMs}ms median budget`)
+      expect(result.valueMs, `${scenario.label} exceeded its ${scenario.budgetMs}ms median budget`)
         .toBeLessThanOrEqual(scenario.budgetMs);
     }
   });

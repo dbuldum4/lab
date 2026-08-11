@@ -17,6 +17,7 @@ import {
   parseVaultBackup,
   serializeVaultBackup,
 } from "../lib/vault-backup.ts";
+import { recordPerformanceMetric } from "./results.ts";
 import { summarizeSamples, type SampleSummary } from "./statistics.ts";
 
 type BenchmarkOptions = {
@@ -43,6 +44,7 @@ if (!Number.isInteger(PERF_SAMPLES) || PERF_SAMPLES < 5) {
 }
 
 function benchmark<T>(
+  id: string,
   name: string,
   operation: () => T,
   { warmups = 2, samples = PERF_SAMPLES, iterations = 1 }: BenchmarkOptions = {},
@@ -69,17 +71,13 @@ function benchmark<T>(
     samples: durations,
     summary,
   };
-  console.log(JSON.stringify({
-    kind: "lab.performance.unit.v1",
-    name,
-    iterationsPerSample: iterations,
+  recordPerformanceMetric({
+    id,
+    label: name,
+    source: "unit",
     samplesMs: durations,
-    summary,
-  }));
-  console.log(
-    `[perf:unit] ${name}: median=${summary.median.toFixed(2)}ms `
-    + `p95=${summary.p95.toFixed(2)}ms MAD=${summary.mad.toFixed(2)}ms`,
-  );
+    details: { iterationsPerSample: iterations },
+  });
   return result;
 }
 
@@ -144,6 +142,7 @@ const BACKUP_SESSIONS = Array.from({ length: BACKUP_SESSION_COUNT }, (_, index) 
 
 test("full-vault search remains responsive across the maximum session catalog", () => {
   const result = benchmark(
+    "unit-search",
     "search 2,000 indexed sessions across common and sparse queries",
     () => {
       const common = searchLocalDocuments(SEARCH_DOCUMENTS, "shared token");
@@ -164,6 +163,7 @@ test("full-vault search remains responsive across the maximum session catalog", 
 
 test("full-vault search indexing normalizes every Markdown snapshot within budget", () => {
   const result = benchmark(
+    "unit-search-index",
     "normalize Markdown for a 2,000-session search index",
     () => SEARCH_MARKDOWN.map((markdown) => searchableMarkdown(markdown)),
     { iterations: 8 },
@@ -176,6 +176,7 @@ test("full-vault search indexing normalizes every Markdown snapshot within budge
 
 test("outline rebuild and active-heading lookup handle a large document", () => {
   const buildResult = benchmark(
+    "unit-outline-build",
     "build outline for 12,000 headings",
     () => buildOutline(OUTLINE_HEADINGS),
     { iterations: 10 },
@@ -191,6 +192,7 @@ test("outline rebuild and active-heading lookup handle a large document", () => 
     (index * 47) % (OUTLINE_HEADING_COUNT * 4 + 1)
   ));
   const activeResult = benchmark(
+    "unit-outline-active",
     "resolve 1,024 active-heading positions in a 12,000-heading outline",
     () => positions.reduce((total, position) => total + activeOutlineIndex(outline, position), 0),
     { iterations: 6 },
@@ -203,6 +205,7 @@ test("outline rebuild and active-heading lookup handle a large document", () => 
 
   const copiedOutline = outline.map((item) => ({ ...item }));
   const equalityResult = benchmark(
+    "unit-outline-compare",
     "compare cached 12,000-item outlines",
     () => areOutlineItemsEqual(outline, copiedOutline),
     { iterations: 300 },
@@ -213,6 +216,7 @@ test("outline rebuild and active-heading lookup handle a large document", () => 
 
 test("large vault backups build, serialize, and validate within budget", () => {
   const buildResult = benchmark(
+    "unit-backup-build",
     "build backup for 2,000 sessions with deduplicated images",
     () => buildVaultBackup(BACKUP_SESSIONS, 1_800_000_000_000),
     { iterations: 5 },
@@ -227,6 +231,7 @@ test("large vault backups build, serialize, and validate within budget", () => {
 
   const serialized = serializeVaultBackup(backup);
   const serializeResult = benchmark(
+    "unit-backup-serialize",
     "serialize and revalidate a 2,000-session backup",
     () => serializeVaultBackup(backup),
     { iterations: 5 },
@@ -235,6 +240,7 @@ test("large vault backups build, serialize, and validate within budget", () => {
   assertBudget(serializeResult, 4_000);
 
   const parseResult = benchmark(
+    "unit-backup-parse",
     "parse and validate a serialized 2,000-session backup",
     () => parseVaultBackup(serialized),
     { iterations: 5 },

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { looksLikeMarkdown } from "../lib/paste-normalization.ts";
 import {
@@ -9,6 +10,7 @@ import {
   LARGE_STRUCTURED_PASTE,
   LARGE_STRUCTURED_PASTE_SECTIONS,
 } from "./browser-workloads.ts";
+import { ALTERNATE_DOCUMENT_SHAPES } from "./document-shapes.ts";
 
 function lineCount(source: string, pattern: RegExp) {
   return source.split("\n").filter((line) => pattern.test(line)).length;
@@ -36,4 +38,26 @@ test("plain-text paste fixture stays on the literal paste path", () => {
     LARGE_PLAIN_TEXT_PASTE,
     new RegExp(`marker-Plain-paste-${LARGE_PLAIN_TEXT_PARAGRAPHS - 1}$`),
   );
+});
+
+test("alternate document fixtures retain distinct large shapes and final markers", () => {
+  assert.deepEqual(ALTERNATE_DOCUMENT_SHAPES.map((shape) => shape.id), [
+    "long-paragraph",
+    "nested-lists",
+    "table-heavy",
+    "render-heavy",
+  ]);
+  for (const shape of ALTERNATE_DOCUMENT_SHAPES) {
+    assert.ok(Buffer.byteLength(shape.markdown) > 75_000, `${shape.id} fixture is too small`);
+    assert.ok(shape.markdown.endsWith(shape.marker), `${shape.id} marker is not final`);
+  }
+});
+
+test("the performance index has complete weights and positive baselines", () => {
+  const baseline = JSON.parse(readFileSync(new URL("./score-baseline.json", import.meta.url), "utf8")) as {
+    metrics: Array<{ id: string; weight: number; baselineMs: number }>;
+  };
+  assert.equal(new Set(baseline.metrics.map((metric) => metric.id)).size, baseline.metrics.length);
+  assert.equal(baseline.metrics.reduce((total, metric) => total + metric.weight, 0), 100);
+  assert.ok(baseline.metrics.every((metric) => metric.baselineMs > 0));
 });

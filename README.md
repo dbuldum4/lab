@@ -40,6 +40,13 @@ Pushes to `main` deploy a static export to GitHub Pages at
 
 ## Testing
 
+For performance work, start with the [performance test guide](PERFORMANCE.md).
+This command runs every weighted metric and reports one aggregate index:
+
+```bash
+npm run perf:score
+```
+
 Fast unit, storage-contract, and editor-persistence tests run with Node's built-in test runner:
 
 ```bash
@@ -47,11 +54,12 @@ npm run test:fast
 ```
 
 Repeatable performance tests cover full-vault search and indexing, large outline
-updates, 2,000-session backup work, and real Chromium load, paste, and edit
-paths. The browser tests use the production static export, one worker, fixed
-browser settings, deterministic corpuses, explicit warmups, and stable painted
-DOM completion checks. The output includes raw JSON samples plus the median,
-p95, and median absolute deviation (MAD):
+updates, 2,000-session backup work, and real Chromium load, paste, typing,
+scrolling, outline, history, persistence, and difficult-document paths. The
+browser tests use the production static export, one worker, fixed browser
+settings, deterministic corpuses, explicit warmups, and stable painted DOM
+completion checks. The output includes raw JSON samples plus the median, p95,
+and median absolute deviation (MAD):
 
 ```bash
 npm run test:perf
@@ -62,6 +70,7 @@ Run only the library or browser layer when investigating a result:
 ```bash
 npm run test:perf:unit
 npm run test:perf:e2e
+npm run test:perf:extended
 ```
 
 The default is 11 unit samples and 7 browser samples. Increase the counts for a
