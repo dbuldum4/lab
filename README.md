@@ -2,6 +2,16 @@
 
 A local-only, local-first Markdown notepad. There is no toolbar: type `/` in an empty line to open every command.
 
+## Keyboard shortcuts
+
+The slash palette remains the complete command surface. Frequently used actions
+also have shortcuts: `Cmd/Ctrl+K` opens sessions, `Cmd/Ctrl+Shift+F` searches
+all notes, `Cmd/Ctrl+Shift+S` shows statistics, `Cmd/Ctrl+Alt+H` opens version
+history, `Cmd/Ctrl+Shift+K` edits the link around the caret,
+`Cmd/Ctrl+Shift+N` creates a session, `Cmd/Ctrl+S` exports the current note,
+and `Cmd/Ctrl+/` shows the full shortcut reference. Standard editor shortcuts
+for undo, redo, bold, italic, and selection continue to work.
+
 ## Outline
 
 Use `/outline` (or `Cmd/Ctrl+Shift+O`) to toggle a side outline built from the
@@ -83,11 +93,48 @@ can retry safely.
 
 ## Sessions
 
-The original note remains the default, so existing users do not need to manage documents. Use `/new` to start a separate local document, `/name` to give the current document a recognizable name, `/sessions` to resume another document, and `/delete` to permanently remove an extra session (the original cannot be deleted; use `/clear` to empty it).
+The original note remains the default, so existing users do not need to manage documents. Use `/new` to start a separate local document, `/name` to give the current document a recognizable name, `/sessions` to resume another document, and `/delete` to permanently remove an extra session (the original cannot be deleted; use `/clear` to empty it). Until `/name` is used, the session title follows the note's first heading or readable line. A manual name is never overwritten.
+
+Use `/pin` and `/unpin` to control which sessions stay at the top of active
+lists. `/archive` hides a non-original session without deleting its note or
+history; `/archives` browses archived sessions and `/unarchive` returns one to
+the active list. Pin, archive, and automatic/manual-title metadata are included
+in whole-vault backups.
 
 Each session has its own URL hash and isolated redundant storage. Different sessions can stay open and save independently in different tabs. Two tabs opened to the same session still use atomic conflict resolution, with the losing edit retained for `/recover` rather than silently discarded.
 
 Use `/search` (or type `/find`) to search session names and the text of every local session. Results include a short excerpt and open the matching session with Enter or a click. Search reads verified on-device snapshots only; it makes no network requests and does not create a new remote index.
+
+Use `/link-note` to insert a normal Markdown link to another local session and
+`/backlinks` to find every local note that points to the current one. Local-link
+navigation uses the same session safety and save boundary as `/sessions`.
+
+## Statistics and history
+
+`/stats` reports readable words, characters, paragraphs, headings, code blocks,
+and estimated reading time at 225 words per minute. Markdown punctuation does
+not inflate the counts.
+
+Successful durable saves create deduplicated, per-session local history.
+`/history` lists and restores those versions while preserving the current text
+as another version first. History is bounded to 50 entries and 1 MiB per
+session and is deleted when its session is permanently deleted.
+
+## Structured blocks
+
+Use `/callout-note`, `/callout-tip`, `/callout-warning`, or
+`/callout-important` for editable callouts. They export as GitHub-style
+`> [!NOTE]` alert blockquotes. `/details` inserts an editable collapsible
+section that round-trips through safe `<details>` and `<summary>` Markdown.
+
+Table commands add or remove the row or column around the caret, toggle a
+header row, or remove the table. `/language` creates or updates a fenced code
+block language; `Cmd/Ctrl+Alt+L` opens the same chooser from inside code.
+
+Place the caret inside a link and use `/edit-link` or `Cmd/Ctrl+Shift+K` to
+change its text and destination or remove the link. Selecting an image exposes
+`Details` alongside crop, center, resize, and delete controls; it edits portable
+alt text and the optional Markdown image title.
 
 ## Math
 

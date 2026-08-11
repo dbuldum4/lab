@@ -7,14 +7,40 @@ import {
 
 const SESSION_KEY_PREFIX = "lab.session.v1.";
 const SESSION_ACTIVITY_KEY_PREFIX = "lab.session.activity.v1.";
+const SESSION_FIELD_KEY_PREFIX = "lab.session.field.v1.";
+const SESSION_MANUAL_TITLE_KEY_PREFIX = "lab.session.manual-title.v1.";
 const SESSION_LOCK_PREFIX = "lab-session-metadata";
 const SESSION_HASH_PREFIX = "#session=";
+
+type SessionFieldValues = Partial<Pick<
+  DocumentSession,
+  "name" | "titleSource" | "pinned" | "archived" | "createdAt" | "updatedAt"
+>>;
+
+const SESSION_FIELDS = [
+  "name",
+  "titleSource",
+  "pinned",
+  "archived",
+  "createdAt",
+  "updatedAt",
+] as const;
+type SessionField = typeof SESSION_FIELDS[number];
 
 export type DocumentSession = {
   id: string;
   name: string;
+  /** Automatic names may track the document heading; manual names never do. */
+  titleSource: "automatic" | "manual";
+  pinned: boolean;
+  archived: boolean;
   createdAt: number;
   updatedAt: number;
+};
+
+export type DocumentSessionListOptions = {
+  /** Active sessions are returned by default. Use true for archived only. */
+  archived?: boolean | "all";
 };
 
 export type DocumentSessionList = {
@@ -73,12 +99,145 @@ function normalizeName(value: string) {
   return value.trim().replace(/\s+/g, " ").slice(0, 80) || "Untitled";
 }
 
+function inferredTitleSource(name: string): DocumentSession["titleSource"] {
+  return normalizeName(name) === "Untitled" ? "automatic" : "manual";
+}
+
+function normalizeSessionMetadata(session: Pick<DocumentSession, "id" | "name" | "createdAt" | "updatedAt">
+  & Partial<Pick<DocumentSession, "titleSource" | "pinned" | "archived">>): DocumentSession {
+  return {
+    id: session.id,
+    name: normalizeName(session.name),
+    titleSource: session.titleSource ?? inferredTitleSource(session.name),
+    pinned: session.pinned ?? false,
+    // The original document is the navigation fallback and must stay active.
+    archived: session.id === DEFAULT_DOCUMENT_ID ? false : (session.archived ?? false),
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+  };
+}
+
+function sameSessionMetadata(left: DocumentSession, right: DocumentSession) {
+  return left.id === right.id
+    && left.name === right.name
+    && left.titleSource === right.titleSource
+    && left.pinned === right.pinned
+    && left.archived === right.archived
+    && left.createdAt === right.createdAt
+    && left.updatedAt === right.updatedAt;
+}
+
+function sessionFieldsMatchEither(
+  current: DocumentSession,
+  left: DocumentSession,
+  right: DocumentSession,
+) {
+  return ["name", "titleSource", "pinned", "archived", "createdAt", "updatedAt"]
+    .every((field) => {
+      const key = field as keyof DocumentSession;
+      return current[key] === left[key] || current[key] === right[key];
+    });
+}
+
 function sessionKey(id: string) {
   return `${SESSION_KEY_PREFIX}${id}`;
 }
 
 function activityKey(id: string) {
   return `${SESSION_ACTIVITY_KEY_PREFIX}${id}`;
+}
+
+function sessionFieldKey(id: string, field: SessionField) {
+  return `${SESSION_FIELD_KEY_PREFIX}${id}.${field}`;
+}
+
+function manualTitleKey(id: string) {
+  return `${SESSION_MANUAL_TITLE_KEY_PREFIX}${id}`;
+}
+
+function readManualTitle(local: Storage, id: string) {
+  try {
+    const raw = local.getItem(manualTitleKey(id));
+    if (raw === null) return null;
+    const value: unknown = JSON.parse(raw);
+    return typeof value === "string" ? normalizeName(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeManualTitle(id: string, name: string) {
+  const local = storage();
+  if (!local) throw new Error("Session metadata storage is unavailable.");
+  local.setItem(manualTitleKey(id), JSON.stringify(normalizeName(name)));
+}
+
+function parseSessionField(value: string | null, field: SessionField): unknown {
+  if (value === null) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (field === "name") return typeof parsed === "string" ? parsed : undefined;
+    if (field === "titleSource") {
+      return parsed === "automatic" || parsed === "manual" ? parsed : undefined;
+    }
+    if (field === "pinned" || field === "archived") {
+      return typeof parsed === "boolean" ? parsed : undefined;
+    }
+    return typeof parsed === "number" && Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readSessionFields(local: Storage, id: string): SessionFieldValues {
+  const fields: SessionFieldValues = {};
+  for (const field of SESSION_FIELDS) {
+    const value = parseSessionField(local.getItem(sessionFieldKey(id, field)), field);
+    if (value === undefined) continue;
+    if (field === "name") fields.name = value as string;
+    else if (field === "titleSource") fields.titleSource = value as DocumentSession["titleSource"];
+    else if (field === "pinned") fields.pinned = value as boolean;
+    else if (field === "archived") fields.archived = value as boolean;
+    else if (field === "createdAt") fields.createdAt = value as number;
+    else fields.updatedAt = value as number;
+  }
+  const manualName = readManualTitle(local, id);
+  if (manualName !== null) {
+    fields.name = manualName;
+    fields.titleSource = "manual";
+  }
+  return fields;
+}
+
+/**
+ * Store each mutable property in its own key. A pin write can then never
+ * replace a concurrent rename or archive write, even without Web Locks.
+ */
+function writeSessionFields(id: string, fields: SessionFieldValues) {
+  const local = storage();
+  if (!local) throw new Error("Session metadata storage is unavailable.");
+  if (fields.titleSource === "manual" && fields.name !== undefined) {
+    // Publish the permanent manual marker before the replaceable title fields.
+    // An automatic writer that races these writes cannot take ownership back.
+    writeManualTitle(id, fields.name);
+  }
+  for (const field of SESSION_FIELDS) {
+    const value = fields[field];
+    if (value !== undefined) local.setItem(sessionFieldKey(id, field), JSON.stringify(value));
+  }
+  // Keep the v1 aggregate row current for older readers and exported tooling.
+  // Field keys remain authoritative, so a stale aggregate write cannot remove
+  // a concurrent change to another field.
+  const base = parseSession(local.getItem(sessionKey(id)));
+  if (base) {
+    const merged = normalizeSessionMetadata({ ...base, ...readSessionFields(local, id) });
+    local.setItem(sessionKey(id), JSON.stringify(merged));
+  }
+}
+
+function removeSessionFields(local: Storage, id: string) {
+  for (const field of SESSION_FIELDS) local.removeItem(sessionFieldKey(id, field));
+  local.removeItem(manualTitleKey(id));
 }
 
 function parseSession(value: string | null): DocumentSession | null {
@@ -89,15 +248,21 @@ function parseSession(value: string | null): DocumentSession | null {
       typeof session.id !== "string"
       || normalizeId(session.id) !== session.id
       || typeof session.name !== "string"
+      || (session.titleSource !== undefined && session.titleSource !== "automatic" && session.titleSource !== "manual")
+      || (session.pinned !== undefined && typeof session.pinned !== "boolean")
+      || (session.archived !== undefined && typeof session.archived !== "boolean")
       || !Number.isFinite(session.createdAt)
       || !Number.isFinite(session.updatedAt)
     ) return null;
-    return {
+    return normalizeSessionMetadata({
       id: session.id,
-      name: normalizeName(session.name),
+      name: session.name,
+      titleSource: session.titleSource,
+      pinned: session.pinned,
+      archived: session.archived,
       createdAt: session.createdAt as number,
       updatedAt: session.updatedAt as number,
-    };
+    });
   } catch {
     return null;
   }
@@ -126,7 +291,9 @@ function readSession(id: string) {
   if (!local) return null;
   try {
     const session = parseSession(local.getItem(sessionKey(id)));
-    return session ? mergeActivity(local, session) : null;
+    return session
+      ? mergeActivity(local, normalizeSessionMetadata({ ...session, ...readSessionFields(local, id) }))
+      : null;
   } catch {
     return null;
   }
@@ -140,7 +307,7 @@ function readSessionStrict(id: string) {
   if (raw === null) return null;
   const session = parseSession(raw);
   if (!session) throw new Error("Session metadata is invalid.");
-  return mergeActivity(local, session);
+  return mergeActivity(local, normalizeSessionMetadata({ ...session, ...readSessionFields(local, id) }));
 }
 
 function writeSession(session: DocumentSession) {
@@ -148,6 +315,19 @@ function writeSession(session: DocumentSession) {
   if (!local) throw new Error("Session metadata storage is unavailable.");
   local.setItem(sessionKey(session.id), JSON.stringify(session));
   return session;
+}
+
+function ensureMutationBase(id: string, existing: DocumentSession | null, now: number) {
+  if (existing) return existing;
+  return writeSession({
+    id,
+    name: "Untitled",
+    titleSource: "automatic",
+    pinned: false,
+    archived: false,
+    createdAt: now,
+    updatedAt: now,
+  });
 }
 
 async function withSessionLock<T>(id: string, operation: () => T | Promise<T>) {
@@ -229,6 +409,9 @@ export async function ensureDocumentSession(id: string) {
     return writeSession({
       id: normalized,
       name: "Untitled",
+      titleSource: "automatic",
+      pinned: false,
+      archived: false,
       createdAt: now,
       updatedAt: now,
     });
@@ -257,7 +440,8 @@ function randomDocumentSessionId() {
     || fallbackId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
 }
 
-export async function createDocumentSession(name = "Untitled") {
+export async function createDocumentSession(name?: string) {
+  const initialName = name ?? "Untitled";
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const id = randomDocumentSessionId();
     if (!isValidDocumentId(id) || isLocalDocumentDeleted(id)) continue;
@@ -269,7 +453,12 @@ export async function createDocumentSession(name = "Untitled") {
       if (readSession(id)) return null;
       return writeSession({
         id,
-        name: normalizeName(name),
+        name: normalizeName(initialName),
+        // Passing any name is an explicit user/programmatic naming decision,
+        // even when that name happens to be "Untitled".
+        titleSource: name === undefined ? "automatic" : "manual",
+        pinned: false,
+        archived: false,
         createdAt: now,
         updatedAt: now,
       });
@@ -296,12 +485,15 @@ export async function restoreDocumentSession(
     const created = await withSessionLock(id, () => {
       if (id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(id)) return null;
       if (readSessionStrict(id)) return null;
-      const restored = {
+      const restored = normalizeSessionMetadata({
         id,
-        name: normalizeName(session.name),
+        name: session.name,
+        titleSource: session.titleSource,
+        pinned: session.pinned,
+        archived: session.archived,
         createdAt: Number.isFinite(session.createdAt) ? session.createdAt : 0,
         updatedAt: Number.isFinite(session.updatedAt) ? session.updatedAt : 0,
-      };
+      });
       try {
         return writeSession(restored);
       } catch (error) {
@@ -312,9 +504,7 @@ export async function restoreDocumentSession(
           if (
             current
             && current.id === restored.id
-            && current.name === restored.name
-            && current.createdAt === restored.createdAt
-            && current.updatedAt === restored.updatedAt
+            && sameSessionMetadata(current, restored)
           ) {
             const local = storage();
             local?.removeItem(sessionKey(id));
@@ -349,23 +539,46 @@ export async function restoreExistingDocumentSession(
     const existing = readSessionStrict(normalized);
     if (
       !existing
-      || existing.id !== expected.id
-      || existing.name !== expected.name
-      || existing.createdAt !== expected.createdAt
-      || existing.updatedAt !== expected.updatedAt
+      || !sameSessionMetadata(existing, expected)
     ) return null;
     const local = storage();
     if (!local) throw new Error("Session metadata storage is unavailable.");
-    const restored = {
+    let previousManualTitle: string | null = null;
+    try {
+      previousManualTitle = local.getItem(manualTitleKey(normalized));
+    } catch {
+      // The strict read above already validated the row. Treat an unreadable
+      // marker as absent and preserve the original mutation error below.
+    }
+    const restored = normalizeSessionMetadata({
       id: normalized,
-      name: normalizeName(session.name),
+      name: session.name,
+      titleSource: session.titleSource,
+      pinned: session.pinned,
+      archived: session.archived,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
-    };
+    });
     try {
       if (!await mutateContent()) return null;
       local.removeItem(activityKey(normalized));
-      return writeSession(restored);
+      writeSessionFields(normalized, {
+        name: restored.name,
+        titleSource: restored.titleSource,
+        pinned: restored.pinned,
+        archived: restored.archived,
+        createdAt: restored.createdAt,
+        updatedAt: restored.updatedAt,
+      });
+      if (
+        restored.titleSource === "automatic"
+        && local.getItem(manualTitleKey(normalized)) === previousManualTitle
+      ) {
+        // An explicit restore may move a session back to automatic naming. Do
+        // not clear a marker that a peer wrote after our compare read.
+        local.removeItem(manualTitleKey(normalized));
+      }
+      return readSessionStrict(normalized) ?? restored;
     } catch (error) {
       // A Storage implementation can throw after committing setItem. Restore
       // the compare-and-set input so a failed metadata update cannot leave a
@@ -374,11 +587,30 @@ export async function restoreExistingDocumentSession(
         const current = readSessionStrict(normalized);
         if (
           current
-          && current.id === restored.id
-          && current.name === restored.name
-          && current.createdAt === restored.createdAt
-          && current.updatedAt === restored.updatedAt
-        ) writeSession(expected);
+          && (
+            sameSessionMetadata(current, restored)
+            || sessionFieldsMatchEither(current, expected, restored)
+          )
+        ) {
+          writeSession(expected);
+          // Field keys are authoritative for fallback reads. Restore them as
+          // well, or the aggregate rollback would be immediately hidden.
+          writeSessionFields(normalized, {
+            name: expected.name,
+            titleSource: expected.titleSource,
+            pinned: expected.pinned,
+            archived: expected.archived,
+            createdAt: expected.createdAt,
+            updatedAt: expected.updatedAt,
+          });
+          if (expected.titleSource === "manual") {
+            writeManualTitle(normalized, expected.name);
+          } else if (previousManualTitle === null) {
+            local.removeItem(manualTitleKey(normalized));
+          } else {
+            local.setItem(manualTitleKey(normalized), previousManualTitle);
+          }
+        }
       } catch {
         // Surface the original failure; the restore caller will report any
         // remaining cleanup failure with the affected session id.
@@ -404,10 +636,7 @@ export async function rollbackDocumentSessionMetadata(
     const existing = readSessionStrict(normalized);
     if (
       !existing
-      || existing.id !== expected.id
-      || existing.name !== expected.name
-      || existing.createdAt !== expected.createdAt
-      || existing.updatedAt !== expected.updatedAt
+      || !sameSessionMetadata(existing, expected)
     ) return false;
     const local = storage();
     if (!local) throw new Error("Session metadata storage is unavailable.");
@@ -415,6 +644,7 @@ export async function rollbackDocumentSessionMetadata(
       if (!await cleanupContent()) return false;
       local.removeItem(sessionKey(normalized));
       local.removeItem(activityKey(normalized));
+      removeSessionFields(local, normalized);
       return true;
     } catch {
       throw new Error("Session metadata could not be rolled back.");
@@ -429,15 +659,123 @@ export async function renameDocumentSession(id: string, name: string) {
     if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
       throw new Error("This session was deleted.");
     }
-    const existing = readSession(normalized);
     const now = Date.now();
-    return writeSession({
-      id: normalized,
+    const existing = ensureMutationBase(normalized, readSession(normalized), now);
+    const next = {
+      ...existing,
       name: normalizeName(name),
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: Math.max(now, (existing?.updatedAt ?? 0) + 1),
+      titleSource: "manual" as const,
+      updatedAt: Math.max(now, existing.updatedAt + 1),
+    };
+    writeSessionFields(normalized, {
+      name: next.name,
+      titleSource: next.titleSource,
+      updatedAt: next.updatedAt,
     });
+    // A manual-title marker can appear after the read above when Web Locks are
+    // unavailable. Return the merged value so this tab also shows the manual
+    // title that won the race.
+    return readSession(normalized) ?? next;
   });
+}
+
+/**
+ * Update a heading-derived session title. A manual rename permanently wins,
+ * including a manual rename back to "Untitled".
+ */
+export async function updateAutomaticSessionTitle(id: string, name: string) {
+  const normalized = normalizeId(id);
+  await ensureDocumentNotDeleted(normalized);
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
+    const existing = readSession(normalized);
+    if (existing?.titleSource === "manual") return existing;
+    const nextName = normalizeName(name);
+    if (existing && existing.name === nextName) return existing;
+    const now = Date.now();
+    const base = ensureMutationBase(normalized, existing, now);
+    const next = {
+      ...base,
+      name: nextName,
+      titleSource: "automatic" as const,
+      updatedAt: Math.max(now, base.updatedAt + 1),
+    };
+    writeSessionFields(normalized, {
+      name: next.name,
+      titleSource: next.titleSource,
+      updatedAt: next.updatedAt,
+    });
+    return readSession(normalized) ?? next;
+  });
+}
+
+async function setDocumentSessionPinned(id: string, pinned: boolean) {
+  const normalized = normalizeId(id);
+  await ensureDocumentNotDeleted(normalized);
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
+    const existing = readSession(normalized);
+    if (existing?.pinned === pinned) return existing;
+    const now = Date.now();
+    const base = ensureMutationBase(normalized, existing, now);
+    const next = {
+      ...base,
+      pinned,
+      updatedAt: Math.max(now, base.updatedAt + 1),
+    };
+    writeSessionFields(normalized, {
+      pinned: next.pinned,
+      updatedAt: next.updatedAt,
+    });
+    return next;
+  });
+}
+
+export function pinDocumentSession(id: string) {
+  return setDocumentSessionPinned(id, true);
+}
+
+export function unpinDocumentSession(id: string) {
+  return setDocumentSessionPinned(id, false);
+}
+
+async function setDocumentSessionArchived(id: string, archived: boolean) {
+  const normalized = normalizeId(id);
+  if (normalized === DEFAULT_DOCUMENT_ID && archived) {
+    throw new Error("The original session cannot be archived.");
+  }
+  await ensureDocumentNotDeleted(normalized);
+  return withSessionLock(normalized, () => {
+    if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+      throw new Error("This session was deleted.");
+    }
+    const existing = readSession(normalized);
+    if (existing?.archived === archived) return existing;
+    const now = Date.now();
+    const base = ensureMutationBase(normalized, existing, now);
+    const next = {
+      ...base,
+      archived,
+      updatedAt: Math.max(now, base.updatedAt + 1),
+    };
+    writeSessionFields(normalized, {
+      archived: next.archived,
+      updatedAt: next.updatedAt,
+    });
+    return next;
+  });
+}
+
+export function archiveDocumentSession(id: string) {
+  return setDocumentSessionArchived(id, true);
+}
+
+export function unarchiveDocumentSession(id: string) {
+  return setDocumentSessionArchived(id, false);
 }
 
 /**
@@ -465,14 +803,15 @@ export async function touchDocumentSession(id: string) {
       return writeSession({
         id: normalized,
         name: "Untitled",
+        titleSource: "automatic",
+        pinned: false,
+        archived: false,
         createdAt: now,
         updatedAt: now,
       });
     }
     return {
-      id: normalized,
-      name: existing.name,
-      createdAt: existing.createdAt,
+      ...existing,
       updatedAt: now,
     };
   });
@@ -490,6 +829,7 @@ export async function deleteDocumentSession(id: string) {
     try {
       local.removeItem(sessionKey(normalized));
       local.removeItem(activityKey(normalized));
+      removeSessionFields(local, normalized);
     } catch {
       throw new Error("Session metadata could not be deleted.");
     }
@@ -511,7 +851,9 @@ export async function purgeDocumentSession(id: string) {
   return deleteDocumentSession(normalized);
 }
 
-export function listDocumentSessionsWithStatus(): DocumentSessionList {
+export function listDocumentSessionsWithStatus(
+  options: DocumentSessionListOptions = {},
+): DocumentSessionList {
   const local = storage();
   const sessions: DocumentSession[] = [];
   let complete = Boolean(local);
@@ -527,7 +869,13 @@ export function listDocumentSessionsWithStatus(): DocumentSessionList {
           continue;
         }
         if (session.id !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(session.id)) continue;
-        sessions.push(mergeActivity(local, session));
+        const merged = mergeActivity(
+          local,
+          normalizeSessionMetadata({ ...session, ...readSessionFields(local, session.id) }),
+        );
+        if (options.archived === "all" || merged.archived === (options.archived ?? false)) {
+          sessions.push(merged);
+        }
       }
     } catch {
       // Return any metadata that was readable before enumeration failed, but
@@ -535,12 +883,24 @@ export function listDocumentSessionsWithStatus(): DocumentSessionList {
       complete = false;
     }
   }
-  if (!sessions.some((session) => session.id === DEFAULT_DOCUMENT_ID)) {
-    sessions.push({ id: DEFAULT_DOCUMENT_ID, name: "Untitled", createdAt: 0, updatedAt: 0 });
+  if (
+    options.archived !== true
+    && !sessions.some((session) => session.id === DEFAULT_DOCUMENT_ID)
+  ) {
+    sessions.push({
+      id: DEFAULT_DOCUMENT_ID,
+      name: "Untitled",
+      titleSource: "automatic",
+      pinned: false,
+      archived: false,
+      createdAt: 0,
+      updatedAt: 0,
+    });
   }
   return {
     sessions: sessions.sort((left, right) => (
-      right.updatedAt - left.updatedAt
+      Number(right.pinned) - Number(left.pinned)
+      || right.updatedAt - left.updatedAt
       || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
       || left.id.localeCompare(right.id)
     )),
@@ -548,6 +908,6 @@ export function listDocumentSessionsWithStatus(): DocumentSessionList {
   };
 }
 
-export function listDocumentSessions(): DocumentSession[] {
-  return listDocumentSessionsWithStatus().sessions;
+export function listDocumentSessions(options: DocumentSessionListOptions = {}): DocumentSession[] {
+  return listDocumentSessionsWithStatus(options).sessions;
 }

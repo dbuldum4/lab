@@ -215,7 +215,7 @@ test("new, name, and sessions keep independent documents resumable across tabs",
   await page.keyboard.press("Enter");
   const sessionList = page.getByTestId("session-list");
   await expect(sessionList).toContainText("Research");
-  await expect(sessionList).toContainText("Untitled");
+  await expect(sessionList).toContainText("original session note");
 
   const originalTab = await context.newPage();
   const originalEditor = await openEditor(originalTab);
@@ -455,7 +455,7 @@ test("delete removes an extra session and returns to the original note", async (
   await restored.type("/sessions");
   await page.keyboard.press("Enter");
   const sessionList = page.getByTestId("session-list");
-  await expect(sessionList).toContainText("Untitled");
+  await expect(sessionList).toContainText("keep the original note");
   await expect(sessionList).not.toContainText("Doomed");
 });
 
