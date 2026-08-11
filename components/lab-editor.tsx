@@ -444,6 +444,20 @@ function transactionTouchesHeading(transaction: Transaction) {
   return false;
 }
 
+function transactionContainsDollar(transaction: Transaction) {
+  if (!transaction.docChanged) return false;
+  for (const map of transaction.mapping.maps) {
+    let found = false;
+    map.forEach((_oldStart, _oldEnd, newStart, newEnd) => {
+      if (newEnd > newStart && transaction.doc.textBetween(newStart, newEnd, "\n", "\ufffc").includes("$")) {
+        found = true;
+      }
+    });
+    if (found) return true;
+  }
+  return false;
+}
+
 /** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
 function previousGraphemeIndex(text: string, index: number) {
   if (index <= 0) return 0;
@@ -1618,6 +1632,7 @@ function LabEditorSession() {
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
   const outlineItemsRef = useRef<OutlineItem[]>([]);
+  const inlineMathMigrationPendingRef = useRef(true);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
@@ -2549,8 +2564,12 @@ function LabEditorSession() {
       linkEditorStateRef.current = next;
       setLinkEditorState(next);
     },
-    onUpdate: ({ editor: instance }) => {
-      if (migrateInlineMath(instance)) return;
+    onUpdate: ({ editor: instance, transaction, appendedTransactions }) => {
+      const transactions = [transaction, ...appendedTransactions];
+      if (inlineMathMigrationPendingRef.current || transactions.some(transactionContainsDollar)) {
+        inlineMathMigrationPendingRef.current = false;
+        if (migrateInlineMath(instance)) return;
+      }
       syncInterface(instance);
       const markdown = instance.getMarkdown();
       latestMarkdown.set(markdown);
