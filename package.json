@@ -13,11 +13,14 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test:fast": "node --experimental-strip-types --test lib/*.test.ts",
+    "test:perf:unit": "node --experimental-strip-types --test perf/*.test.ts",
+    "test:perf:e2e": "npm run build && playwright test --config playwright.perf.config.ts e2e/performance.spec.ts --grep @perf",
+    "test:perf": "npm run test:perf:unit && npm run test:perf:e2e",
     "test:model": "node --experimental-strip-types --test lib/local-vault.model.test.ts",
     "test": "npm run test:fast",
-    "test:e2e": "playwright test --grep-invert @stress",
+    "test:e2e": "playwright test --grep-invert \"@stress|@perf\"",
     "test:stress": "playwright test e2e/local-vault.stress.spec.ts --grep @stress --workers=1",
-    "test:all": "npm run test:fast && npm run test:e2e",
+    "test:all": "npm run test:fast && npm run test:perf && npm run test:e2e",
     "verify": "npm run test:all && npm run lint && npm run typecheck && npm run build"
   },
   "dependencies": {

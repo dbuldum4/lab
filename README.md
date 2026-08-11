@@ -46,6 +46,45 @@ Fast unit, storage-contract, and editor-persistence tests run with Node's built-
 npm run test:fast
 ```
 
+Repeatable performance tests cover full-vault search and indexing, large outline
+updates, 2,000-session backup work, and real Chromium load, paste, and edit
+paths. The browser tests use the production static export, one worker, fixed
+browser settings, deterministic corpuses, explicit warmups, and stable painted
+DOM completion checks. The output includes raw JSON samples plus the median,
+p95, and median absolute deviation (MAD):
+
+```bash
+npm run test:perf
+```
+
+Run only the library or browser layer when investigating a result:
+
+```bash
+npm run test:perf:unit
+npm run test:perf:e2e
+```
+
+The default is 11 unit samples and 7 browser samples. Increase the counts for a
+long confirmation run:
+
+```bash
+LAB_PERF_UNIT_SAMPLES=25 LAB_PERF_SAMPLES=15 npm run test:perf
+```
+
+Performance timings are sensitive to system load. For a diagnostic run that
+reports all timings but does not enforce the broad median regression budgets,
+use:
+
+```bash
+LAB_PERF_REPORT_ONLY=1 npm run test:perf
+```
+
+For performance work, record an unchanged run first. Make one change, then run
+the same command again under similar machine load. Compare medians and use MAD
+as the noise signal. Treat a change smaller than the run-to-run noise as
+inconclusive. The fixed budgets catch large regressions; they are not a claim
+that a small timing change is significant.
+
 The fast suite includes a compact seeded reference-model test. Re-run one failing model seed with bounded steps using:
 
 ```bash
@@ -59,7 +98,7 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-`test:e2e` excludes the opt-in repeated concurrency stress case. Run it with a reproducible seed and bounded iteration count when investigating scheduling failures:
+`test:e2e` excludes the opt-in performance and repeated concurrency stress cases. Run the browser performance layer with `npm run test:perf:e2e`, or run the stress case with a reproducible seed and bounded iteration count:
 
 ```bash
 LAB_STRESS_SEED=0x20260802 LAB_STRESS_ITERATIONS=8 npm run test:stress
@@ -67,7 +106,7 @@ LAB_STRESS_SEED=0x20260802 LAB_STRESS_ITERATIONS=8 npm run test:stress
 
 Stress failures print the seed, iteration, and schedule; replay the same seed with `LAB_STRESS_ITERATIONS` set through the failing iteration. The quota contract tests use standards-shaped `QuotaExceededError` failures for each backend. Chromium CDP quota override is covered once for the reliable IndexedDB/OPFS path; localStorage is intentionally kept at the contract layer because Chromium 140 does not apply that override to it.
 
-`npm run verify` runs the fast suite, Chromium E2E, lint, typecheck, and production build.
+`npm run verify` runs the fast and performance suites, Chromium E2E, lint, typecheck, and production build.
 
 ## Privacy
 
