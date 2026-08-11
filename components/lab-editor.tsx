@@ -3654,6 +3654,23 @@ function LabEditorSession() {
   useEffect(() => {
     if (!editor) return;
     let active = true;
+    const refreshHealth = async () => {
+      try {
+        const nextHealth = await inspectLocalStorage();
+        if (!active) return;
+        setHealth(nextHealth);
+        const loadNotice = nextHealth.errors.length > 0
+          ? "Some local storage locations are unavailable."
+          : nextHealth.conflicts > 0
+            ? `${nextHealth.conflicts} conflicting local ${nextHealth.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`
+            : openedWithInvalidSessionHash
+              ? "That session link was invalid. Opened the original note."
+              : null;
+        setNotice(loadNotice);
+      } catch {
+        if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
+      }
+    };
     void (async () => {
       // `return` inside try still runs finally — gate so redirect paths never enable the editor.
       let finishHydration = true;
@@ -3721,17 +3738,6 @@ function LabEditorSession() {
             // A metadata failure must not prevent the note from loading.
           }
         }
-        const nextHealth = await inspectLocalStorage();
-        if (!active) return;
-        setHealth(nextHealth);
-        const loadNotice = nextHealth.errors.length > 0
-          ? "Some local storage locations are unavailable."
-          : nextHealth.conflicts > 0
-            ? `${nextHealth.conflicts} conflicting local ${nextHealth.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`
-            : openedWithInvalidSessionHash
-              ? "That session link was invalid. Opened the original note."
-              : null;
-        setNotice(loadNotice);
       } catch {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       } finally {
@@ -3741,6 +3747,7 @@ function LabEditorSession() {
         setHydrating(false);
         editor.commands.focus("end");
         syncInterface(editor);
+        void refreshHealth();
       }
     })();
     return () => {
