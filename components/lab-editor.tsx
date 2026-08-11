@@ -1341,6 +1341,7 @@ const LabImage = Image.extend({
 
       const selectNode = () => {
         selected = true;
+        attachWindowListeners();
         image.classList.add("ProseMirror-selectednode");
         overlay.style.display = "block";
         overlay.setAttribute("aria-hidden", "false");
@@ -1349,6 +1350,7 @@ const LabImage = Image.extend({
       const deselectNode = () => {
         selected = false;
         resizing = null;
+        detachWindowListeners();
         image.classList.remove("ProseMirror-selectednode");
         overlay.style.display = "none";
         overlay.setAttribute("aria-hidden", "true");
@@ -1361,11 +1363,22 @@ const LabImage = Image.extend({
       };
       const onImageLoad = () => updateOverlay();
       const onWindowChange = () => updateOverlay();
+      let windowListenersAttached = false;
+      const attachWindowListeners = () => {
+        if (windowListenersAttached) return;
+        windowListenersAttached = true;
+        window.addEventListener("resize", onWindowChange, { passive: true });
+        window.addEventListener("scroll", onWindowChange, { passive: true });
+      };
+      const detachWindowListeners = () => {
+        if (!windowListenersAttached) return;
+        windowListenersAttached = false;
+        window.removeEventListener("resize", onWindowChange);
+        window.removeEventListener("scroll", onWindowChange);
+      };
 
       image.addEventListener("click", onImageClick);
       image.addEventListener("load", onImageLoad);
-      window.addEventListener("resize", onWindowChange, { passive: true });
-      window.addEventListener("scroll", onWindowChange, { passive: true });
       document.body.append(overlay);
       deselectNode();
 
@@ -1381,13 +1394,12 @@ const LabImage = Image.extend({
         deselectNode,
         destroy: () => {
           stopAlignmentAnimation();
+          detachWindowListeners();
           document.removeEventListener("pointermove", moveResize);
           document.removeEventListener("pointerup", finishResize);
           document.removeEventListener("pointercancel", finishResize);
           image.removeEventListener("click", onImageClick);
           image.removeEventListener("load", onImageLoad);
-          window.removeEventListener("resize", onWindowChange);
-          window.removeEventListener("scroll", onWindowChange);
           overlay.remove();
         },
       };
