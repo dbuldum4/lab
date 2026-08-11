@@ -1248,10 +1248,20 @@ async function persistentStorageGranted() {
  * marker so we never repopulate localStorage/OPFS for a deleted document.
  */
 async function writeReplicaIfCurrent(target: StorageTarget, snapshot: CanonicalSnapshot) {
-  if (await refreshDeletedFromIndexedDb()) return false;
   if (hasIndexedDb()) {
-    const authority = await readIndexedDb();
-    const current = await normalizeSnapshot(authority);
+    const raw = await readIndexedDbRawState();
+    if (isDeletedRecord(raw.deleted)) {
+      writeLocalTombstone(currentDocumentId(), raw.deleted.deletedAt);
+      return false;
+    }
+    const authority = authorityRecord(raw.authority);
+    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
+      normalizeSnapshot(authority?.snapshot),
+      normalizeSnapshot(raw.current),
+    ]);
+    const current = selectCurrentSnapshot(
+      [verifiedAuthority, verifiedCurrent].filter((candidate): candidate is CanonicalSnapshot => Boolean(candidate)),
+    );
     if (current && !sameSnapshot(current, snapshot) && !shouldAcceptSnapshot(current, snapshot)) return false;
   }
   // Peer delete can land during the async authority read above.
