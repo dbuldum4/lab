@@ -3715,6 +3715,10 @@ function LabEditorSession() {
           return;
         }
         if (!active) return;
+        // A full migration scan is only needed when the loaded Markdown can
+        // contain legacy inline-math delimiters. New edits still trigger the
+        // narrow transaction scan below when they contain a dollar sign.
+        inlineMathMigrationPendingRef.current = markdown.includes("$$");
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
         latestMarkdown.set(markdown);
         recordVersion(documentId, markdown);
