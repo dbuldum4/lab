@@ -2690,7 +2690,9 @@ function LabEditorSession() {
       editorRef.current = instance;
     },
     onTransaction: ({ editor: instance, transaction, appendedTransactions }) => {
-      syncOutlineTransactions(instance, [transaction, ...appendedTransactions]);
+      if (outlineOpenRef.current) {
+        syncOutlineTransactions(instance, [transaction, ...appendedTransactions]);
+      }
       if (!transaction.docChanged) return;
       const current = linkEditorStateRef.current;
       if (!current) return;
