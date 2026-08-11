@@ -1585,14 +1585,6 @@ async function saveLocalDocumentInScope(markdown: string): Promise<StorageHealth
       extraErrors.push("Cross-tab persistence requires IndexedDB or Web Locks; the candidate was not written.");
     }
 
-    // Re-read the IndexedDB deletion marker after authority work. A peer tab can
-    // finish deleteLocalDocument between commitIndexedDb acceptance and replica
-    // writes when Web Locks are missing; authority may already be gone.
-    if (await refreshDeletedFromIndexedDb()) {
-      const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
-      return { ...health, saved: false };
-    }
-
     const writes = authorityFailed
       ? []
       : await Promise.allSettled(
