@@ -3782,11 +3782,12 @@ function LabEditorSession() {
   useEffect(() => {
     if (!editor) return;
     let active = true;
-    const refreshHealth = async () => {
+    const refreshHealth = async (updateNotice = true) => {
       try {
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);
+        if (!updateNotice) return;
         const loadNotice = nextHealth.errors.length > 0
           ? "Some local storage locations are unavailable."
           : nextHealth.conflicts > 0
@@ -3817,7 +3818,9 @@ function LabEditorSession() {
         // browsers can leave the request pending while waiting for a permission
         // decision, so it must never block note hydration or editor startup.
         void requestPersistentStorage().then(() => {
-          if (active) void refreshHealth();
+          // A delayed permission result must not overwrite a newer notice from
+          // an edit, import, or save failure. Only refresh the health model.
+          if (active) void refreshHealth(false);
         });
         if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
           if (!active) return;

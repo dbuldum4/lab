@@ -36,6 +36,54 @@ test(`${BROWSER_SMOKE_TAG} hydrates while persistent-storage permission is pendi
   await expect(editor).toHaveText("Permission-independent hydration");
 });
 
+test(`${BROWSER_SMOKE_TAG} keeps newer notices after delayed persistence permission`, async ({ page }) => {
+  await page.addInitScript(() => {
+    const state = window as typeof window & {
+      resolvePersistencePermission?: () => void;
+      permissionResolved?: boolean;
+      postPermissionHealthChecks?: number;
+    };
+    Object.defineProperty(navigator.storage, "persist", {
+      configurable: true,
+      value: () => new Promise<boolean>((resolve) => {
+        state.resolvePersistencePermission = () => {
+          state.permissionResolved = true;
+          resolve(true);
+        };
+      }),
+    });
+    const persisted = navigator.storage.persisted?.bind(navigator.storage);
+    Object.defineProperty(navigator.storage, "persisted", {
+      configurable: true,
+      value: async () => {
+        if (state.permissionResolved) {
+          state.postPermissionHealthChecks = (state.postPermissionHealthChecks ?? 0) + 1;
+        }
+        return (await persisted?.()) ?? false;
+      },
+    });
+  });
+
+  const editor = await openEditor(page);
+
+  await editor.type("/theme");
+  await page.keyboard.press("Enter");
+  await page.getByTestId("theme-list")
+    .getByRole("option", { name: "Light Warm neutral light theme", exact: true })
+    .click();
+  const notice = page.locator(".editor-notice");
+  await expect(notice).toHaveText("Changed the theme to Light.");
+
+  await page.evaluate(() => {
+    (window as typeof window & { resolvePersistencePermission?: () => void })
+      .resolvePersistencePermission?.();
+  });
+  await expect.poll(() => page.evaluate(() => (
+    (window as typeof window & { postPermissionHealthChecks?: number }).postPermissionHealthChecks ?? 0
+  ))).toBeGreaterThan(0);
+  await expect(notice).toHaveText("Changed the theme to Light.");
+});
+
 test(`${BROWSER_SMOKE_TAG} keeps a note after a durable reload`, async ({ page }) => {
   const editor = await openEditor(page);
   const markdown = "Cross-browser persistence smoke";
