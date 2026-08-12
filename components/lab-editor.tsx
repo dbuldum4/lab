@@ -55,6 +55,10 @@ import {
   restoreLocalVault,
   serializeVaultBackup,
 } from "@/lib/vault-backup";
+import {
+  transactionContainsDollar,
+  transactionTouchesHeading,
+} from "@/lib/editor-transactions";
 import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
@@ -608,52 +612,6 @@ function createIncrementalMarkdownSerializer() {
       : renderedMarkdown;
     return cachedMarkdown;
   };
-}
-
-function rangeTouchesHeading(doc: PMNode, from: number, to: number) {
-  const start = Math.max(0, Math.min(from, doc.content.size));
-  const end = Math.max(start, Math.min(to, doc.content.size));
-  if (doc.resolve(start).parent.type.name === "heading") return true;
-  if (end > start && doc.resolve(end).parent.type.name === "heading") return true;
-
-  let found = false;
-  if (end > start) {
-    doc.nodesBetween(start, end, (node) => {
-      if (node.type.name === "heading") found = true;
-    });
-  }
-  return found;
-}
-
-function transactionTouchesHeading(transaction: Transaction) {
-  if (!transaction.docChanged) return false;
-  for (const map of transaction.mapping.maps) {
-    let found = false;
-    map.forEach((oldStart, oldEnd, newStart, newEnd) => {
-      if (
-        rangeTouchesHeading(transaction.before, oldStart, oldEnd)
-        || rangeTouchesHeading(transaction.doc, newStart, newEnd)
-      ) {
-        found = true;
-      }
-    });
-    if (found) return true;
-  }
-  return false;
-}
-
-function transactionContainsDollar(transaction: Transaction) {
-  if (!transaction.docChanged) return false;
-  for (const map of transaction.mapping.maps) {
-    let found = false;
-    map.forEach((_oldStart, _oldEnd, newStart, newEnd) => {
-      if (newEnd > newStart && transaction.doc.textBetween(newStart, newEnd, "\n", "\ufffc").includes("$")) {
-        found = true;
-      }
-    });
-    if (found) return true;
-  }
-  return false;
 }
 
 /** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */

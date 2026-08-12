@@ -626,6 +626,28 @@ test("pasted math delimiters become editable math nodes", async ({ page }) => {
   await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "x^2 + y^2");
 });
 
+test("deleting text can expose inline math delimiters", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.click();
+  await editor.type("$a$x$$");
+  await expect(editor).toHaveText("$a$x$$");
+
+  await editor.evaluate((element) => {
+    const text = element.querySelector("p")?.firstChild;
+    if (!(text instanceof Text)) throw new Error("The test paragraph has no text node.");
+    const selection = window.getSelection();
+    if (!selection) throw new Error("The browser has no selection.");
+    const range = document.createRange();
+    range.setStart(text, 1);
+    range.setEnd(text, 2);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  await editor.press("Backspace");
+
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "x");
+});
+
 test("escaped-dollar LaTeX survives persistence and reload", async ({ page }) => {
   const editor = await openEditor(page);
   const markdown = "Price: $$\\$5$$";
