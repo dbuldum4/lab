@@ -296,6 +296,36 @@ test("search finds session names and verified note excerpts, then opens the resu
   await expect(page.getByRole("textbox", { name: "lab local-only Markdown note" })).toContainText(originalNote);
 });
 
+test("search ignores accents in names and note content while highlighting the originals", async ({ page }) => {
+  const editor = await openEditor(page);
+  const note = "Meet for crème brûlée at the café.";
+  await editor.fill(note);
+  await waitForAuthority(page, note);
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/name");
+  await page.keyboard.press("Enter");
+  const nameInput = page.getByLabel("Session name");
+  await nameInput.fill("Café plans");
+  await nameInput.press("Enter");
+  await expect(nameInput).toBeHidden();
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
+  await searchInput.fill("  CAFE   CREME ");
+
+  const result = page.getByTestId("search-result").filter({ hasText: "Café plans" });
+  await expect(result).toContainText("crème brûlée");
+  await expect(result.locator("mark")).toHaveCount(3);
+  await expect(result.locator("mark").nth(0)).toHaveText("Café");
+  await expect(result.locator("mark").nth(1)).toHaveText("crème");
+  await expect(result.locator("mark").nth(2)).toHaveText("café");
+});
+
 test("keyboard search selection scrolls the active result into view", async ({ page }) => {
   const editor = await openEditor(page);
   await page.evaluate(async () => {
