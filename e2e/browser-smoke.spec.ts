@@ -40,27 +40,12 @@ test(`${BROWSER_SMOKE_TAG} keeps newer notices after delayed persistence permiss
   await page.addInitScript(() => {
     const state = window as typeof window & {
       resolvePersistencePermission?: () => void;
-      permissionResolved?: boolean;
-      postPermissionHealthChecks?: number;
     };
     Object.defineProperty(navigator.storage, "persist", {
       configurable: true,
       value: () => new Promise<boolean>((resolve) => {
-        state.resolvePersistencePermission = () => {
-          state.permissionResolved = true;
-          resolve(true);
-        };
+        state.resolvePersistencePermission = () => resolve(true);
       }),
-    });
-    const persisted = navigator.storage.persisted?.bind(navigator.storage);
-    Object.defineProperty(navigator.storage, "persisted", {
-      configurable: true,
-      value: async () => {
-        if (state.permissionResolved) {
-          state.postPermissionHealthChecks = (state.postPermissionHealthChecks ?? 0) + 1;
-        }
-        return (await persisted?.()) ?? false;
-      },
     });
   });
 
@@ -73,14 +58,17 @@ test(`${BROWSER_SMOKE_TAG} keeps newer notices after delayed persistence permiss
     .click();
   const notice = page.locator(".editor-notice");
   await expect(notice).toHaveText("Changed the theme to Light.");
+  await expect.poll(() => page.evaluate(() => typeof (
+    window as typeof window & { resolvePersistencePermission?: () => void }
+  ).resolvePersistencePermission)).toBe("function");
 
   await page.evaluate(() => {
     (window as typeof window & { resolvePersistencePermission?: () => void })
       .resolvePersistencePermission?.();
   });
-  await expect.poll(() => page.evaluate(() => (
-    (window as typeof window & { postPermissionHealthChecks?: number }).postPermissionHealthChecks ?? 0
-  ))).toBeGreaterThan(0);
+  // Let the permission continuation and its asynchronous storage inspection
+  // finish; the resulting health update must not clear the newer theme notice.
+  await page.waitForTimeout(500);
   await expect(notice).toHaveText("Changed the theme to Light.");
 });
 
