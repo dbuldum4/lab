@@ -779,6 +779,42 @@ export function unarchiveDocumentSession(id: string) {
 }
 
 /**
+ * Advance activity metadata synchronously after a durable content save.
+ *
+ * Lifecycle teardown can interrupt a pending Web Lock callback, so the activity
+ * marker must be written before the save callback returns. The async variant
+ * below remains the concurrency-safe path for ordinary metadata mutations.
+ */
+export function touchDocumentSessionSync(id: string) {
+  const normalized = normalizeId(id);
+  if (normalized !== DEFAULT_DOCUMENT_ID && isLocalDocumentDeleted(normalized)) {
+    throw new Error("This session was deleted.");
+  }
+  const local = storage();
+  if (!local) throw new Error("Session metadata storage is unavailable.");
+
+  const existing = readSession(normalized);
+  const now = Math.max(Date.now(), (existing?.updatedAt ?? 0) + 1);
+  try {
+    local.setItem(activityKey(normalized), String(now));
+    if (!existing) {
+      return writeSession({
+        id: normalized,
+        name: "Untitled",
+        titleSource: "automatic",
+        pinned: false,
+        archived: false,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  } catch {
+    throw new Error("Session activity storage is unavailable.");
+  }
+  return { ...existing, updatedAt: now };
+}
+
+/**
  * Advance activity metadata without rewriting the session name record.
  * Creates a session entry on first durable save so unknown hashes only appear
  * in /sessions after the user has written real content.

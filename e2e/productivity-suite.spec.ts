@@ -1,14 +1,15 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { openEditor, waitForAuthority } from "./helpers";
+import { confirmMarkdownImport, openEditor, waitForAuthority } from "./helpers";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-async function importMarkdown(page: Page, markdown: string) {
+async function importMarkdown(page: Page, markdown: string, confirm = false) {
   await page.locator('input[type="file"][accept*="markdown"]').setInputFiles({
     name: "productivity-suite.md",
     mimeType: "text/markdown",
     buffer: Buffer.from(markdown),
   });
+  if (confirm) await confirmMarkdownImport(page);
 }
 
 async function runSlash(page: Page, query: string) {
@@ -108,12 +109,20 @@ test("automatic titles, pinning, and archive views stay in sync", async ({ page 
   await waitForSessionMetadata(page, documentId, { pinned: true, archived: true });
 
   await runSlash(page, "sessions");
-  await expect(page.getByTestId("session-list")).not.toContainText("Project Atlas");
+  const sessionList = page.getByTestId("session-list");
+  await expect(page.getByRole("combobox", { name: "Search sessions" })).toBeFocused();
+  await page.getByRole("combobox", { name: "Search sessions" }).fill("project");
+  await expect(sessionList).toContainText("No sessions match");
   await page.keyboard.press("Escape");
 
   await runSlash(page, "archives");
+  const archivedFilter = page.getByRole("combobox", { name: "Search archived sessions" });
+  await expect(archivedFilter).toBeFocused();
+  await archivedFilter.fill("Project   Atlas");
   const archived = page.getByTestId("session-list").getByRole("option").filter({ hasText: "Project Atlas" });
+  await expect(archived).toHaveCount(1);
   await expect(archived).toContainText("◆ Project Atlas");
+  await expect(archived).toHaveAttribute("data-current", "true");
 });
 
 test("hydration refreshes an existing automatic Untitled session title", async ({ page }) => {
@@ -201,7 +210,7 @@ test("table row and column commands work in place and code language round-trips"
   await runSlash(page, "table-column-after");
   await expect(table.locator("tr").first().locator("th, td")).toHaveCount(4);
 
-  await importMarkdown(page, "```\nconst answer = 42;\n```");
+  await importMarkdown(page, "```\nconst answer = 42;\n```", true);
   const code = editor.locator("pre code");
   await expect(code).toHaveText("const answer = 42;");
   await code.click();
@@ -215,6 +224,32 @@ test("table row and column commands work in place and code language round-trips"
   await page.reload();
   const restored = await openEditor(page);
   await expect(restored.locator("pre code")).toHaveClass(/language-typescript/);
+});
+
+test("code language creates a code block from a paragraph", async ({ page }) => {
+  const editor = await openEditor(page);
+  await runSlash(page, "language");
+
+  const code = editor.locator("pre code");
+  await expect(code).toHaveCount(1);
+  await expect(page.getByRole("listbox", { name: "Code block language" })).toBeVisible();
+});
+
+test("contextual slash commands explain when the selection is unavailable", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.focus();
+  await page.keyboard.type("/table-row-after");
+
+  const palette = page.getByRole("listbox", { name: "Slash commands" });
+  const option = palette.getByRole("option", { name: /Table row below/ });
+  await expect(option).toBeVisible();
+  await expect(option).toHaveAttribute("aria-disabled", "true");
+  await expect(option).toHaveAccessibleDescription("Place the caret inside a table first.");
+  await expect(option).not.toHaveAttribute("aria-selected", "true");
+
+  await page.keyboard.press("Enter");
+  await expect(palette).toBeVisible();
+  await expect(editor.locator("table")).toHaveCount(0);
 });
 
 test("local session links expose backlinks and navigate in both directions", async ({ page }) => {
@@ -249,11 +284,14 @@ test("local session links expose backlinks and navigate in both directions", asy
   });
   await page.keyboard.type(" ");
   await runSlash(page, "link-note");
-  const targetOption = page.getByRole("listbox", { name: "Choose a session to link" })
-    .getByRole("option")
-    .filter({ hasText: "Target Note" });
+  const linkPicker = page.getByRole("listbox", { name: "Choose a session to link" });
+  const linkFilter = page.getByRole("combobox", { name: "Search sessions to link" });
+  await expect(linkFilter).toBeFocused();
+  await linkFilter.fill(" target   note ");
+  const targetOption = linkPicker.getByRole("option").filter({ hasText: "Target Note" });
+  await expect(linkPicker.getByRole("option")).toHaveCount(1);
   await expect(targetOption).toBeVisible();
-  await targetOption.click();
+  await linkFilter.press("Enter");
 
   const localLink = sourceEditor.locator('a[href="#session=default"]');
   await expect(localLink).toHaveText("Target Note");
@@ -266,7 +304,12 @@ test("local session links expose backlinks and navigate in both directions", asy
   await expect(destination).toContainText("This is the link destination.");
 
   await appendSlash(page, destination, "backlinks");
-  const backlink = page.getByTestId("backlinks-panel").getByRole("option").filter({ hasText: "Source Note" });
+  const backlinks = page.getByTestId("backlinks-panel");
+  const backlinkFilter = page.getByRole("combobox", { name: "Search backlinks" });
+  await expect(backlinkFilter).toBeFocused();
+  await backlinkFilter.fill("source");
+  const backlink = backlinks.getByRole("option").filter({ hasText: "Source Note" });
+  await expect(backlinks.getByRole("option")).toHaveCount(1);
   await expect(backlink).toContainText("Related: Target Note");
   await backlink.click();
   await expect(page).toHaveURL(sourceUrl);
@@ -285,7 +328,11 @@ test("version history restores an earlier snapshot and keeps the displaced draft
   await editor.press("ControlOrMeta+Alt+h");
   const history = page.getByTestId("version-history-panel");
   await expect(history).toBeVisible();
+  const historyFilter = page.getByRole("combobox", { name: "Search version history" });
+  await expect(historyFilter).toBeFocused();
+  await historyFilter.fill("old snapshot");
   const oldVersion = history.getByRole("option").filter({ hasText: "2 words" });
+  await expect(history.getByRole("option")).toHaveCount(1);
   await expect(oldVersion).toBeVisible();
   await oldVersion.click();
   const restoreConfirmation = page.getByTestId("confirm-restore-history");

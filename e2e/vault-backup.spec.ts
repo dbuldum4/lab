@@ -127,7 +127,10 @@ test("rejects malformed backups and keeps conflicting sessions untouched", async
     mimeType: "application/json",
     buffer: Buffer.from(malformed.slice(0, -5)),
   });
-  await expect(page.getByRole("status").filter({ hasText: "Invalid Lab vault backup" })).toBeVisible();
+  const invalidBackupNotice = page.getByTestId("editor-notice");
+  await expect(invalidBackupNotice).toContainText("Invalid Lab vault backup");
+  await expect(invalidBackupNotice).toHaveAttribute("role", "alert");
+  await expect(invalidBackupNotice).toHaveAttribute("aria-live", "assertive");
   await expect(editor).toContainText("keep the current vault");
 
   const conflict = JSON.stringify({
