@@ -15,8 +15,7 @@ export type { Command, ShortcutDescription };
 export type PaletteMode =
   | "commands"
   | "status"
-  | "confirm-clear"
-  | "confirm-delete"
+  | "confirm"
   | "confirm-import"
   | "name"
   | "sessions"
@@ -97,7 +96,8 @@ export function filterThemes(palette: PaletteState | null) {
   return THEMES.filter((theme) => normalizeSearchText(`${theme.label} ${theme.detail}`).includes(query));
 }
 
-export function paletteRole(mode: PaletteMode): "listbox" | "dialog" | "status" {
+export function paletteRole(mode: PaletteMode): "listbox" | "dialog" | "alertdialog" | "status" {
+  if (mode === "confirm") return "alertdialog";
   if (["commands", "sessions", "archives", "link-session", "language", "backlinks", "history"].includes(mode)) {
     return "listbox";
   }
@@ -117,6 +117,7 @@ export function paletteLabel(mode: PaletteMode) {
     case "history": return "Version history";
     case "link-editor": return "Edit link";
     case "confirm-import": return "Confirm Markdown import";
+    case "confirm": return "Confirm action";
     default: return "Slash commands";
   }
 }

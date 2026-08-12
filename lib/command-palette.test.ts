@@ -64,5 +64,6 @@ test("palette accessibility contracts cover every mode family", () => {
   assert.equal(paletteRole("status"), "status");
   assert.equal(paletteLabel("link-session"), "Choose a session to link");
   assert.equal(paletteLabel("theme"), "Choose a theme");
-  assert.equal(paletteLabel("confirm-clear"), "Slash commands");
+  assert.equal(paletteRole("confirm"), "alertdialog");
+  assert.equal(paletteLabel("confirm"), "Confirm action");
 });

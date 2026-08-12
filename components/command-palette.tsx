@@ -27,6 +27,7 @@ import type { VersionHistoryEntry } from "@/lib/version-history";
 import { THEMES, type ThemeId } from "@/lib/theme";
 import type { StorageHealth } from "@/lib/local-vault";
 import { formatStorageEstimate } from "@/lib/storage-estimate";
+import { ConfirmationPanel, type ConfirmationModel } from "@/components/confirmation-panel";
 import { filterPickerOptions } from "@/lib/picker-filter";
 
 export type LinkEditorState = {
@@ -77,6 +78,9 @@ export type CommandPaletteProps = {
   linkEditorState: LinkEditorState | null;
   pendingMarkdownImport: { fileName: string } | null;
   importConfirming: boolean;
+  confirmation: ConfirmationModel | null;
+  confirmationButtonRef: RefObject<HTMLButtonElement | null>;
+  settleConfirmation: (confirmed: boolean) => void;
   setPalette: (value: PaletteState | null) => void;
   setSelected: (value: number) => void;
   setSessionName: (value: string) => void;
@@ -138,6 +142,9 @@ export function CommandPalette({
   linkEditorState,
   pendingMarkdownImport,
   importConfirming,
+  confirmation,
+  confirmationButtonRef,
+  settleConfirmation,
   setPalette,
   setSelected,
   setSessionName,
@@ -294,6 +301,9 @@ export function CommandPalette({
             className="command-palette"
             role={paletteRole(palette.mode)}
             aria-label={paletteLabel(palette.mode)}
+            aria-modal={palette.mode === "confirm" ? "true" : undefined}
+            aria-labelledby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-title` : undefined}
+            aria-describedby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-description` : undefined}
           >
             {palette.mode === "commands" ? (
               rankedCommands.length > 0 ? (
@@ -675,16 +685,13 @@ export function CommandPalette({
                   </button>
                 </div>
               </div>
-            ) : palette.mode === "confirm-clear" ? (
-              <div className="palette-message palette-confirm">
-                <span>Clear the note?</span>
-                <small>Press Enter to confirm · Esc to keep it</small>
-              </div>
-            ) : palette.mode === "confirm-delete" ? (
-              <div className="palette-message palette-confirm" data-testid="confirm-delete">
-                <span>Delete this session permanently?</span>
-                <small>Press Enter to confirm · Esc to keep it</small>
-              </div>
+            ) : palette.mode === "confirm" && confirmation ? (
+              <ConfirmationPanel
+                model={confirmation}
+                confirmButtonRef={confirmationButtonRef}
+                onConfirm={() => settleConfirmation(true)}
+                onCancel={() => settleConfirmation(false)}
+              />
             ) : (
               <div className="palette-message storage-message" data-testid="storage-status">
                 <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>

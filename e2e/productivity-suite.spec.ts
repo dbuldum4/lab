@@ -334,11 +334,19 @@ test("version history restores an earlier snapshot and keeps the displaced draft
   const oldVersion = history.getByRole("option").filter({ hasText: "2 words" });
   await expect(history.getByRole("option")).toHaveCount(1);
   await expect(oldVersion).toBeVisible();
-  page.once("dialog", async (dialog) => {
-    expect(dialog.message()).toContain("The current note will be kept in version history");
-    await dialog.accept();
-  });
   await oldVersion.click();
+  const restoreConfirmation = page.getByTestId("confirm-restore-history");
+  await expect(restoreConfirmation).toBeVisible();
+  await expect(restoreConfirmation).toContainText("The current note will be kept in version history");
+  await expect(restoreConfirmation.getByRole("button", { name: "Restore version" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(restoreConfirmation).toBeHidden();
+  await expect(history).toBeVisible();
+  await expect(editor).toHaveText("Current draft has five words");
+
+  await oldVersion.click();
+  await expect(restoreConfirmation).toBeVisible();
+  await restoreConfirmation.getByRole("button", { name: "Restore version" }).click();
   await expect(editor).toHaveText("Old snapshot");
   await waitForAuthority(page, "Old snapshot");
 
