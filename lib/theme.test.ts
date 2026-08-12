@@ -20,6 +20,15 @@ test("theme ids include the default and licensed palettes", () => {
   assert.equal(isThemeId("tokyo-night-moon"), true);
   assert.equal(isThemeId("everforest-medium"), true);
   assert.equal(isThemeId("kanagawa-wave"), true);
+  assert.equal(isThemeId("flexoki-light"), true);
+  assert.equal(isThemeId("ayu-light"), true);
+  assert.equal(isThemeId("github-light-default"), true);
+  assert.equal(isThemeId("light-owl"), true);
+  assert.equal(isThemeId("catppuccin-latte"), true);
+  assert.equal(isThemeId("solarized-light"), true);
+  assert.equal(isThemeId("everforest-light-medium"), true);
+  assert.equal(isThemeId("kanagawa-lotus"), true);
+  assert.equal(isThemeId("tokyo-night-day"), true);
   assert.equal(isThemeId("unknown"), false);
 });
 

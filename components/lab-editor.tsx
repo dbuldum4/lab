@@ -4736,8 +4736,9 @@ function LabEditorSession() {
                   <div className="search-empty">No themes match “{palette.query.trim()}”.</div>
                 )}
               </div>
-              <div className="search-footer">
-                {filteredThemes.length} {filteredThemes.length === 1 ? "theme" : "themes"} · ↑↓ move · Enter select
+              <div className="search-footer theme-footer">
+                <span>{filteredThemes.length} {filteredThemes.length === 1 ? "theme" : "themes"} · ↑↓ move · Enter select</span>
+                <a href="./third-party-notices/" target="_blank" rel="noreferrer">Licenses</a>
               </div>
             </div>
           ) : palette.mode === "backlinks" ? (

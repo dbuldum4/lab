@@ -2,6 +2,9 @@
 
 The app includes adapted color values from the themes in this file.
 
+The theme names identify their upstream palettes. This project is independent
+and is not affiliated with or endorsed by the theme authors or maintainers.
+
 ## Dracula
 
 Source: <https://github.com/dracula/dracula-theme>
@@ -36,12 +39,23 @@ The following adapted palettes are also included under permissive MIT terms:
   Pavel Pertsev. The upstream project identifies its license as MIT/X11.
 - Rosé Pine Dawn: <https://github.com/rose-pine/rose-pine-theme>.
   Copyright (c) 2023 Rosé Pine.
-- Tokyo Night Moon: <https://github.com/enkia/tokyo-night-vscode-theme>.
+- Tokyo Night Moon and Tokyo Night Day:
+  <https://github.com/enkia/tokyo-night-vscode-theme>.
   Copyright (c) 2018-present Enkia.
-- Everforest Medium: <https://github.com/sainnhe/everforest>.
+- Everforest Medium and Everforest Light Medium:
+  <https://github.com/sainnhe/everforest>.
   Copyright (c) 2019 sainnhe.
-- Kanagawa Wave: <https://github.com/rebelot/kanagawa.nvim>.
+- Kanagawa Wave and Kanagawa Lotus:
+  <https://github.com/rebelot/kanagawa.nvim>.
   Copyright (c) 2021 Tommaso Laurenzi.
+- Flexoki Light: <https://github.com/kepano/flexoki>.
+  Copyright (c) 2023 Steph Ango.
+- Ayu Light: <https://github.com/ayu-theme/ayu-colors>.
+  Copyright (c) Konstantin Pschera (kons.ch).
+- GitHub Light Default: <https://github.com/primer/github-vscode-theme>.
+  Copyright (c) 2020 Primer.
+- Light Owl: <https://github.com/sdras/night-owl-vscode-theme>.
+  Copyright (c) 2018 Sarah Drasner.
 
 MIT License
 
