@@ -18,7 +18,7 @@ import Image, { type ImageOptions } from "@tiptap/extension-image";
 import { Markdown } from "@tiptap/markdown";
 import { closeHistory } from "@tiptap/pm/history";
 import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
-import { NodeSelection } from "@tiptap/pm/state";
+import { NodeSelection, type Transaction } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { BorderBeam } from "border-beam";
@@ -55,6 +55,10 @@ import {
   restoreLocalVault,
   serializeVaultBackup,
 } from "@/lib/vault-backup";
+import {
+  transactionContainsDollar,
+  transactionTouchesHeading,
+} from "@/lib/editor-transactions";
 import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
@@ -341,6 +345,53 @@ const MarkdownLinkInput = Extension.create({
  * inline nodes with single-dollar delimiters, so its Markdown handlers are
  * intentionally narrowed here to avoid confusing `$$x$$` with a block node.
  */
+const deferredMathRenders = new Map<Element, () => void>();
+let deferredMathObserver: IntersectionObserver | null = null;
+
+function createDeferredMathRenderer(element: HTMLElement, render: () => void) {
+  if (typeof IntersectionObserver === "undefined") {
+    render();
+    return {
+      renderNow: () => {},
+      destroy: () => {},
+    };
+  }
+
+  const stopObserver = () => {
+    deferredMathObserver?.unobserve(element);
+    if (deferredMathRenders.size === 0) {
+      deferredMathObserver?.disconnect();
+      deferredMathObserver = null;
+    }
+  };
+
+  const renderOnce = () => {
+    if (!deferredMathRenders.has(element)) return;
+    deferredMathRenders.delete(element);
+    stopObserver();
+    render();
+  };
+
+  if (!deferredMathObserver) {
+    deferredMathObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) deferredMathRenders.get(entry.target)?.();
+      }
+    }, { rootMargin: "600px 0px" });
+  }
+
+  deferredMathRenders.set(element, renderOnce);
+  deferredMathObserver.observe(element);
+
+  return {
+    renderNow: renderOnce,
+    destroy: () => {
+      deferredMathRenders.delete(element);
+      stopObserver();
+    },
+  };
+}
+
 const InlineMathMarkdown = InlineMath.extend({
   renderMarkdown: (node) => `$$${String(node.attrs?.latex ?? "")}$$`,
   markdownTokenizer: {
@@ -358,6 +409,52 @@ const InlineMathMarkdown = InlineMath.extend({
     // upstream input rule assumes a synchronous DOM range and can throw when
     // an IME or browser automation reports the range before reconciliation.
     return [];
+  },
+  addNodeView() {
+    const { katexOptions } = this.options;
+
+    return ({ node, getPos }) => {
+      const wrapper = document.createElement("span");
+      wrapper.className = "tiptap-mathematics-render";
+
+      if (this.editor.isEditable) {
+        wrapper.classList.add("tiptap-mathematics-render--editable");
+      }
+
+      wrapper.dataset.type = "inline-math";
+      wrapper.setAttribute("data-latex", node.attrs.latex);
+
+      function renderMath() {
+        try {
+          katex.render(node.attrs.latex, wrapper, katexOptions);
+          wrapper.classList.remove("inline-math-error");
+        } catch {
+          wrapper.textContent = node.attrs.latex;
+          wrapper.classList.add("inline-math-error");
+        }
+      }
+
+      const deferredRender = createDeferredMathRenderer(wrapper, renderMath);
+      const handleClick = (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        deferredRender.renderNow();
+        const pos = getPos();
+
+        if (pos == null) return;
+        this.options.onClick?.(node, pos);
+      };
+
+      if (this.options.onClick) wrapper.addEventListener("click", handleClick);
+
+      return {
+        dom: wrapper,
+        destroy() {
+          wrapper.removeEventListener("click", handleClick);
+          deferredRender.destroy();
+        },
+      };
+    };
   },
 });
 
@@ -383,6 +480,55 @@ const BlockMathMarkdown = BlockMath.extend({
       if (!match) return undefined;
       return { type: "blockMath", raw: match[0], latex: match[1].trim() };
     },
+  },
+  addNodeView() {
+    const { katexOptions } = this.options;
+
+    return ({ node, getPos }) => {
+      const wrapper = document.createElement("div");
+      const innerWrapper = document.createElement("div");
+      wrapper.className = "tiptap-mathematics-render";
+
+      if (this.editor.isEditable) {
+        wrapper.classList.add("tiptap-mathematics-render--editable");
+      }
+
+      innerWrapper.className = "block-math-inner";
+      wrapper.dataset.type = "block-math";
+      wrapper.setAttribute("data-latex", node.attrs.latex);
+      wrapper.appendChild(innerWrapper);
+
+      function renderMath() {
+        try {
+          katex.render(node.attrs.latex, innerWrapper, katexOptions);
+          wrapper.classList.remove("block-math-error");
+        } catch {
+          wrapper.textContent = node.attrs.latex;
+          wrapper.classList.add("block-math-error");
+        }
+      }
+
+      const deferredRender = createDeferredMathRenderer(wrapper, renderMath);
+      const handleClick = (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        deferredRender.renderNow();
+        const pos = getPos();
+
+        if (pos == null) return;
+        this.options.onClick?.(node, pos);
+      };
+
+      if (this.options.onClick) wrapper.addEventListener("click", handleClick);
+
+      return {
+        dom: wrapper,
+        destroy() {
+          wrapper.removeEventListener("click", handleClick);
+          deferredRender.destroy();
+        },
+      };
+    };
   },
 });
 
@@ -410,6 +556,62 @@ function outlineFromEditor(instance: Editor): OutlineItem[] {
     });
   });
   return buildOutline(headings);
+}
+
+/**
+ * Serialize only top-level ProseMirror nodes that changed since the last call.
+ * ProseMirror nodes are immutable, so an unchanged node keeps the same object
+ * identity across transactions. The Markdown manager still renders every
+ * changed block, which preserves the canonical Tiptap Markdown format.
+ */
+function createIncrementalMarkdownSerializer() {
+  let cachedNodes: PMNode[] = [];
+  let cachedFragments: string[] = [];
+  let cachedMarkdown = "";
+
+  return (instance: Editor) => {
+    const manager = instance.markdown;
+    if (!manager) return instance.getMarkdown();
+
+    const documentNode = instance.state.doc;
+    const nextNodes: PMNode[] = [];
+    const nextFragments: string[] = [];
+    let changed = cachedNodes.length !== documentNode.childCount;
+
+    for (let index = 0; index < documentNode.childCount; index += 1) {
+      const node = documentNode.child(index);
+      nextNodes.push(node);
+      const nodeChanged = cachedNodes[index] !== node;
+      const previousNodeChanged = index > 0
+        && cachedNodes[index - 1] !== documentNode.child(index - 1);
+      changed ||= nodeChanged;
+      if (!nodeChanged && !previousNodeChanged) {
+        nextFragments.push(cachedFragments[index] ?? "");
+        continue;
+      }
+
+      const parentContent = index > 0 ? new Array<JSONContent>(index) : undefined;
+      if (parentContent) parentContent[index - 1] = documentNode.child(index - 1).toJSON() as JSONContent;
+      nextFragments.push(
+        manager.renderNodeToMarkdown(
+          node.toJSON() as JSONContent,
+          parentContent ? { type: "doc", content: parentContent } : { type: "doc" },
+          index,
+          0,
+        ),
+      );
+    }
+
+    if (!changed) return cachedMarkdown;
+
+    cachedNodes = nextNodes;
+    cachedFragments = nextFragments;
+    const renderedMarkdown = nextFragments.join("\n\n");
+    cachedMarkdown = renderedMarkdown.replace(/&nbsp;/g, "").replace(/\u00a0/g, "").trim() === ""
+      ? ""
+      : renderedMarkdown;
+    return cachedMarkdown;
+  };
 }
 
 /** Index just before the grapheme ending at `index`. Uses Intl.Segmenter when available so ZWJ emoji and combined marks are not split; falls back to surrogate-pair handling. */
@@ -867,6 +1069,7 @@ const LabImage = Image.extend({
       const image = document.createElement("img");
       image.className = String(props.HTMLAttributes.class ?? "lab-image");
       image.draggable = false;
+      image.loading = "lazy";
       image.setAttribute("contenteditable", "false");
       let centerButton: HTMLButtonElement | null = null;
       let alignmentAnimationFrame: number | null = null;
@@ -974,17 +1177,7 @@ const LabImage = Image.extend({
       };
       syncImage(props.node);
 
-      const overlay = document.createElement("div");
-      overlay.className = "image-selection-overlay";
-      overlay.setAttribute("contenteditable", "false");
-      overlay.setAttribute("data-image-overlay", "true");
-      overlay.setAttribute("aria-hidden", "true");
-
-      const toolbar = document.createElement("div");
-      toolbar.className = "image-edit-toolbar";
-      toolbar.setAttribute("contenteditable", "false");
-      toolbar.setAttribute("role", "toolbar");
-      toolbar.setAttribute("aria-label", "Image actions");
+      let overlay: HTMLDivElement | null = null;
 
       const getCurrentImage = () => {
         const pos = props.getPos();
@@ -1007,7 +1200,7 @@ const LabImage = Image.extend({
       } | null = null;
 
       const updateOverlay = () => {
-        if (!selected) return;
+        if (!selected || !overlay) return;
         const rect = image.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
         overlay.style.left = `${rect.left}px`;
@@ -1015,68 +1208,6 @@ const LabImage = Image.extend({
         overlay.style.width = `${rect.width}px`;
         overlay.style.height = `${rect.height}px`;
       };
-
-      const makeButton = (label: string, action: () => void) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "image-edit-button";
-        button.textContent = label;
-        button.setAttribute("aria-label", `${label} image`);
-        button.addEventListener("pointerdown", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-        });
-        button.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          action();
-        });
-        return button;
-      };
-
-      const cropButton = makeButton("Crop", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        (this.options as LabImageOptions).onCrop?.(current.node, current.pos);
-      });
-      const metadataButton = makeButton("Details", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        (this.options as LabImageOptions).onMetadata?.(current.node, current.pos);
-      });
-      const deleteButton = makeButton("Delete", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        props.editor.commands.deleteSelection();
-        props.editor.commands.focus();
-      });
-      centerButton = makeButton("Center", () => {
-        const current = getCurrentImage();
-        if (!current) return;
-        props.editor.commands.setNodeSelection(current.pos);
-        props.editor.commands.updateAttributes("image", {
-          align: current.node.attrs.align === "center" ? null : "center",
-        });
-        props.editor.commands.focus();
-      });
-      syncCenterButton(props.node);
-      toolbar.append(cropButton, metadataButton, centerButton, deleteButton);
-      overlay.append(toolbar);
-
-      const resizeHandles = CROP_HANDLES
-        .map((direction) => {
-          const handle = document.createElement("button");
-          handle.type = "button";
-          handle.className = `image-resize-handle image-resize-handle-${direction}`;
-          handle.setAttribute("data-image-resize-handle", direction);
-          handle.setAttribute("aria-label", `Resize image ${direction}`);
-          handle.tabIndex = -1;
-          overlay.append(handle);
-          return { direction, handle };
-        });
 
       const finishResize = () => {
         if (!resizing) return;
@@ -1147,23 +1278,102 @@ const LabImage = Image.extend({
         document.addEventListener("pointercancel", finishResize);
       };
 
-      resizeHandles.forEach(({ direction, handle }) => {
-        handle.addEventListener("pointerdown", (event) => startResize(event, direction));
-      });
+      const ensureOverlay = () => {
+        if (overlay) return;
+
+        const nextOverlay = document.createElement("div");
+        nextOverlay.className = "image-selection-overlay";
+        nextOverlay.setAttribute("contenteditable", "false");
+        nextOverlay.setAttribute("data-image-overlay", "true");
+        nextOverlay.setAttribute("aria-hidden", "true");
+
+        const toolbar = document.createElement("div");
+        toolbar.className = "image-edit-toolbar";
+        toolbar.setAttribute("contenteditable", "false");
+        toolbar.setAttribute("role", "toolbar");
+        toolbar.setAttribute("aria-label", "Image actions");
+
+        const makeButton = (label: string, action: () => void) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "image-edit-button";
+          button.textContent = label;
+          button.setAttribute("aria-label", `${label} image`);
+          button.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          });
+          button.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            action();
+          });
+          return button;
+        };
+
+        const cropButton = makeButton("Crop", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          (this.options as LabImageOptions).onCrop?.(current.node, current.pos);
+        });
+        const metadataButton = makeButton("Details", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          (this.options as LabImageOptions).onMetadata?.(current.node, current.pos);
+        });
+        const deleteButton = makeButton("Delete", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          props.editor.commands.deleteSelection();
+          props.editor.commands.focus();
+        });
+        centerButton = makeButton("Center", () => {
+          const current = getCurrentImage();
+          if (!current) return;
+          props.editor.commands.setNodeSelection(current.pos);
+          props.editor.commands.updateAttributes("image", {
+            align: current.node.attrs.align === "center" ? null : "center",
+          });
+          props.editor.commands.focus();
+        });
+        syncCenterButton(props.node);
+        toolbar.append(cropButton, metadataButton, centerButton, deleteButton);
+        nextOverlay.append(toolbar);
+
+        CROP_HANDLES.forEach((direction) => {
+          const handle = document.createElement("button");
+          handle.type = "button";
+          handle.className = `image-resize-handle image-resize-handle-${direction}`;
+          handle.setAttribute("data-image-resize-handle", direction);
+          handle.setAttribute("aria-label", `Resize image ${direction}`);
+          handle.tabIndex = -1;
+          handle.addEventListener("pointerdown", (event) => startResize(event, direction));
+          nextOverlay.append(handle);
+        });
+
+        overlay = nextOverlay;
+        document.body.append(nextOverlay);
+      };
 
       const selectNode = () => {
+        ensureOverlay();
         selected = true;
+        attachWindowListeners();
         image.classList.add("ProseMirror-selectednode");
-        overlay.style.display = "block";
-        overlay.setAttribute("aria-hidden", "false");
+        overlay?.style.setProperty("display", "block");
+        overlay?.setAttribute("aria-hidden", "false");
         updateOverlay();
       };
       const deselectNode = () => {
         selected = false;
         resizing = null;
+        detachWindowListeners();
         image.classList.remove("ProseMirror-selectednode");
-        overlay.style.display = "none";
-        overlay.setAttribute("aria-hidden", "true");
+        overlay?.style.setProperty("display", "none");
+        overlay?.setAttribute("aria-hidden", "true");
       };
       const onImageClick = (event: MouseEvent) => {
         event.preventDefault();
@@ -1173,12 +1383,22 @@ const LabImage = Image.extend({
       };
       const onImageLoad = () => updateOverlay();
       const onWindowChange = () => updateOverlay();
+      let windowListenersAttached = false;
+      const attachWindowListeners = () => {
+        if (windowListenersAttached) return;
+        windowListenersAttached = true;
+        window.addEventListener("resize", onWindowChange, { passive: true });
+        window.addEventListener("scroll", onWindowChange, { passive: true });
+      };
+      const detachWindowListeners = () => {
+        if (!windowListenersAttached) return;
+        windowListenersAttached = false;
+        window.removeEventListener("resize", onWindowChange);
+        window.removeEventListener("scroll", onWindowChange);
+      };
 
       image.addEventListener("click", onImageClick);
       image.addEventListener("load", onImageLoad);
-      window.addEventListener("resize", onWindowChange, { passive: true });
-      window.addEventListener("scroll", onWindowChange, { passive: true });
-      document.body.append(overlay);
       deselectNode();
 
       return {
@@ -1193,14 +1413,13 @@ const LabImage = Image.extend({
         deselectNode,
         destroy: () => {
           stopAlignmentAnimation();
+          detachWindowListeners();
           document.removeEventListener("pointermove", moveResize);
           document.removeEventListener("pointerup", finishResize);
           document.removeEventListener("pointercancel", finishResize);
           image.removeEventListener("click", onImageClick);
           image.removeEventListener("load", onImageLoad);
-          window.removeEventListener("resize", onWindowChange);
-          window.removeEventListener("scroll", onWindowChange);
-          overlay.remove();
+          overlay?.remove();
         },
       };
     };
@@ -1586,6 +1805,11 @@ function LabEditorSession() {
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
   const outlineItemsRef = useRef<OutlineItem[]>([]);
+  const largeExecCommandRef = useRef<{
+    original: Document["execCommand"];
+    patched: Document["execCommand"];
+  } | null>(null);
+  const inlineMathMigrationPendingRef = useRef(true);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
@@ -1666,6 +1890,7 @@ function LabEditorSession() {
 
   const setPalette = useCallback((value: PaletteState | null) => {
     const previous = paletteRef.current;
+    if (previous === value) return;
     if (previous?.mode === "search" && value?.mode !== "search") {
       searchIndexVersionRef.current += 1;
       searchComposingRef.current = false;
@@ -1680,6 +1905,7 @@ function LabEditorSession() {
   }, []);
 
   const setSelected = useCallback((value: number) => {
+    if (selectedRef.current === value) return;
     selectedRef.current = value;
     setSelectedState(value);
   }, []);
@@ -1709,6 +1935,29 @@ function LabEditorSession() {
     }
     syncOutlineActive(instance);
   }, [syncOutlineActive]);
+
+  const syncOutlineTransactions = useCallback((instance: Editor, transactions: readonly Transaction[]) => {
+    if (!outlineOpenRef.current) return;
+
+    let nextItems = outlineItemsRef.current;
+    let positionsChanged = false;
+    for (const transaction of transactions) {
+      if (!transaction.docChanged) continue;
+      if (transactionTouchesHeading(transaction)) {
+        syncOutlineItems(instance);
+        return;
+      }
+      nextItems = nextItems.map((item) => {
+        const position = transaction.mapping.map(item.position, 1);
+        if (position === item.position) return item;
+        positionsChanged = true;
+        return { ...item, position };
+      });
+    }
+
+    if (positionsChanged) outlineItemsRef.current = nextItems;
+    syncOutlineActive(instance);
+  }, [syncOutlineActive, syncOutlineItems]);
 
   const toggleOutline = useCallback(() => {
     const nextOpen = !outlineOpenRef.current;
@@ -1931,6 +2180,32 @@ function LabEditorSession() {
     [openImageCrop, openImageMetadata],
   );
 
+  const editorExtensions = useMemo(() => [
+    StarterKit.configure({
+      heading: { levels: [1, 2, 3] },
+      link: {
+        openOnClick: true,
+        linkOnPaste: true,
+        // The built-in autolinker runs before MarkdownLinkInput and consumes URLs
+        // inside `[label](https://...)`. Plain URLs are handled by PlainUrlInput below.
+        autolink: false,
+        defaultProtocol: "https",
+        HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
+      },
+    }),
+    TaskList,
+    TaskItem.configure({ nested: true }),
+    TableKit.configure({ table: { resizable: false } }),
+    Placeholder.configure({ placeholder: "" }),
+    imageExtension,
+    ...mathExtensions,
+    ...EditorBlockExtensions,
+    Markdown.configure({ markedOptions: { gfm: true } }),
+    MarkdownLinkInput,
+    PlainUrlInput,
+    SlashCommandInput,
+  ], [imageExtension, mathExtensions]);
+
   const stopCaretBlink = useCallback(() => {
     caretStrokeRef.current?.removeAttribute("data-blinking");
   }, []);
@@ -2055,50 +2330,27 @@ function LabEditorSession() {
   }, [setPalette]);
 
   const syncInterface = useCallback(
-    (instance: Editor, refreshOutline = false) => {
+    (instance: Editor) => {
       requestAnimationFrame(() => positionCaret(instance));
       if (outlineOpenRef.current) {
-        if (refreshOutline) syncOutlineItems(instance);
-        else syncOutlineActive(instance);
+        syncOutlineActive(instance);
       }
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
       setSelected(0);
     },
-    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive, syncOutlineItems],
+    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive],
   );
+
+  const serializeMarkdown = useMemo(() => createIncrementalMarkdownSerializer(), []);
 
   const editor = useEditor({
     immediatelyRender: false,
     // Tiptap's default style tag has no nonce. The equivalent base rules live
     // in the static global stylesheet so nonce-only CSP remains effective.
     injectCSS: false,
-    extensions: [
-      StarterKit.configure({
-        heading: { levels: [1, 2, 3] },
-        link: {
-          openOnClick: true,
-          linkOnPaste: true,
-          // The built-in autolinker runs before MarkdownLinkInput and consumes URLs
-          // inside `[label](https://...)`. Plain URLs are handled by PlainUrlInput below.
-          autolink: false,
-          defaultProtocol: "https",
-          HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
-        },
-      }),
-      TaskList,
-      TaskItem.configure({ nested: true }),
-      TableKit.configure({ table: { resizable: false } }),
-      Placeholder.configure({ placeholder: "" }),
-      imageExtension,
-      ...mathExtensions,
-      ...EditorBlockExtensions,
-      Markdown.configure({ markedOptions: { gfm: true } }),
-      MarkdownLinkInput,
-      PlainUrlInput,
-      SlashCommandInput,
-    ],
+    extensions: editorExtensions,
     content: "",
     contentType: "markdown",
     autofocus: false,
@@ -2473,8 +2725,52 @@ function LabEditorSession() {
     },
     onCreate: ({ editor: instance }) => {
       editorRef.current = instance;
+      const originalExecCommand = document.execCommand.bind(document);
+      const patchedExecCommand: Document["execCommand"] = (commandId, showUI, value) => {
+        if (commandId.toLowerCase() === "inserttext" && value && value.length <= 256) {
+          const selection = window.getSelection();
+          if (
+            selection
+            && !selection.isCollapsed
+            && selection.anchorNode
+            && selection.focusNode
+            && instance.view.dom.contains(selection.anchorNode)
+            && instance.view.dom.contains(selection.focusNode)
+          ) {
+            try {
+              const anchor = instance.view.posAtDOM(selection.anchorNode, selection.anchorOffset);
+              const head = instance.view.posAtDOM(selection.focusNode, selection.focusOffset);
+              const from = Math.min(anchor, head);
+              const to = Math.max(anchor, head);
+              if (to - from >= 4096) {
+                instance.view.dispatch(
+                  closeHistory(
+                    instance.view.state.tr.insertText(value, from, to).scrollIntoView(),
+                  ),
+                );
+                return true;
+              }
+            } catch {
+              // Keep native editing when the DOM range is transient.
+            }
+          }
+        }
+        return originalExecCommand(commandId, showUI, value);
+      };
+      document.execCommand = patchedExecCommand;
+      largeExecCommandRef.current = { original: originalExecCommand, patched: patchedExecCommand };
     },
-    onTransaction: ({ transaction }) => {
+    onDestroy: () => {
+      const execCommandPatch = largeExecCommandRef.current;
+      if (execCommandPatch && document.execCommand === execCommandPatch.patched) {
+        document.execCommand = execCommandPatch.original;
+      }
+      largeExecCommandRef.current = null;
+    },
+    onTransaction: ({ editor: instance, transaction, appendedTransactions }) => {
+      if (outlineOpenRef.current) {
+        syncOutlineTransactions(instance, [transaction, ...appendedTransactions]);
+      }
       if (!transaction.docChanged) return;
       const current = linkEditorStateRef.current;
       if (!current) return;
@@ -2494,10 +2790,16 @@ function LabEditorSession() {
       linkEditorStateRef.current = next;
       setLinkEditorState(next);
     },
-    onUpdate: ({ editor: instance }) => {
-      if (migrateInlineMath(instance)) return;
-      syncInterface(instance, true);
-      const markdown = instance.getMarkdown();
+    onUpdate: ({ editor: instance, transaction, appendedTransactions }) => {
+      const hasMathMigration = inlineMathMigrationPendingRef.current
+        || transactionContainsDollar(transaction)
+        || appendedTransactions.some(transactionContainsDollar);
+      if (hasMathMigration) {
+        inlineMathMigrationPendingRef.current = false;
+        if (migrateInlineMath(instance)) return;
+      }
+      syncInterface(instance);
+      const markdown = serializeMarkdown(instance);
       latestMarkdown.set(markdown);
       persistence.onEdit(markdown);
     },
@@ -2782,7 +3084,7 @@ function LabEditorSession() {
       // or an authority conflict has made the latest edit unsavable.
       const available = searchSessionList();
       setSessions(available);
-      const currentMarkdown = editor?.getMarkdown() ?? "";
+      const currentMarkdown = editor ? serializeMarkdown(editor) : "";
       const documents: LocalSearchDocument[] = (await Promise.all(available.map(async (session) => {
         if (session.id === documentId) {
           return {
@@ -2822,7 +3124,7 @@ function LabEditorSession() {
     } finally {
       if (requestVersion === searchIndexVersionRef.current) setSearchLoading(false);
     }
-  }, [documentId, editor, searchSessionList]);
+  }, [documentId, editor, searchSessionList, serializeMarkdown]);
 
   const updateSearchQuery = useCallback((query: string) => {
     const current = paletteRef.current;
@@ -2836,7 +3138,7 @@ function LabEditorSession() {
     setBacklinksLoading(true);
     try {
       const available = searchSessionList();
-      const currentMarkdown = editor?.getMarkdown() ?? "";
+      const currentMarkdown = editor ? serializeMarkdown(editor) : "";
       const documents: BacklinkDocument[] = (await Promise.all(available.map(async (session) => {
         if (session.id === documentId) {
           return { id: session.id, name: session.name, markdown: currentMarkdown, updatedAt: session.updatedAt };
@@ -2853,7 +3155,7 @@ function LabEditorSession() {
     } finally {
       setBacklinksLoading(false);
     }
-  }, [documentId, editor, searchSessionList]);
+  }, [documentId, editor, searchSessionList, serializeMarkdown]);
 
   const openCurrentLinkEditor = useCallback((anchor?: PaletteState) => {
     if (!editor) return false;
@@ -2954,12 +3256,12 @@ function LabEditorSession() {
       `Restore the version from ${new Date(version.createdAt).toLocaleString()}? The current note will be kept in version history.`,
     );
     if (!confirmed) return;
-    recordVersion(documentId, editor.getMarkdown());
+    recordVersion(documentId, serializeMarkdown(editor));
     editor.commands.setContent(version.markdown, { contentType: "markdown" });
     setPalette(null);
     editor.commands.focus("start");
     setNotice("Restored an earlier local version.");
-  }, [documentId, editor, setPalette]);
+  }, [documentId, editor, serializeMarkdown, setPalette]);
 
   const openBacklink = useCallback((backlink: Backlink) => {
     const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
@@ -3078,7 +3380,7 @@ function LabEditorSession() {
         return;
       }
       if (command.id === "stats") {
-        setStats(calculateDocumentStats(editor.getMarkdown()));
+        setStats(calculateDocumentStats(serializeMarkdown(editor)));
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "stats" });
         return;
       }
@@ -3324,17 +3626,19 @@ function LabEditorSession() {
         case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
-          downloadMarkdown("lab.md", editor.getMarkdown());
+          downloadMarkdown("lab.md", serializeMarkdown(editor));
           break;
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
-  const navigateToOutlineHeading = useCallback((item: OutlineItem) => {
+  const navigateToOutlineHeading = useCallback((itemId: string) => {
     const instance = editorRef.current;
     if (!instance || instance.isDestroyed) return;
+    const item = outlineItemsRef.current.find((candidate) => candidate.id === itemId);
+    if (!item) return;
     const node = instance.state.doc.nodeAt(item.position);
     if (!node || node.type.name !== "heading") {
       syncOutlineItems(instance);
@@ -3412,6 +3716,23 @@ function LabEditorSession() {
   useEffect(() => {
     if (!editor) return;
     let active = true;
+    const refreshHealth = async () => {
+      try {
+        const nextHealth = await inspectLocalStorage();
+        if (!active) return;
+        setHealth(nextHealth);
+        const loadNotice = nextHealth.errors.length > 0
+          ? "Some local storage locations are unavailable."
+          : nextHealth.conflicts > 0
+            ? `${nextHealth.conflicts} conflicting local ${nextHealth.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`
+            : openedWithInvalidSessionHash
+              ? "That session link was invalid. Opened the original note."
+              : null;
+        setNotice(loadNotice);
+      } catch {
+        if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
+      }
+    };
     void (async () => {
       // `return` inside try still runs finally — gate so redirect paths never enable the editor.
       let finishHydration = true;
@@ -3456,6 +3777,10 @@ function LabEditorSession() {
           return;
         }
         if (!active) return;
+        // A full migration scan is only needed when the loaded Markdown can
+        // contain legacy inline-math delimiters. New edits still trigger the
+        // narrow transaction scan below when they contain a dollar sign.
+        inlineMathMigrationPendingRef.current = markdown.includes("$$");
         editor.commands.setContent(markdown, { contentType: "markdown", emitUpdate: false });
         latestMarkdown.set(markdown);
         recordVersion(documentId, markdown);
@@ -3479,32 +3804,22 @@ function LabEditorSession() {
             // A metadata failure must not prevent the note from loading.
           }
         }
-        const nextHealth = await inspectLocalStorage();
-        if (!active) return;
-        setHealth(nextHealth);
-        const loadNotice = nextHealth.errors.length > 0
-          ? "Some local storage locations are unavailable."
-          : nextHealth.conflicts > 0
-            ? `${nextHealth.conflicts} conflicting local ${nextHealth.conflicts === 1 ? "draft is" : "drafts are"} available. Use /recover to export.`
-            : openedWithInvalidSessionHash
-              ? "That session link was invalid. Opened the original note."
-              : null;
-        setNotice(loadNotice);
       } catch {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       } finally {
         if (!active || !finishHydration) return;
-        if (!persistence.getState().loaded) persistence.markLoaded(editor.getMarkdown());
+        if (!persistence.getState().loaded) persistence.markLoaded(serializeMarkdown(editor));
         editor.setEditable(true, false);
         setHydrating(false);
         editor.commands.focus("end");
         syncInterface(editor);
+        void refreshHealth();
       }
     })();
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, syncInterface]);
+  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3673,7 +3988,7 @@ function LabEditorSession() {
     if (current.mode === "confirm-clear") {
       if (event.key === "Enter") {
         event.preventDefault();
-        if (editor) recordVersion(documentId, editor.getMarkdown());
+        if (editor) recordVersion(documentId, serializeMarkdown(editor));
         editor?.commands.clearContent(true);
         setPalette(null);
         editor?.commands.focus("start");
@@ -3951,7 +4266,7 @@ function LabEditorSession() {
                           data-level={item.level}
                           aria-current={active ? "location" : undefined}
                           title={item.title}
-                          onClick={() => navigateToOutlineHeading(item)}
+                          onClick={() => navigateToOutlineHeading(item.id)}
                         >
                           <span className="outline-item-marker" aria-hidden="true" />
                           <span className="outline-item-label">{item.title}</span>

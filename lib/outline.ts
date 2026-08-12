@@ -43,10 +43,17 @@ export function areOutlineItemsEqual(left: readonly OutlineItem[], right: readon
 }
 
 export function activeOutlineIndex(items: readonly OutlineItem[], position: number) {
+  let low = 0;
+  let high = items.length - 1;
   let active = -1;
-  for (let index = 0; index < items.length; index += 1) {
-    if (items[index].position > position) break;
-    active = index;
+  while (low <= high) {
+    const middle = low + ((high - low) >> 1);
+    if (items[middle].position <= position) {
+      active = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
   }
   return active;
 }

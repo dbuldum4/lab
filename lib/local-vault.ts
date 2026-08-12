@@ -379,6 +379,18 @@ async function normalizeSnapshot(value: unknown): Promise<CanonicalSnapshot | nu
     : null;
 }
 
+async function normalizeSnapshotPair(left: unknown, right: unknown) {
+  if (isSnapshotShape(left) && isSnapshotShape(right) && sameSnapshot(left, right)) {
+    const normalized = await normalizeSnapshot(left);
+    return [normalized, normalized] as const;
+  }
+  const [normalizedLeft, normalizedRight] = await Promise.all([
+    normalizeSnapshot(left),
+    normalizeSnapshot(right),
+  ]);
+  return [normalizedLeft, normalizedRight] as const;
+}
+
 export function sameSnapshot(left: LocalSnapshot | null, right: LocalSnapshot | null) {
   return Boolean(
     left
@@ -482,6 +494,7 @@ async function readIndexedDbRawState(): Promise<IndexedDbRawState> {
  */
 async function refreshDeletedFromIndexedDb(): Promise<boolean> {
   const id = currentDocumentId();
+  if (isDefaultDocument(id)) return false;
   if (isLocalDocumentDeleted(id)) return true;
   if (!hasIndexedDb()) return false;
   try {
@@ -530,10 +543,10 @@ async function readIndexedDb(): Promise<LocalSnapshot | null> {
   const authority = authorityRecord(raw.authority);
   // The authority record is a convenience for atomic commits, not a reason to
   // hide a healthy `current` replica when the authority payload is corrupt.
-  const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-    normalizeSnapshot(authority?.snapshot),
-    normalizeSnapshot(raw.current),
-  ]);
+  const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+    authority?.snapshot,
+    raw.current,
+  );
   return selectCurrentSnapshot(
     [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
   ) as CanonicalSnapshot | null;
@@ -689,10 +702,10 @@ async function commitIndexedDb(candidate: CanonicalSnapshot): Promise<AuthorityC
       };
     }
     const authority = authorityRecord(observed.authority);
-    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-      normalizeSnapshot(authority?.snapshot),
-      normalizeSnapshot(observed.current),
-    ]);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      observed.current,
+    );
     const existing = selectCurrentSnapshot(
       [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
     ) as CanonicalSnapshot | null;
@@ -729,10 +742,10 @@ async function commitIndexedDbIfSnapshot(
     const observed = await readIndexedDbRawState();
     if (isDeletedRecord(observed.deleted)) return null;
     const authority = authorityRecord(observed.authority);
-    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-      normalizeSnapshot(authority?.snapshot),
-      normalizeSnapshot(observed.current),
-    ]);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      observed.current,
+    );
     const existing = selectCurrentSnapshot(
       [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
     ) as CanonicalSnapshot | null;
@@ -754,10 +767,10 @@ async function commitIndexedDbDeletionIfSnapshot(
     const observed = await readIndexedDbRawState();
     if (isDeletedRecord(observed.deleted)) return false;
     const authority = authorityRecord(observed.authority);
-    const [verifiedAuthority, verifiedCurrent] = await Promise.all([
-      normalizeSnapshot(authority?.snapshot),
-      normalizeSnapshot(observed.current),
-    ]);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      observed.current,
+    );
     const existing = selectCurrentSnapshot(
       [verifiedAuthority, verifiedCurrent].filter((snapshot): snapshot is CanonicalSnapshot => Boolean(snapshot)),
     ) as CanonicalSnapshot | null;
@@ -1248,10 +1261,20 @@ async function persistentStorageGranted() {
  * marker so we never repopulate localStorage/OPFS for a deleted document.
  */
 async function writeReplicaIfCurrent(target: StorageTarget, snapshot: CanonicalSnapshot) {
-  if (await refreshDeletedFromIndexedDb()) return false;
   if (hasIndexedDb()) {
-    const authority = await readIndexedDb();
-    const current = await normalizeSnapshot(authority);
+    const raw = await readIndexedDbRawState();
+    if (isDeletedRecord(raw.deleted)) {
+      writeLocalTombstone(currentDocumentId(), raw.deleted.deletedAt);
+      return false;
+    }
+    const authority = authorityRecord(raw.authority);
+    const [verifiedAuthority, verifiedCurrent] = await normalizeSnapshotPair(
+      authority?.snapshot,
+      raw.current,
+    );
+    const current = selectCurrentSnapshot(
+      [verifiedAuthority, verifiedCurrent].filter((candidate): candidate is CanonicalSnapshot => Boolean(candidate)),
+    );
     if (current && !sameSnapshot(current, snapshot) && !shouldAcceptSnapshot(current, snapshot)) return false;
   }
   // Peer delete can land during the async authority read above.
@@ -1509,11 +1532,6 @@ export function listLocalRecoveryDrafts(): Promise<LocalRecoveryDraft[]> {
 }
 
 async function saveLocalDocumentInScope(markdown: string): Promise<StorageHealth> {
-    if (await refreshDeletedFromIndexedDb()) {
-      const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
-      return { ...health, saved: false };
-    }
-
     const pending = readPendingDocument();
     const pendingRead = await readPendingSnapshot(pending);
     const trustedPending = pendingRead.snapshot ? pending : null;
@@ -1573,14 +1591,6 @@ async function saveLocalDocumentInScope(markdown: string): Promise<StorageHealth
     } else {
       authorityFailed = true;
       extraErrors.push("Cross-tab persistence requires IndexedDB or Web Locks; the candidate was not written.");
-    }
-
-    // Re-read the IndexedDB deletion marker after authority work. A peer tab can
-    // finish deleteLocalDocument between commitIndexedDb acceptance and replica
-    // writes when Web Locks are missing; authority may already be gone.
-    if (await refreshDeletedFromIndexedDb()) {
-      const health = await inspectLocalStorageNow(["This session was deleted in another tab."]);
-      return { ...health, saved: false };
     }
 
     const writes = authorityFailed
