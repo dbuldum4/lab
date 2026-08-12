@@ -1,3 +1,11 @@
+import {
+  normalizeSearchText,
+  normalizeSearchTextWithMapping,
+  type SearchSourceRange,
+} from "./search-normalization.ts";
+
+export { normalizeSearchText } from "./search-normalization.ts";
+
 export type LocalSearchDocument = {
   id: string;
   name: string;
@@ -35,19 +43,45 @@ export function searchableMarkdown(markdown: string) {
 }
 
 export function normalizeSearchQuery(query: string) {
-  return query.trim().replace(/\s+/g, " ");
+  return normalizeSearchText(query);
 }
 
 function searchTerms(query: string) {
-  return [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))];
+  return [...new Set(normalizeSearchQuery(query).split(" ").filter(Boolean))];
 }
 
 function firstMatchIndex(value: string, terms: readonly string[]) {
-  const normalized = value.toLowerCase();
   return terms.reduce((earliest, term) => {
-    const index = normalized.indexOf(term);
+    const index = value.indexOf(term);
     return index >= 0 && (earliest < 0 || index < earliest) ? index : earliest;
   }, -1);
+}
+
+export function searchMatchRanges(value: string, query: string): SearchSourceRange[] {
+  const normalized = normalizeSearchTextWithMapping(value);
+  const terms = searchTerms(query);
+  const ranges: SearchSourceRange[] = [];
+  for (const term of terms) {
+    let index = normalized.text.indexOf(term);
+    while (index >= 0) {
+      const endIndex = index + term.length;
+      const startRange = normalized.sourceRanges[index];
+      const endRange = normalized.sourceRanges[endIndex - 1];
+      if (startRange && endRange) ranges.push({ start: startRange.start, end: endRange.end });
+      index = normalized.text.indexOf(term, endIndex);
+    }
+  }
+  return ranges
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+    .reduce<SearchSourceRange[]>((merged, range) => {
+      const previous = merged.at(-1);
+      if (previous && range.start <= previous.end) {
+        previous.end = Math.max(previous.end, range.end);
+      } else {
+        merged.push({ ...range });
+      }
+      return merged;
+    }, []);
 }
 
 export function searchExcerpt(markdown: string, query: string, maxLength = DEFAULT_EXCERPT_LENGTH) {
@@ -59,8 +93,9 @@ function searchExcerptFromText(text: string, query: string, maxLength: number) {
   if (text.length <= maxLength) return text;
 
   const terms = searchTerms(query);
-  const matchIndex = firstMatchIndex(text, terms);
-  const center = matchIndex < 0 ? 0 : matchIndex;
+  const normalized = normalizeSearchTextWithMapping(text);
+  const matchIndex = firstMatchIndex(normalized.text, terms);
+  const center = matchIndex < 0 ? 0 : normalized.sourceRanges[matchIndex]?.start ?? 0;
   // Keep the first matching term near the start of the excerpt. The result
   // card is intentionally compact, so a long lead can hide the match behind
   // the card's two-line clamp on narrow screens.
@@ -83,8 +118,8 @@ export function searchLocalDocuments(
     .flatMap((document) => {
       const name = document.name.trim() || "Untitled";
       const content = document.searchableText ?? searchableMarkdown(document.markdown);
-      const normalizedName = name.toLowerCase();
-      const normalizedContent = content.toLowerCase();
+      const normalizedName = normalizeSearchText(name);
+      const normalizedContent = normalizeSearchText(content);
       const nameTermCount = terms.filter((term) => normalizedName.includes(term)).length;
       const contentTermCount = terms.filter((term) => normalizedContent.includes(term)).length;
       const nameMatches = nameTermCount === terms.length;
@@ -94,10 +129,9 @@ export function searchLocalDocuments(
       ));
       if (!combinedMatches) return [];
 
-      const normalizedQueryLower = normalizedQuery.toLowerCase();
-      const nameScore = normalizedName === normalizedQueryLower
+      const nameScore = normalizedName === normalizedQuery
         ? 0
-        : normalizedName.startsWith(normalizedQueryLower)
+        : normalizedName.startsWith(normalizedQuery)
           ? 1
           : 2;
       const match: LocalSearchMatch = nameMatches && contentMatches

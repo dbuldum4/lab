@@ -1,12 +1,13 @@
 import { expect, test } from "@playwright/test";
-import { openEditor } from "./helpers";
+import { confirmMarkdownImport, openEditor } from "./helpers";
 
-async function importMarkdown(page: Parameters<typeof openEditor>[0], markdown: string) {
+async function importMarkdown(page: Parameters<typeof openEditor>[0], markdown: string, confirm = false) {
   await page.locator('input[type="file"][accept*="markdown"]').setInputFiles({
     name: "outline.md",
     mimeType: "text/markdown",
     buffer: Buffer.from(markdown),
   });
+  if (confirm) await confirmMarkdownImport(page);
 }
 
 test("the outline command reflects headings, tracks the current section, and navigates by keyboard", async ({ page }) => {
@@ -44,7 +45,7 @@ test("the outline command reflects headings, tracks the current section, and nav
 
   await editor.press("ControlOrMeta+Shift+o");
   await expect(page.getByTestId("document-outline")).toBeVisible();
-  await importMarkdown(page, "# Plan\n\n## Discovery\n\n### Sources\n\n## Launch\n\nNotes");
+  await importMarkdown(page, "# Plan\n\n## Discovery\n\n### Sources\n\n## Launch\n\nNotes", true);
   await expect(page.getByTestId("document-outline").getByRole("button", { name: "Discovery", exact: true })).toBeVisible();
   await expect(page.getByTestId("document-outline").getByRole("button", { name: "Research", exact: true })).toHaveCount(0);
 });

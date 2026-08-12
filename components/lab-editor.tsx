@@ -21,15 +21,16 @@ import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
 import { NodeSelection, type Transaction } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import { BorderBeam } from "border-beam";
 import katex from "katex";
-import { LayoutGroup, motion, type Transition } from "motion/react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ChangeEvent, type ReactNode, type RefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  CommandPalette,
+  type LinkEditorState,
+} from "@/components/command-palette";
 import {
   ImageMetadataDialog,
-  LinkEditorPanel,
-  ShortcutsPanel,
-  StatsPanel,
+  trapTabWithin,
+  useModalFocusTrap,
 } from "@/components/editor-feature-panels";
 import {
   createEditorPersistenceController,
@@ -59,6 +60,10 @@ import {
   transactionContainsDollar,
   transactionTouchesHeading,
 } from "@/lib/editor-transactions";
+import {
+  commandAvailability,
+  type CommandContext,
+} from "@/lib/command-availability";
 import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
@@ -81,14 +86,13 @@ import {
 import { automaticTitleFromMarkdown } from "@/lib/automatic-title";
 import { calculateDocumentStats, type DocumentStats } from "@/lib/document-stats";
 import { EditorBlockExtensions } from "@/lib/editor-blocks";
+import { markdownExportFilename } from "@/lib/export-filename";
 import {
-  normalizeSearchQuery,
   searchableMarkdown,
   searchLocalDocuments,
   type LocalSearchDocument,
   type LocalSearchResult,
 } from "@/lib/local-search";
-import { filterPickerOptions } from "@/lib/picker-filter";
 import {
   documentIdFromLocalHref,
   findBacklinks,
@@ -111,46 +115,34 @@ import {
   type VersionHistoryEntry,
 } from "@/lib/version-history";
 import {
+  createEditorNoticeController,
+  type EditorNotice,
+  type EditorNoticeController,
+  type EditorNoticeKind,
+} from "@/lib/editor-notice";
+import {
   THEMES,
   THEME_STORAGE_KEY,
   themeFromDocument,
   type ThemeId,
 } from "@/lib/theme";
+import {
+  CODE_LANGUAGES,
+  COMMANDS,
+  filterCommands,
+  filterThemes,
+  PALETTE_ID,
+  rankCommandOptions,
+  type Command,
+  type PaletteMode,
+  type PaletteState,
+} from "@/lib/command-palette";
 
-type SlashRange = { from: number; to: number };
-type PaletteMode =
-  | "commands"
-  | "status"
-  | "confirm-clear"
-  | "confirm-delete"
-  | "name"
-  | "sessions"
-  | "archives"
-  | "link-session"
-  | "search"
-  | "stats"
-  | "shortcuts"
-  | "language"
-  | "theme"
-  | "backlinks"
-  | "history"
-  | "link-editor";
-type PickerMode = "sessions" | "archives" | "link-session" | "backlinks" | "history";
-type PaletteAnchor = { left: number; top: number; bottom: number };
-type PaletteState = {
-  query: string;
-  range: SlashRange;
-  left: number;
-  top: number;
-  mode: PaletteMode;
-  anchor: PaletteAnchor;
-};
-
-type Command = {
-  id: string;
-  label: string;
-  detail: string;
-  terms: string;
+type PendingMarkdownImport = {
+  markdown: string;
+  fileName: string;
+  revision: number;
+  currentMarkdown: string;
 };
 
 type MathKind = "inline" | "block";
@@ -176,18 +168,6 @@ type ImageMetadataTarget = {
   title: string;
 };
 
-type LinkEditorState = {
-  from: number;
-  to: number;
-  label: string;
-  href: string;
-};
-
-type ShortcutDescription = {
-  keys: string;
-  action: string;
-};
-
 type CropRect = {
   x: number;
   y: number;
@@ -205,60 +185,6 @@ type CropInteraction = {
   handle?: CropHandle;
 };
 
-function isPickerMode(mode: PaletteMode | undefined): mode is PickerMode {
-  return mode === "sessions"
-    || mode === "archives"
-    || mode === "link-session"
-    || mode === "backlinks"
-    || mode === "history";
-}
-
-type PickerFilterFieldProps = {
-  inputRef: RefObject<HTMLInputElement | null>;
-  ariaLabel: string;
-  placeholder: string;
-  value: string;
-  activeDescendant?: string;
-  onChange: (event: ChangeEvent<HTMLInputElement>) => void;
-  onCompositionStart: () => void;
-  onCompositionEnd: () => void;
-};
-
-function PickerFilterField({
-  inputRef,
-  ariaLabel,
-  placeholder,
-  value,
-  activeDescendant,
-  onChange,
-  onCompositionStart,
-  onCompositionEnd,
-}: PickerFilterFieldProps) {
-  return (
-    <div className="search-field picker-filter-field">
-      <span className="search-field-prefix" aria-hidden="true">⌕</span>
-      <input
-        ref={inputRef}
-        type="search"
-        role="combobox"
-        aria-label={ariaLabel}
-        aria-expanded="true"
-        aria-controls={PALETTE_ID}
-        aria-activedescendant={activeDescendant}
-        aria-autocomplete="list"
-        aria-haspopup="listbox"
-        autoComplete="off"
-        placeholder={placeholder}
-        value={value}
-        onChange={onChange}
-        onCompositionStart={onCompositionStart}
-        onCompositionEnd={onCompositionEnd}
-      />
-      <kbd>Esc</kbd>
-    </div>
-  );
-}
-
 const CROP_HANDLES: CropHandle[] = [
   "top-left",
   "top",
@@ -270,118 +196,23 @@ const CROP_HANDLES: CropHandle[] = [
   "left",
 ];
 
-const SLASH_PALETTE_INITIAL = {
-  opacity: 0,
-  transform: "translateY(0px) scale(0.93)",
-};
-const SLASH_PALETTE_TRANSITION: Transition = {
-  type: "spring",
-  stiffness: 560,
-  damping: 34,
-  mass: 0.62,
-};
-const SLASH_SELECTION_TRANSITION: Transition = {
-  type: "spring",
-  stiffness: 480,
-  damping: 35,
-  mass: 0.58,
+const EMPTY_COMMAND_CONTEXT: CommandContext = {
+  inTable: false,
+  inCodeBlock: false,
+  inLink: false,
+  selectedImage: false,
 };
 
-const CODE_LANGUAGES = [
-  { id: "", label: "Plain text" },
-  { id: "typescript", label: "TypeScript" },
-  { id: "javascript", label: "JavaScript" },
-  { id: "tsx", label: "TSX" },
-  { id: "jsx", label: "JSX" },
-  { id: "python", label: "Python" },
-  { id: "bash", label: "Shell" },
-  { id: "json", label: "JSON" },
-  { id: "html", label: "HTML" },
-  { id: "css", label: "CSS" },
-  { id: "sql", label: "SQL" },
-  { id: "rust", label: "Rust" },
-  { id: "go", label: "Go" },
-  { id: "java", label: "Java" },
-  { id: "c", label: "C" },
-  { id: "cpp", label: "C++" },
-  { id: "yaml", label: "YAML" },
-  { id: "markdown", label: "Markdown" },
-] as const;
-
-const KEYBOARD_SHORTCUTS: ShortcutDescription[] = [
-  { keys: "⌘/Ctrl K", action: "Open sessions" },
-  { keys: "⌘/Ctrl ⇧ F", action: "Search every note" },
-  { keys: "⌘/Ctrl ⇧ O", action: "Toggle outline" },
-  { keys: "⌘/Ctrl ⇧ S", action: "Show document stats" },
-  { keys: "⌘/Ctrl ⌥ H", action: "Open version history" },
-  { keys: "⌘/Ctrl ⌥ L", action: "Choose code-block language" },
-  { keys: "⌘/Ctrl ⇧ K", action: "Edit the current link" },
-  { keys: "⌘/Ctrl ⇧ N", action: "Create a new session" },
-  { keys: "⌘/Ctrl ⇧ E", action: "Insert an equation" },
-  { keys: "⌘/Ctrl S", action: "Export the current note" },
-  { keys: "⌘/Ctrl /", action: "Show shortcuts" },
-];
-
-const COMMANDS: Command[] = [
-  { id: "text", label: "Text", detail: "Plain paragraph", terms: "paragraph normal" },
-  { id: "h1", label: "Heading 1", detail: "Large section title", terms: "title h1" },
-  { id: "h2", label: "Heading 2", detail: "Medium section title", terms: "subtitle h2" },
-  { id: "h3", label: "Heading 3", detail: "Small section title", terms: "subtitle h3" },
-  { id: "outline", label: "Outline", detail: "Toggle document headings", terms: "toc table of contents navigation sidebar" },
-  { id: "bullet", label: "Bulleted list", detail: "Create an unordered list", terms: "ul list bullets" },
-  { id: "number", label: "Numbered list", detail: "Create an ordered list", terms: "ol list numbers" },
-  { id: "todo", label: "To-do list", detail: "Create a checklist", terms: "task check checkbox" },
-  { id: "quote", label: "Quote", detail: "Create a block quote", terms: "blockquote citation" },
-  { id: "code", label: "Code block", detail: "Write preformatted code", terms: "pre snippet" },
-  { id: "divider", label: "Divider", detail: "Separate sections", terms: "rule hr line" },
-  { id: "table", label: "Table", detail: "Insert a 3 × 3 Markdown table", terms: "grid rows columns" },
-  { id: "table-row-before", label: "Table row above", detail: "Add a row before the current row", terms: "table insert row above" },
-  { id: "table-row-after", label: "Table row below", detail: "Add a row after the current row", terms: "table insert row below" },
-  { id: "table-delete-row", label: "Delete table row", detail: "Remove the current row", terms: "table remove row" },
-  { id: "table-column-before", label: "Table column left", detail: "Add a column before the current one", terms: "table insert column left" },
-  { id: "table-column-after", label: "Table column right", detail: "Add a column after the current one", terms: "table insert column right" },
-  { id: "table-delete-column", label: "Delete table column", detail: "Remove the current column", terms: "table remove column" },
-  { id: "table-toggle-header", label: "Toggle table header", detail: "Toggle the current row as a header", terms: "table heading header row" },
-  { id: "table-delete", label: "Delete table", detail: "Remove the current table", terms: "table remove grid" },
-  { id: "language", label: "Code language", detail: "Set the current code block language", terms: "code block syntax language fence" },
-  { id: "callout-note", label: "Note callout", detail: "Insert a note callout", terms: "alert info block" },
-  { id: "callout-tip", label: "Tip callout", detail: "Insert a tip callout", terms: "alert advice block" },
-  { id: "callout-warning", label: "Warning callout", detail: "Insert a warning callout", terms: "alert caution block" },
-  { id: "callout-important", label: "Important callout", detail: "Insert an important callout", terms: "alert critical block" },
-  { id: "details", label: "Collapsible section", detail: "Insert a summary with collapsible content", terms: "details disclosure toggle fold" },
-  { id: "inline-math", label: "Inline equation", detail: "Write LaTeX within a line", terms: "math latex formula inline equation" },
-  { id: "math", label: "Block equation", detail: "Write a centered LaTeX equation", terms: "math latex formula display equation" },
-  { id: "link", label: "Link", detail: "Type a URL, then close with )", terms: "url href markdown" },
-  { id: "link-note", label: "Link to session", detail: "Insert a link to another local note", terms: "internal wiki note relation" },
-  { id: "backlinks", label: "Backlinks", detail: "Show sessions linking here", terms: "incoming internal links references" },
-  { id: "edit-link", label: "Edit link", detail: "Edit the selected link label and URL", terms: "url href rename unlink" },
-  { id: "image", label: "Image", detail: "Insert a local image", terms: "photo picture upload paste" },
-  { id: "image-metadata", label: "Image metadata", detail: "Edit alt text and title", terms: "photo accessibility caption alt title" },
-  { id: "undo", label: "Undo", detail: "Undo the last change", terms: "back history" },
-  { id: "redo", label: "Redo", detail: "Redo the last change", terms: "forward history" },
-  { id: "import", label: "Import Markdown", detail: "Open a local .md file", terms: "open file load" },
-  { id: "export", label: "Export Markdown", detail: "Save a local .md copy", terms: "download file save" },
-  { id: "backup", label: "Export vault backup", detail: "Save every session and local image", terms: "vault backup export all archive" },
-  { id: "restore", label: "Restore vault backup", detail: "Merge a validated local backup", terms: "vault backup restore import merge" },
-  { id: "recover", label: "Export recovery drafts", detail: "Download conflicting local drafts", terms: "conflict restore backup" },
-  { id: "new", label: "New session", detail: "Start a separate document", terms: "document note create" },
-  { id: "name", label: "Name session", detail: "Rename this document", terms: "document note title rename" },
-  { id: "pin", label: "Pin session", detail: "Keep this session at the top", terms: "favorite important document" },
-  { id: "unpin", label: "Unpin session", detail: "Return this session to date ordering", terms: "favorite document" },
-  { id: "archive", label: "Archive session", detail: "Hide this session from active lists", terms: "hide store document" },
-  { id: "unarchive", label: "Unarchive session", detail: "Return this session to active lists", terms: "restore show document" },
-  { id: "sessions", label: "Sessions", detail: "Resume another document", terms: "documents notes switch open resume" },
-  { id: "archives", label: "Archived sessions", detail: "Browse locally archived notes", terms: "documents hidden stored" },
-  { id: "search", label: "Search notes", detail: "Find across local sessions", terms: "find search notes text content sessions" },
-  { id: "stats", label: "Document stats", detail: "Words, characters, blocks, and reading time", terms: "count reading time metrics" },
-  { id: "history", label: "Version history", detail: "Restore an earlier local version", terms: "revisions snapshots time machine" },
-  { id: "shortcuts", label: "Keyboard shortcuts", detail: "Show every app shortcut", terms: "keys hotkeys help" },
-  { id: "theme", label: "Theme", detail: "Choose the app colors", terms: "appearance light dark dracula nord solarized catppuccin" },
-  { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
-  { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
-  { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
-];
-
+function commandContextFromEditor(instance: Editor): CommandContext {
+  const linkType = instance.schema.marks.link;
+  const selection = instance.state.selection;
+  return {
+    inTable: instance.isActive("table"),
+    inCodeBlock: instance.isActive("codeBlock"),
+    inLink: Boolean(linkType && getMarkRange(selection.$from, linkType)),
+    selectedImage: selection instanceof NodeSelection && selection.node.type.name === "image",
+  };
+}
 const MarkdownLinkInput = Extension.create({
   name: "markdownLinkInput",
   addInputRules() {
@@ -596,8 +427,14 @@ const BlockMathMarkdown = BlockMath.extend({
   },
 });
 
-const EMPTY_HEALTH: StorageHealth = { copies: 0, labels: [], persistent: false, errors: [], conflicts: 0 };
-const PALETTE_ID = "slash-command-palette";
+const EMPTY_HEALTH: StorageHealth = {
+  copies: 0,
+  labels: [],
+  persistent: false,
+  errors: [],
+  conflicts: 0,
+  storageEstimate: null,
+};
 const MATH_EDITOR_ID = "math-editor-popover";
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
 const INLINE_MATH_PATTERN = /^\$\$((?:\\\$|[^$\n])+?)\$\$$/;
@@ -829,22 +666,6 @@ function deleteMathNode(instance: Editor, current: MathEditorState) {
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
-}
-
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function highlightSearchText(value: string, query: string): ReactNode {
-  const terms = [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))]
-    .sort((left, right) => right.length - left.length);
-  if (terms.length === 0) return value;
-  const matcher = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
-  return value.split(matcher).map((part, index) => (
-    terms.includes(part.toLowerCase())
-      ? <mark key={`${part}-${index}`}>{part}</mark>
-      : <span key={`${part}-${index}`}>{part}</span>
-  ));
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -1366,6 +1187,7 @@ const LabImage = Image.extend({
           button.addEventListener("pointerdown", (event) => {
             event.preventDefault();
             event.stopPropagation();
+            button.focus({ preventScroll: true });
           });
           button.addEventListener("click", (event) => {
             event.preventDefault();
@@ -1547,6 +1369,7 @@ function resizeCropRect(initial: CropRect, handle: CropHandle, delta: CropPoint)
 
 function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) {
   const dialogRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const interactionRef = useRef<CropInteraction | null>(null);
@@ -1556,9 +1379,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    dialogRef.current?.focus();
-  }, []);
+  useModalFocusTrap(dialogRef, closeButtonRef, onCancel);
 
   const updateRect = useCallback((next: CropRect) => {
     rectRef.current = next;
@@ -1678,34 +1499,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
             onCancel();
             return;
           }
-          if (event.key !== "Tab") return;
-
-          const dialog = dialogRef.current;
-          if (!dialog) return;
-          const focusable = Array.from(
-            dialog.querySelectorAll<HTMLElement>(
-              "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
-            ),
-          ).filter((element) => element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
-          if (focusable.length === 0) {
-            event.preventDefault();
-            dialog.focus();
-            return;
-          }
-
-          const first = focusable[0];
-          const last = focusable[focusable.length - 1];
-          const active = document.activeElement;
-          const movingBackward = event.shiftKey;
-          if (
-            active === dialog
-            || !dialog.contains(active)
-            || (movingBackward && active === first)
-            || (!movingBackward && active === last)
-          ) {
-            event.preventDefault();
-            (movingBackward ? last : first).focus();
-          }
+          trapTabWithin(event, dialogRef.current);
         }}
       >
         <div className="image-crop-header">
@@ -1713,7 +1507,15 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
             <h2 id="image-crop-title">Crop image</h2>
             <p>Drag to choose the visible area.</p>
           </div>
-          <button type="button" className="image-crop-close" aria-label="Close crop editor" onClick={onCancel}>×</button>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            className="image-crop-close"
+            aria-label="Close crop editor"
+            onClick={onCancel}
+          >
+            ×
+          </button>
         </div>
         <div
           ref={stageRef}
@@ -1799,7 +1601,7 @@ const SlashCommandInput = Extension.create({
     return [
       new InputRule({
         find: (text) => {
-          const match = text.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
+          const match = text.match(/(?:^|\s)\/([\p{L}\p{M}\p{N}_-]*)$/u);
           if (!match || match.index === undefined) return null;
           return { index: match.index, text: match[0] };
         },
@@ -1845,10 +1647,6 @@ function LabEditorSession() {
   const paletteElementRef = useRef<HTMLDivElement>(null);
   const mathEditorElementRef = useRef<HTMLDivElement>(null);
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
-  const sessionNameInputRef = useRef<HTMLInputElement>(null);
-  const searchInputRef = useRef<HTMLInputElement>(null);
-  const themeSearchInputRef = useRef<HTMLInputElement>(null);
-  const pickerFilterInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1864,13 +1662,14 @@ function LabEditorSession() {
   );
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
-  const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const searchIndexVersionRef = useRef(0);
   const searchComposingRef = useRef(false);
   const themeComposingRef = useRef(false);
-  const pickerComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const pendingMarkdownImportRef = useRef<PendingMarkdownImport | null>(null);
+  const importRequestRef = useRef(0);
+  const importConfirmingRef = useRef(false);
   const outlineOpenRef = useRef(false);
   const outlineItemsRef = useRef<OutlineItem[]>([]);
   const largeExecCommandRef = useRef<{
@@ -1879,6 +1678,8 @@ function LabEditorSession() {
   } | null>(null);
   const inlineMathMigrationPendingRef = useRef(true);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
+  const [pendingMarkdownImport, setPendingMarkdownImport] = useState<PendingMarkdownImport | null>(null);
+  const [importConfirming, setImportConfirming] = useState(false);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [imageMetadataTarget, setImageMetadataTarget] = useState<ImageMetadataTarget | null>(null);
@@ -1887,6 +1688,7 @@ function LabEditorSession() {
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
+  const [commandContext, setCommandContext] = useState<CommandContext>(EMPTY_COMMAND_CONTEXT);
   const [outlineOpen, setOutlineOpenState] = useState(false);
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
   const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
@@ -1903,7 +1705,20 @@ function LabEditorSession() {
   // /restore awaiting the render-time (stale) chain instead of that new touch.
   const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
   const [hydrating, setHydrating] = useState(true);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNoticeState] = useState<EditorNotice | null>(null);
+  const [noticeController] = useState<EditorNoticeController>(() => (
+    createEditorNoticeController({ onChange: setNoticeState })
+  ));
+  const setNotice = useCallback((message: string | null, kind?: EditorNoticeKind) => {
+    noticeController.set(message, kind);
+  }, [noticeController]);
+
+  useEffect(() => {
+    noticeController.activate();
+    return () => {
+      noticeController.dispose();
+    };
+  }, [noticeController]);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
   // Invalid ids still map to the default document; the hash is rewritten in
   // useLayoutEffect below so React StrictMode double init stays correct.
@@ -1964,15 +1779,11 @@ function LabEditorSession() {
       searchIndexVersionRef.current += 1;
       searchComposingRef.current = false;
       searchDocumentsRef.current = [];
-      searchResultRefs.current.clear();
       setSearchResults([]);
       setSearchLoading(false);
     }
     if (previous?.mode === "theme" && value?.mode !== "theme") {
       themeComposingRef.current = false;
-    }
-    if (isPickerMode(previous?.mode) && !isPickerMode(value?.mode)) {
-      pickerComposingRef.current = false;
     }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
@@ -2332,7 +2143,7 @@ function LabEditorSession() {
     const { $from } = instance.state.selection;
     if (!instance.state.selection.empty || !$from.parent.isTextblock || isCodeBlock($from.parent)) return null;
     const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
-    const match = before.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
+    const match = before.match(/(?:^|\s)\/([\p{L}\p{M}\p{N}_-]*)$/u);
     if (!match) return null;
     const token = `/${match[1]}`;
     const from = instance.state.selection.from - token.length;
@@ -2410,6 +2221,15 @@ function LabEditorSession() {
       if (outlineOpenRef.current) {
         syncOutlineActive(instance);
       }
+      const nextCommandContext = commandContextFromEditor(instance);
+      setCommandContext((current) => (
+        current.inTable === nextCommandContext.inTable
+        && current.inCodeBlock === nextCommandContext.inCodeBlock
+        && current.inLink === nextCommandContext.inLink
+        && current.selectedImage === nextCommandContext.selectedImage
+          ? current
+          : nextCommandContext
+      ));
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
@@ -2883,60 +2703,16 @@ function LabEditorSession() {
     onBlur: hideCaret,
   });
 
-  const filtered = useMemo(() => {
-    if (!palette || palette.mode !== "commands") return [];
-    const query = palette.query.toLowerCase();
-    return COMMANDS
-      .filter((command) => command.id !== (sessionPinned ? "pin" : "unpin"))
-      .filter((command) => command.id !== (sessionArchived ? "archive" : "unarchive"))
-      .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
-      .sort((left, right) => {
-        const score = (command: Command) => command.id === query
-          ? 0
-          : command.label.toLowerCase().startsWith(query)
-            ? 1
-            : 2;
-        return score(left) - score(right);
-      });
-  }, [palette, sessionArchived, sessionPinned]);
+  const filtered = useMemo(
+    () => filterCommands(palette, sessionPinned, sessionArchived, commandContext),
+    [commandContext, palette, sessionArchived, sessionPinned],
+  );
+  const rankedCommands = useMemo(
+    () => rankCommandOptions(palette, sessionPinned, sessionArchived, commandContext),
+    [commandContext, palette, sessionArchived, sessionPinned],
+  );
 
-  const filteredThemes = useMemo(() => {
-    if (!palette || palette.mode !== "theme") return [];
-    const normalize = (value: string) => value
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase();
-    const query = normalize(palette.query.trim());
-    if (!query) return [...THEMES];
-    return THEMES.filter((theme) => (
-      normalize(`${theme.label} ${theme.detail}`).includes(query)
-    ));
-  }, [palette]);
-
-  const filteredSessions = useMemo(() => {
-    if (!palette || !isPickerMode(palette.mode) || (palette.mode !== "sessions" && palette.mode !== "archives" && palette.mode !== "link-session")) {
-      return [];
-    }
-    return filterPickerOptions(
-      sessions,
-      palette.query,
-      (session) => `${session.name} ${session.pinned ? "pinned" : ""} ${session.archived ? "archived" : ""}`,
-    );
-  }, [palette, sessions]);
-
-  const filteredBacklinks = useMemo(() => {
-    if (!palette || palette.mode !== "backlinks") return [];
-    return filterPickerOptions(backlinks, palette.query, (backlink) => `${backlink.name} ${backlink.excerpt}`);
-  }, [backlinks, palette]);
-
-  const filteredVersions = useMemo(() => {
-    if (!palette || palette.mode !== "history") return [];
-    return filterPickerOptions(versions, palette.query, (version) => {
-      const versionStats = calculateDocumentStats(version.markdown);
-      const preview = searchableMarkdown(version.markdown).slice(0, 140);
-      return `${new Date(version.createdAt).toLocaleString()} ${versionStats.words} ${preview}`;
-    });
-  }, [palette, versions]);
+  const filteredThemes = useMemo(() => filterThemes(palette), [palette]);
 
   const mathError = useMemo(() => {
     if (!mathEditorState) return null;
@@ -2985,94 +2761,6 @@ function LabEditorSession() {
     return () => window.cancelAnimationFrame(frame);
   }, [mathEditorIdentity]);
 
-  useEffect(() => {
-    if (palette?.mode !== "name") return;
-    const frame = window.requestAnimationFrame(() => {
-      sessionNameInputRef.current?.focus();
-      sessionNameInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "search") return;
-    const frame = window.requestAnimationFrame(() => {
-      searchInputRef.current?.focus();
-      searchInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "theme") return;
-    const frame = window.requestAnimationFrame(() => {
-      themeSearchInputRef.current?.focus();
-      themeSearchInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (!isPickerMode(palette?.mode)) return;
-    const frame = window.requestAnimationFrame(() => {
-      pickerFilterInputRef.current?.focus();
-      pickerFilterInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "theme") return;
-    const activeThemeOption = filteredThemes[selected];
-    if (!activeThemeOption) return;
-    const frame = window.requestAnimationFrame(() => {
-      document
-        .getElementById(`${PALETTE_ID}-theme-${activeThemeOption.id}`)
-        ?.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [filteredThemes, palette?.mode, selected]);
-
-  useEffect(() => {
-    if (palette?.mode !== "search" || searchLoading) return;
-    const activeResult = searchResults[selected];
-    if (!activeResult) return;
-    const frame = window.requestAnimationFrame(() => {
-      searchResultRefs.current
-        .get(activeResult.documentId)
-        ?.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode, searchLoading, searchResults, selected]);
-
-  useEffect(() => {
-    if (!isPickerMode(palette?.mode)) return;
-    const activeId = palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session"
-      ? filteredSessions[selected] ? `${PALETTE_ID}-session-${filteredSessions[selected].id}` : null
-      : palette.mode === "backlinks"
-        ? filteredBacklinks[selected] ? `${PALETTE_ID}-backlink-${filteredBacklinks[selected].documentId}` : null
-        : filteredVersions[selected] ? `${PALETTE_ID}-version-${filteredVersions[selected].id}` : null;
-    if (!activeId) return;
-    const frame = window.requestAnimationFrame(() => {
-      document.getElementById(activeId)?.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [filteredBacklinks, filteredSessions, filteredVersions, palette?.mode, selected]);
-
-  useEffect(() => {
-    if (!isPickerMode(palette?.mode)) return;
-    const count = palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session"
-      ? filteredSessions.length
-      : palette.mode === "backlinks"
-        ? filteredBacklinks.length
-        : filteredVersions.length;
-    if (count === 0) {
-      if (selectedRef.current !== 0) setSelected(0);
-      return;
-    }
-    if (selectedRef.current >= count) setSelected(count - 1);
-  }, [filteredBacklinks.length, filteredSessions.length, filteredVersions.length, palette?.mode, setSelected]);
-
   useLayoutEffect(() => {
     repositionMathEditor();
   }, [mathEditorState, repositionMathEditor]);
@@ -3094,7 +2782,7 @@ function LabEditorSession() {
       return;
     }
     if (palette?.mode === "sessions" || palette?.mode === "archives" || palette?.mode === "link-session") {
-      const activeSession = filteredSessions[selected];
+      const activeSession = sessions[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeSession) {
@@ -3116,7 +2804,7 @@ function LabEditorSession() {
       return;
     }
     if (palette?.mode === "backlinks") {
-      const activeBacklink = filteredBacklinks[selected];
+      const activeBacklink = backlinks[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeBacklink) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-backlink-${activeBacklink.documentId}`);
@@ -3124,7 +2812,7 @@ function LabEditorSession() {
       return;
     }
     if (palette?.mode === "history") {
-      const activeVersion = filteredVersions[selected];
+      const activeVersion = versions[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeVersion) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-version-${activeVersion.id}`);
@@ -3142,7 +2830,7 @@ function LabEditorSession() {
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [backlinks, editor, filtered, filteredBacklinks, filteredSessions, filteredVersions, palette, searchResults, selected, sessions, versions]);
+  }, [backlinks, editor, filtered, palette, searchResults, selected, sessions, versions]);
 
   /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
   const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
@@ -3161,7 +2849,7 @@ function LabEditorSession() {
     if (switchAnyway) return "dirty";
     setNotice("This note could not be saved before switching sessions.");
     return "cancel";
-  }, [persistence]);
+  }, [persistence, setNotice]);
 
   /**
    * Stop accepting edits so the async gap before navigation cannot stage/save more text.
@@ -3187,7 +2875,7 @@ function LabEditorSession() {
     // dispose() is irreversible; reload restores a live persistence controller.
     window.location.reload();
     return false;
-  }, [editor, persistence]);
+  }, [editor, persistence, setNotice]);
 
   const navigateToSession = useCallback((session: DocumentSession, hashOverride?: string) => {
     // Preserve an explicit local-link hash, including the legacy
@@ -3305,13 +2993,6 @@ function LabEditorSession() {
     setSearchResults(searchLocalDocuments(searchDocumentsRef.current, query));
   }, [setPalette, setSelected]);
 
-  const updatePickerQuery = useCallback((query: string) => {
-    const current = paletteRef.current;
-    if (!current || !isPickerMode(current.mode)) return;
-    setPalette({ ...current, query });
-    setSelected(0);
-  }, [setPalette, setSelected]);
-
   const refreshBacklinks = useCallback(async () => {
     setBacklinksLoading(true);
     try {
@@ -3362,7 +3043,7 @@ function LabEditorSession() {
       range: { from: editor.state.selection.from, to: editor.state.selection.from },
     });
     return true;
-  }, [editor, paletteAtSelection, setPalette]);
+  }, [editor, paletteAtSelection, setNotice, setPalette]);
 
   const saveEditedLink = useCallback((label: string, href: string) => {
     const state = linkEditorState;
@@ -3394,7 +3075,7 @@ function LabEditorSession() {
     setLinkEditorState(null);
     setPalette(null);
     editor.commands.focus();
-  }, [editor, linkEditorState, setPalette]);
+  }, [editor, linkEditorState, setNotice, setPalette]);
 
   const removeEditedLink = useCallback(() => {
     const state = linkEditorState;
@@ -3415,7 +3096,7 @@ function LabEditorSession() {
     setPalette(null);
     editor.commands.focus();
     setNotice(`Linked to “${session.name}”.`);
-  }, [editor, setPalette]);
+  }, [editor, setNotice, setPalette]);
 
   const chooseCodeLanguage = useCallback((language: string) => {
     if (!editor || !editor.isActive("codeBlock")) {
@@ -3426,7 +3107,7 @@ function LabEditorSession() {
     editor.chain().focus().updateAttributes("codeBlock", { language: language || null }).run();
     setPalette(null);
     setNotice(language ? `Set code language to ${language}.` : "Cleared the code language.");
-  }, [editor, setPalette]);
+  }, [editor, setNotice, setPalette]);
 
   const restoreHistoryVersion = useCallback((version: VersionHistoryEntry) => {
     if (!editor) return;
@@ -3439,7 +3120,82 @@ function LabEditorSession() {
     setPalette(null);
     editor.commands.focus("start");
     setNotice("Restored an earlier local version.");
-  }, [documentId, editor, serializeMarkdown, setPalette]);
+  }, [documentId, editor, serializeMarkdown, setNotice, setPalette]);
+
+  const applyMarkdownImport = useCallback((markdown: string, fileName: string) => {
+    if (!editor) return false;
+    try {
+      editor.commands.setContent(markdown, { contentType: "markdown" });
+    } catch {
+      editor.commands.focus();
+      setNotice("The selected file could not be imported as Markdown.");
+      return false;
+    }
+    editor.commands.focus("start");
+    setNotice(`Imported “${fileName || "the selected Markdown file"}”.`);
+    return true;
+  }, [editor]);
+
+  const cancelMarkdownImport = useCallback((message = "Markdown import cancelled.") => {
+    pendingMarkdownImportRef.current = null;
+    setPendingMarkdownImport(null);
+    importConfirmingRef.current = false;
+    setImportConfirming(false);
+    setPalette(null);
+    editor?.commands.focus();
+    setNotice(message);
+  }, [editor, setPalette]);
+
+  const confirmMarkdownImport = useCallback(async () => {
+    const pending = pendingMarkdownImportRef.current;
+    if (!pending || !editor || importConfirmingRef.current) return;
+
+    const changedBeforeConfirmation = pending.revision !== persistence.getState().editRevision
+      || serializeMarkdown(editor) !== pending.currentMarkdown;
+    if (changedBeforeConfirmation) {
+      cancelMarkdownImport("The note changed while the import was waiting. Import was cancelled.");
+      return;
+    }
+
+    importConfirmingRef.current = true;
+    setImportConfirming(true);
+    let flushed = false;
+    try {
+      flushed = await persistence.flush();
+    } catch {
+      flushed = false;
+    }
+    if (pendingMarkdownImportRef.current !== pending) return;
+
+    const changedWhileSaving = pending.revision !== persistence.getState().editRevision
+      || serializeMarkdown(editor) !== pending.currentMarkdown;
+    if (changedWhileSaving) {
+      cancelMarkdownImport("The note changed while it was being saved. Import was cancelled.");
+      return;
+    }
+    if (!flushed) {
+      cancelMarkdownImport("The current note could not be saved before import. Import was cancelled.");
+      return;
+    }
+
+    const preservedBeforeImport = listVersions(documentId)
+      .some((version) => version.markdown === pending.currentMarkdown);
+    if (!preservedBeforeImport) recordVersion(documentId, pending.currentMarkdown);
+    const preserved = listVersions(documentId)
+      .some((version) => version.markdown === pending.currentMarkdown);
+    if (!preserved) {
+      cancelMarkdownImport("The current note could not be preserved in version history. Import was cancelled.");
+      return;
+    }
+
+    const imported = applyMarkdownImport(pending.markdown, pending.fileName);
+    pendingMarkdownImportRef.current = null;
+    setPendingMarkdownImport(null);
+    importConfirmingRef.current = false;
+    setImportConfirming(false);
+    setPalette(null);
+    if (!imported) editor.commands.focus();
+  }, [applyMarkdownImport, cancelMarkdownImport, documentId, editor, persistence, serializeMarkdown, setPalette]);
 
   const openBacklink = useCallback((backlink: Backlink) => {
     const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
@@ -3448,7 +3204,7 @@ function LabEditorSession() {
       return;
     }
     void resumeSession(session);
-  }, [resumeSession]);
+  }, [resumeSession, setNotice]);
 
   const openSearchResult = useCallback((result: LocalSearchResult) => {
     const session = sessions.find((candidate) => candidate.id === result.documentId) ?? {
@@ -3494,7 +3250,7 @@ function LabEditorSession() {
     window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
     window.location.reload();
     return true;
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, setNotice]);
 
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
@@ -3512,7 +3268,7 @@ function LabEditorSession() {
         editor?.commands.focus();
       })
       .catch(() => setNotice("This session name could not be saved locally."));
-  }, [documentId, editor, sessionName, setPalette]);
+  }, [documentId, editor, sessionName, setNotice, setPalette]);
 
   const chooseTheme = useCallback((themeId: ThemeId) => {
     document.documentElement.dataset.theme = themeId;
@@ -3525,11 +3281,17 @@ function LabEditorSession() {
     }
     setPalette(null);
     window.requestAnimationFrame(() => editorRef.current?.commands.focus());
-  }, [setPalette]);
+  }, [setNotice, setPalette]);
 
   const runCommand = useCallback(
     (command: Command) => {
       if (!editor || !paletteRef.current) return;
+      const availability = commandAvailability(command.id, commandContextFromEditor(editor));
+      if (!availability.available) {
+        setNotice(availability.reason ?? "This command is not available here.");
+        setPalette(null);
+        return;
+      }
       const current = paletteRef.current;
       const anchor = { ...current };
       // Slash text is UI chrome, not an edit the user should have to undo. In particular,
@@ -3822,12 +3584,12 @@ function LabEditorSession() {
         case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
-          downloadMarkdown("lab.md", serializeMarkdown(editor));
+          downloadMarkdown(markdownExportFilename(savedSessionName), serializeMarkdown(editor));
           break;
         }
       }
     },
-    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setNotice, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3907,7 +3669,7 @@ function LabEditorSession() {
       window.removeEventListener("hashchange", rebindIfSessionChanged);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, setNotice]);
 
   useEffect(() => {
     if (!editor) return;
@@ -4015,7 +3777,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, syncInterface]);
+  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -4038,7 +3800,7 @@ function LabEditorSession() {
 
   useLayoutEffect(() => {
     repositionPalette();
-  }, [backlinks.length, filtered.length, filteredBacklinks.length, filteredSessions.length, filteredThemes.length, filteredVersions.length, palette, repositionPalette, sessions.length, versions.length]);
+  }, [backlinks.length, filtered.length, filteredThemes.length, palette, rankedCommands.length, repositionPalette, sessions.length, versions.length]);
 
   useEffect(() => {
     const flush = () => {
@@ -4092,6 +3854,10 @@ function LabEditorSession() {
       event.preventDefault();
       if (current.mode === "name") setSessionName(savedSessionName);
       if (current.mode === "link-editor") setLinkEditorState(null);
+      if (current.mode === "confirm-import") {
+        cancelMarkdownImport();
+        return;
+      }
       setPalette(null);
       editor?.commands.focus();
       return;
@@ -4123,22 +3889,14 @@ function LabEditorSession() {
     }
 
     if (current.mode === "sessions" || current.mode === "archives" || current.mode === "link-session") {
-      const isComposing = pickerComposingRef.current || event.nativeEvent.isComposing;
-      if (isComposing && (
-        event.key === "ArrowDown"
-        || event.key === "ArrowUp"
-        || event.key === "Enter"
-        || event.key === "Tab"
-      )) return;
-
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, filteredSessions.length);
+        const count = Math.max(1, sessions.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && filteredSessions.length > 0) {
+      } else if ((event.key === "Enter" || event.key === "Tab") && sessions.length > 0) {
         event.preventDefault();
-        const session = filteredSessions[selectedRef.current] ?? filteredSessions[0];
+        const session = sessions[selectedRef.current] ?? sessions[0];
         if (current.mode === "link-session") {
           insertSessionLink(session);
         } else if (session.id === documentId) {
@@ -4189,43 +3947,35 @@ function LabEditorSession() {
     }
 
     if (current.mode === "backlinks") {
-      const isComposing = pickerComposingRef.current || event.nativeEvent.isComposing;
-      if (isComposing && (
-        event.key === "ArrowDown"
-        || event.key === "ArrowUp"
-        || event.key === "Enter"
-        || event.key === "Tab"
-      )) return;
-
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, filteredBacklinks.length);
+        const count = Math.max(1, backlinks.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && filteredBacklinks.length > 0) {
+      } else if ((event.key === "Enter" || event.key === "Tab") && backlinks.length > 0) {
         event.preventDefault();
-        openBacklink(filteredBacklinks[selectedRef.current] ?? filteredBacklinks[0]);
+        openBacklink(backlinks[selectedRef.current] ?? backlinks[0]);
       }
       return;
     }
 
     if (current.mode === "history") {
-      const isComposing = pickerComposingRef.current || event.nativeEvent.isComposing;
-      if (isComposing && (
-        event.key === "ArrowDown"
-        || event.key === "ArrowUp"
-        || event.key === "Enter"
-        || event.key === "Tab"
-      )) return;
-
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, filteredVersions.length);
+        const count = Math.max(1, versions.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && filteredVersions.length > 0) {
+      } else if ((event.key === "Enter" || event.key === "Tab") && versions.length > 0) {
         event.preventDefault();
-        restoreHistoryVersion(filteredVersions[selectedRef.current] ?? filteredVersions[0]);
+        restoreHistoryVersion(versions[selectedRef.current] ?? versions[0]);
+      }
+      return;
+    }
+
+    if (current.mode === "confirm-import") {
+      if (event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
+        event.preventDefault();
+        void confirmMarkdownImport();
       }
       return;
     }
@@ -4268,28 +4018,61 @@ function LabEditorSession() {
       return;
     }
 
-    if ((event.key === "Enter" || event.key === "Tab") && filtered.length > 0) {
-      event.preventDefault();
-      runCommand(filtered[selectedRef.current] ?? filtered[0]);
+    if (event.key === "Enter" || event.key === "Tab") {
+      if (rankedCommands.length > 0) event.preventDefault();
+      if (filtered.length > 0) {
+        runCommand(filtered[selectedRef.current] ?? filtered[0]);
+      }
     }
   };
 
   const onImport = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+    event.target.value = "";
     if (!file || !editor) return;
+    if (pendingMarkdownImportRef.current) {
+      pendingMarkdownImportRef.current = null;
+      setPendingMarkdownImport(null);
+      importConfirmingRef.current = false;
+      setImportConfirming(false);
+      if (paletteRef.current?.mode === "confirm-import") setPalette(null);
+    }
+    const requestId = importRequestRef.current + 1;
+    importRequestRef.current = requestId;
     const revisionAtSelection = persistence.getState().editRevision;
+    const currentMarkdown = serializeMarkdown(editor);
     void file.text()
       .then((markdown) => {
-        if (revisionAtSelection !== persistence.getState().editRevision) {
+        if (requestId !== importRequestRef.current) return;
+        if (
+          revisionAtSelection !== persistence.getState().editRevision
+          || serializeMarkdown(editor) !== currentMarkdown
+        ) {
           setNotice("The note changed while the file was loading. Import was cancelled.");
           return;
         }
-        editor.commands.setContent(markdown, { contentType: "markdown" });
-        editor.commands.focus("start");
+        if (!currentMarkdown.trim()) {
+          applyMarkdownImport(markdown, file.name);
+          return;
+        }
+        const pending = {
+          markdown,
+          fileName: file.name,
+          revision: revisionAtSelection,
+          currentMarkdown,
+        };
+        pendingMarkdownImportRef.current = pending;
+        setPendingMarkdownImport(pending);
+        importConfirmingRef.current = false;
+        setImportConfirming(false);
         setNotice(null);
+        setPalette(paletteAtSelection(editor, "confirm-import"));
       })
-      .catch(() => setNotice("The selected file could not be read as Markdown."));
-    event.target.value = "";
+      .catch(() => {
+        if (requestId === importRequestRef.current) {
+          setNotice("The selected file could not be read as Markdown.");
+        }
+      });
   };
 
   const onVaultRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -4377,13 +4160,11 @@ function LabEditorSession() {
     }
     instance.commands.setNodeSelection(target.pos);
     instance.commands.updateAttributes("image", { src: dataUrl, width: null, height: null });
-    instance.commands.focus();
     setImageCropTarget(null);
   }, [imageCropTarget]);
 
   const cancelImageCrop = useCallback(() => {
     setImageCropTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const applyImageMetadata = useCallback((metadata: { alt: string; title: string }) => {
@@ -4401,13 +4182,11 @@ function LabEditorSession() {
       title: metadata.title.trim() || null,
     });
     setImageMetadataTarget(null);
-    instance.commands.focus();
     setNotice("Updated image alt text and title.");
-  }, [imageMetadataTarget]);
+  }, [imageMetadataTarget, setNotice]);
 
   const cancelImageMetadata = useCallback(() => {
     setImageMetadataTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -4609,456 +4388,87 @@ function LabEditorSession() {
       <input ref={vaultBackupInputRef} hidden type="file" accept=".json,.lab-vault,application/json" tabIndex={-1} aria-hidden="true" onChange={onVaultRestore} />
       <input ref={imageInputRef} hidden type="file" accept="image/*" multiple tabIndex={-1} aria-hidden="true" onChange={onImageImport} />
 
-      {palette ? (
+      <CommandPalette
+        palette={palette}
+        paletteElementRef={paletteElementRef}
+        selected={selected}
+        commandContext={commandContext}
+        sessionPinned={sessionPinned}
+        sessionArchived={sessionArchived}
+        activeTheme={activeTheme}
+        prefersReducedMotion={prefersReducedMotion}
+        sessions={sessions}
+        documentId={documentId}
+        searchResults={searchResults}
+        searchLoading={searchLoading}
+        stats={stats}
+        backlinks={backlinks}
+        backlinksLoading={backlinksLoading}
+        versions={versions}
+        health={health}
+        sessionName={sessionName}
+        linkEditorState={linkEditorState}
+        pendingMarkdownImport={pendingMarkdownImport}
+        importConfirming={importConfirming}
+        setPalette={setPalette}
+        setSelected={setSelected}
+        setSessionName={setSessionName}
+        updateSearchQuery={updateSearchQuery}
+        submitSessionName={submitSessionName}
+        runCommand={runCommand}
+        openSearchResult={openSearchResult}
+        onSessionSelect={(session, mode) => {
+          if (mode === "link-session") {
+            insertSessionLink(session);
+          } else if (session.id === documentId) {
+            setPalette(null);
+            editor?.commands.focus();
+          } else {
+            void resumeSession(session);
+          }
+        }}
+        chooseCodeLanguage={chooseCodeLanguage}
+        chooseTheme={chooseTheme}
+        openBacklink={openBacklink}
+        restoreHistoryVersion={restoreHistoryVersion}
+        onLinkLabelChange={(label) => setLinkEditorState((current) => current ? { ...current, label } : current)}
+        onLinkHrefChange={(href) => setLinkEditorState((current) => current ? { ...current, href } : current)}
+        saveEditedLink={() => {
+          if (linkEditorState) saveEditedLink(linkEditorState.label, linkEditorState.href);
+        }}
+        removeEditedLink={removeEditedLink}
+        cancelLinkEditor={() => {
+          setLinkEditorState(null);
+          setPalette(null);
+          editor?.commands.focus();
+        }}
+        confirmMarkdownImport={confirmMarkdownImport}
+        cancelMarkdownImport={cancelMarkdownImport}
+        onSearchCompositionStart={() => { searchComposingRef.current = true; }}
+        onSearchCompositionEnd={() => { searchComposingRef.current = false; }}
+        onThemeCompositionStart={() => { themeComposingRef.current = true; }}
+        onThemeCompositionEnd={() => { themeComposingRef.current = false; }}
+      />
+      {notice ? (
         <div
-          ref={paletteElementRef}
-          className="command-palette-positioner"
-          style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
+          className="editor-notice"
+          data-kind={notice.kind}
+          data-testid="editor-notice"
+          role={notice.kind === "info" ? "status" : "alert"}
+          aria-live={notice.kind === "info" ? "polite" : "assertive"}
+          aria-atomic="true"
         >
-          <motion.div
-            className="command-palette-motion"
-            initial={prefersReducedMotion ? { opacity: 0, transform: "none" } : SLASH_PALETTE_INITIAL}
-            animate={{ opacity: 1, transform: "translateY(0px) scale(1)" }}
-            transition={prefersReducedMotion ? { duration: 0.08, ease: [0.23, 1, 0.32, 1] } : SLASH_PALETTE_TRANSITION}
+          <span className="editor-notice-message">{notice.message}</span>
+          <button
+            className="feature-button editor-notice-dismiss"
+            type="button"
+            aria-label="Dismiss notification"
+            onClick={() => { noticeController.dismiss(notice.id); }}
           >
-          <BorderBeam
-            className="command-palette-frame"
-            size="line"
-            colorVariant="mono"
-            theme={THEMES.find((theme) => theme.id === activeTheme)?.colorScheme ?? "dark"}
-            staticColors
-            duration={3.2}
-            active={(palette.mode === "commands" || palette.mode === "search") && !prefersReducedMotion}
-            strength={0.42}
-            brightness={1.05}
-            saturation={0}
-            borderRadius={13}
-          >
-          <div
-            id={PALETTE_ID}
-            className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
-          >
-          {palette.mode === "commands" ? (
-            filtered.length > 0 ? (
-              <LayoutGroup id="slash-command-selection">
-                <div className="command-list">
-                  {filtered.map((command, index) => (
-                    <div
-                      className="command-item"
-                      data-motion-selection="true"
-                      data-selected={index === selected}
-                      id={`${PALETTE_ID}-${command.id}`}
-                      key={command.id}
-                      role="option"
-                      aria-selected={index === selected}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        runCommand(command);
-                      }}
-                      onMouseEnter={() => setSelected(index)}
-                    >
-                      {index === selected ? (
-                        <motion.div
-                          className="command-selection-motion"
-                          layoutId="slash-command-selection"
-                          transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
-                          aria-hidden="true"
-                        />
-                      ) : null}
-                      <span>{command.label}</span>
-                      <small>{command.detail}</small>
-                    </div>
-                  ))}
-                </div>
-              </LayoutGroup>
-            ) : (
-              <div className="palette-message">No command</div>
-            )
-          ) : palette.mode === "search" ? (
-            <div className="search-panel" data-testid="search-panel">
-              <div className="search-field">
-                <span className="search-field-prefix" aria-hidden="true">/</span>
-                <input
-                  ref={searchInputRef}
-                  type="search"
-                  role="combobox"
-                  aria-label="Search local notes"
-                  aria-expanded="true"
-                  aria-controls={`${PALETTE_ID}-results`}
-                  aria-activedescendant={!searchLoading && searchResults[selected]
-                    ? `${PALETTE_ID}-search-${searchResults[selected].documentId}`
-                    : undefined}
-                  aria-autocomplete="list"
-                  aria-haspopup="listbox"
-                  autoComplete="off"
-                  placeholder="Search sessions and note text"
-                  value={palette.query}
-                  onChange={(event) => updateSearchQuery(event.target.value)}
-                  onCompositionStart={() => { searchComposingRef.current = true; }}
-                  onCompositionEnd={() => { searchComposingRef.current = false; }}
-                />
-                <kbd>Esc</kbd>
-              </div>
-              <div className="search-summary" role="status" aria-live="polite">
-                {searchLoading
-                  ? "Indexing local notes…"
-                  : palette.query.trim()
-                    ? `${searchResults.length} ${searchResults.length === 1 ? "match" : "matches"}`
-                    : `${sessions.length} local ${sessions.length === 1 ? "session" : "sessions"}`}
-              </div>
-              <div id={`${PALETTE_ID}-results`} className="search-results" role="listbox" aria-label="Search results">
-                {searchLoading ? (
-                  <div className="search-empty">Reading verified local copies…</div>
-                ) : palette.query.trim() && searchResults.length > 0 ? (
-                  searchResults.map((result, index) => (
-                    <div
-                      ref={(element) => {
-                        if (element) searchResultRefs.current.set(result.documentId, element);
-                        else searchResultRefs.current.delete(result.documentId);
-                      }}
-                      className="search-result"
-                      data-testid="search-result"
-                      data-selected={index === selected}
-                      data-current={result.documentId === documentId}
-                      id={`${PALETTE_ID}-search-${result.documentId}`}
-                      key={result.documentId}
-                      role="option"
-                      aria-selected={index === selected}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        openSearchResult(result);
-                      }}
-                      onMouseEnter={() => setSelected(index)}
-                    >
-                      <div className="search-result-heading">
-                        <span>{highlightSearchText(result.name, palette.query)}</span>
-                        <small>
-                          {result.documentId === documentId ? "Current session · " : ""}
-                          {result.match === "name"
-                            ? "Session name"
-                            : result.match === "content"
-                              ? "Note text"
-                              : "Name + note text"}
-                        </small>
-                      </div>
-                      <div className="search-result-excerpt">
-                        {highlightSearchText(result.excerpt || "Session name match", palette.query)}
-                      </div>
-                    </div>
-                  ))
-                ) : palette.query.trim() ? (
-                  <div className="search-empty">No local notes match “{palette.query.trim()}”.</div>
-                ) : (
-                  <div className="search-empty">Search session names and the text of every local note.</div>
-                )}
-              </div>
-              <div className="search-footer">↑↓ move · Enter open · Esc close · local only</div>
-            </div>
-          ) : palette.mode === "name" ? (
-            <div className="session-name-panel">
-              <label htmlFor="session-name-input">Session name</label>
-              <input
-                ref={sessionNameInputRef}
-                id="session-name-input"
-                value={sessionName}
-                maxLength={80}
-                autoComplete="off"
-                onChange={(event) => setSessionName(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    submitSessionName();
-                  }
-                }}
-              />
-              <small>Enter to save · Esc to cancel</small>
-            </div>
-          ) : palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" ? (
-            <div className="command-list session-list" data-testid="session-list">
-              <PickerFilterField
-                inputRef={pickerFilterInputRef}
-                ariaLabel={palette.mode === "archives" ? "Search archived sessions" : palette.mode === "link-session" ? "Search sessions to link" : "Search sessions"}
-                placeholder={palette.mode === "archives" ? "Filter archived sessions" : palette.mode === "link-session" ? "Filter sessions to link" : "Filter sessions"}
-                value={palette.query}
-                activeDescendant={filteredSessions[selected]
-                  ? `${PALETTE_ID}-session-${filteredSessions[selected].id}`
-                  : undefined}
-                onChange={(event) => updatePickerQuery(event.target.value)}
-                onCompositionStart={() => { pickerComposingRef.current = true; }}
-                onCompositionEnd={() => { pickerComposingRef.current = false; }}
-              />
-              {filteredSessions.length > 0 ? filteredSessions.map((session, index) => (
-                <div
-                  className="command-item"
-                  data-selected={index === selected}
-                  data-current={session.id === documentId}
-                  id={`${PALETTE_ID}-session-${session.id}`}
-                  key={session.id}
-                  role="option"
-                  aria-selected={index === selected}
-                  aria-current={session.id === documentId ? "true" : undefined}
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    if (palette.mode === "link-session") {
-                      insertSessionLink(session);
-                    } else if (session.id === documentId) {
-                      setPalette(null);
-                      editor?.commands.focus();
-                    } else {
-                      void resumeSession(session);
-                    }
-                  }}
-                  onMouseEnter={() => setSelected(index)}
-                >
-                  <span>{session.pinned ? "◆ " : ""}{session.name}</span>
-                  <small>
-                    {palette.mode === "link-session"
-                      ? session.archived ? "Archived · insert local link" : "Insert local link"
-                      : session.id === documentId
-                        ? "Current session"
-                        : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}
-                  </small>
-                </div>
-              )) : (
-                <div className="palette-message">
-                  <span>{palette.query.trim()
-                    ? `No ${palette.mode === "archives" ? "archived sessions" : palette.mode === "link-session" ? "sessions to link" : "sessions"} match “${palette.query.trim()}”.`
-                    : palette.mode === "archives" ? "No archived sessions" : palette.mode === "link-session" ? "No other sessions to link" : "No sessions"}</span>
-                  <small>{palette.query.trim() ? "Try another filter" : "Type to filter · Esc to return to the editor"}</small>
-                </div>
-              )}
-            </div>
-          ) : palette.mode === "stats" ? (
-            <StatsPanel stats={stats} />
-          ) : palette.mode === "shortcuts" ? (
-            <ShortcutsPanel shortcuts={KEYBOARD_SHORTCUTS} />
-          ) : palette.mode === "language" ? (
-            <div className="command-list language-list" data-testid="language-list">
-              {CODE_LANGUAGES.map((language, index) => (
-                <div
-                  className="command-item"
-                  data-selected={index === selected}
-                  id={`${PALETTE_ID}-language-${language.id || "plain"}`}
-                  key={language.id || "plain"}
-                  role="option"
-                  aria-selected={index === selected}
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    chooseCodeLanguage(language.id);
-                  }}
-                  onMouseEnter={() => setSelected(index)}
-                >
-                  <span>{language.label}</span>
-                  <small>{language.id ? `\`\`\`${language.id}` : "No fence identifier"}</small>
-                </div>
-              ))}
-            </div>
-          ) : palette.mode === "theme" ? (
-            <div className="theme-panel" data-testid="theme-panel">
-              <div className="search-field">
-                <span className="search-field-prefix" aria-hidden="true">◐</span>
-                <input
-                  ref={themeSearchInputRef}
-                  type="search"
-                  role="combobox"
-                  aria-label="Search themes"
-                  aria-expanded="true"
-                  aria-controls={`${PALETTE_ID}-theme-results`}
-                  aria-activedescendant={filteredThemes[selected]
-                    ? `${PALETTE_ID}-theme-${filteredThemes[selected].id}`
-                    : undefined}
-                  aria-autocomplete="list"
-                  aria-haspopup="listbox"
-                  autoComplete="off"
-                  placeholder="Search themes"
-                  value={palette.query}
-                  onCompositionStart={() => { themeComposingRef.current = true; }}
-                  onCompositionEnd={() => { themeComposingRef.current = false; }}
-                  onChange={(event) => {
-                    setSelected(0);
-                    setPalette({ ...palette, query: event.target.value });
-                  }}
-                />
-                <kbd>Esc</kbd>
-              </div>
-              <div
-                id={`${PALETTE_ID}-theme-results`}
-                className="command-list theme-list"
-                data-testid="theme-list"
-                role="listbox"
-                aria-label="Theme results"
-                tabIndex={-1}
-              >
-                {filteredThemes.length > 0 ? filteredThemes.map((theme, index) => (
-                  <div
-                    className="command-item theme-item"
-                    data-selected={index === selected}
-                    data-current={theme.id === activeTheme}
-                    id={`${PALETTE_ID}-theme-${theme.id}`}
-                    key={theme.id}
-                    role="option"
-                    aria-selected={index === selected}
-                    aria-current={theme.id === activeTheme ? "true" : undefined}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      chooseTheme(theme.id);
-                    }}
-                    onMouseEnter={() => setSelected(index)}
-                  >
-                    <span className="theme-label">
-                      <span className="theme-swatches" aria-hidden="true">
-                        {theme.swatches.map((color) => (
-                          <span key={color} style={{ backgroundColor: color }} />
-                        ))}
-                      </span>
-                      {theme.label}
-                    </span>
-                    <small>{theme.id === activeTheme ? "Current" : theme.detail}</small>
-                  </div>
-                )) : (
-                  <div className="search-empty">No themes match “{palette.query.trim()}”.</div>
-                )}
-              </div>
-              <div className="search-footer theme-footer">
-                <span>{filteredThemes.length} {filteredThemes.length === 1 ? "theme" : "themes"} · ↑↓ move · Enter select</span>
-                <a href="./third-party-notices/" target="_blank" rel="noreferrer">Licenses</a>
-              </div>
-            </div>
-          ) : palette.mode === "backlinks" ? (
-            <div className="feature-list-panel" data-testid="backlinks-panel">
-              <div className="feature-list-header">
-                <span>Backlinks</span>
-                <small>{backlinksLoading ? "Reading local notes…" : `${filteredBacklinks.length}${palette.query.trim() ? ` of ${backlinks.length}` : ""} incoming ${filteredBacklinks.length === 1 ? "link" : "links"}`}</small>
-              </div>
-              <PickerFilterField
-                inputRef={pickerFilterInputRef}
-                ariaLabel="Search backlinks"
-                placeholder="Filter backlinks"
-                value={palette.query}
-                activeDescendant={filteredBacklinks[selected]
-                  ? `${PALETTE_ID}-backlink-${filteredBacklinks[selected].documentId}`
-                  : undefined}
-                onChange={(event) => updatePickerQuery(event.target.value)}
-                onCompositionStart={() => { pickerComposingRef.current = true; }}
-                onCompositionEnd={() => { pickerComposingRef.current = false; }}
-              />
-              <div className="command-list feature-result-list">
-                {backlinksLoading ? (
-                  <div className="palette-message"><span>Finding links…</span><small>Verified local copies only</small></div>
-                ) : filteredBacklinks.length > 0 ? filteredBacklinks.map((backlink, index) => (
-                  <div
-                    className="command-item feature-result-item"
-                    data-selected={index === selected}
-                    id={`${PALETTE_ID}-backlink-${backlink.documentId}`}
-                    key={backlink.documentId}
-                    role="option"
-                    aria-selected={index === selected}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      openBacklink(backlink);
-                    }}
-                    onMouseEnter={() => setSelected(index)}
-                  >
-                    <span>{backlink.name}</span>
-                    <small>{backlink.excerpt}</small>
-                  </div>
-                )) : (
-                  <div className="palette-message">
-                    <span>{palette.query.trim() ? `No backlinks match “${palette.query.trim()}”.` : "No backlinks yet"}</span>
-                    <small>{palette.query.trim() ? "Try another filter" : "Use /link-note in another session to create one"}</small>
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : palette.mode === "history" ? (
-            <div className="feature-list-panel" data-testid="version-history-panel">
-              <div className="feature-list-header">
-                <span>Version history</span>
-                <small>{filteredVersions.length}{palette.query.trim() ? ` of ${versions.length}` : ""} local {filteredVersions.length === 1 ? "version" : "versions"}</small>
-              </div>
-              <PickerFilterField
-                inputRef={pickerFilterInputRef}
-                ariaLabel="Search version history"
-                placeholder="Filter saved versions"
-                value={palette.query}
-                activeDescendant={filteredVersions[selected]
-                  ? `${PALETTE_ID}-version-${filteredVersions[selected].id}`
-                  : undefined}
-                onChange={(event) => updatePickerQuery(event.target.value)}
-                onCompositionStart={() => { pickerComposingRef.current = true; }}
-                onCompositionEnd={() => { pickerComposingRef.current = false; }}
-              />
-              <div className="command-list feature-result-list">
-                {filteredVersions.length > 0 ? filteredVersions.map((version, index) => {
-                  const versionStats = calculateDocumentStats(version.markdown);
-                  const preview = searchableMarkdown(version.markdown).slice(0, 140);
-                  return (
-                    <div
-                      className="command-item feature-result-item"
-                      data-selected={index === selected}
-                      id={`${PALETTE_ID}-version-${version.id}`}
-                      key={version.id}
-                      role="option"
-                      aria-selected={index === selected}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        restoreHistoryVersion(version);
-                      }}
-                      onMouseEnter={() => setSelected(index)}
-                    >
-                      <span>{new Date(version.createdAt).toLocaleString()}</span>
-                      <small>{versionStats.words} {versionStats.words === 1 ? "word" : "words"} · Enter to restore · {preview || "Empty note"}</small>
-                    </div>
-                  );
-                }) : (
-                  <div className="palette-message">
-                    <span>{palette.query.trim() ? `No saved versions match “${palette.query.trim()}”.` : "No saved versions yet"}</span>
-                    <small>{palette.query.trim() ? "Try another filter" : "Versions appear after durable local saves"}</small>
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : palette.mode === "link-editor" && linkEditorState ? (
-            <LinkEditorPanel
-              label={linkEditorState.label}
-              href={linkEditorState.href}
-              onLabelChange={(label) => setLinkEditorState((current) => current ? { ...current, label } : current)}
-              onHrefChange={(href) => setLinkEditorState((current) => current ? { ...current, href } : current)}
-              onSave={() => saveEditedLink(linkEditorState.label, linkEditorState.href)}
-              onRemove={removeEditedLink}
-              onCancel={() => {
-                setLinkEditorState(null);
-                setPalette(null);
-                editor?.commands.focus();
-              }}
-              saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
-            />
-          ) : palette.mode === "confirm-clear" ? (
-            <div className="palette-message palette-confirm">
-              <span>Clear the note?</span>
-              <small>Press Enter to confirm · Esc to keep it</small>
-            </div>
-          ) : palette.mode === "confirm-delete" ? (
-            <div className="palette-message palette-confirm" data-testid="confirm-delete">
-              <span>Delete this session permanently?</span>
-              <small>Press Enter to confirm · Esc to keep it</small>
-            </div>
-          ) : (
-            <div className="palette-message storage-message" data-testid="storage-status">
-              <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>
-              <small>{health.labels.join(" · ") || "Storage is unavailable"}</small>
-              {health.conflicts > 0 ? <small>{health.conflicts} recoverable {health.conflicts === 1 ? "draft" : "drafts"} · /recover to export</small> : null}
-              <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"} · no network access</small>
-            </div>
-          )}
-          </div>
-          </BorderBeam>
-          </motion.div>
+            Dismiss
+          </button>
         </div>
       ) : null}
-      {notice ? <p className="editor-notice" role="status">{notice}</p> : null}
     </div>
   );
 }
