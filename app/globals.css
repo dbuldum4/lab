@@ -2112,7 +2112,7 @@ img.ProseMirror-separator {
 .feature-button-primary {
   border-color: var(--primary);
   background: var(--primary);
-  color: var(--surface-control)10f;
+  color: var(--primary-ink);
 }
 
 .feature-button-primary:hover,

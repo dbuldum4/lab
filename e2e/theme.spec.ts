@@ -72,15 +72,23 @@ test("the theme submenu supports keyboard selection", async ({ page }) => {
   await expect(editor).toBeFocused();
 });
 
-test("Tab reaches the theme license link without selecting a theme", async ({ page }) => {
+test("the theme license link opens from the keyboard without selecting a theme", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.type("/theme");
   await page.keyboard.press("Enter");
 
   await page.keyboard.press("Tab");
 
-  await expect(page.getByRole("link", { name: "Licenses" })).toBeFocused();
+  const licenseLink = page.getByRole("link", { name: "Licenses" });
+  await expect(licenseLink).toBeFocused();
   await expect(page.getByTestId("theme-panel")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+  const popupPromise = page.waitForEvent("popup");
+  await page.keyboard.press("Enter");
+  const noticesPage = await popupPromise;
+
+  await expect(noticesPage).toHaveURL(/\/third-party-notices\/$/);
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 });
 

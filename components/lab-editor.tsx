@@ -4026,6 +4026,8 @@ function LabEditorSession() {
     }
 
     if (current.mode === "theme") {
+      if (event.target instanceof HTMLAnchorElement) return;
+
       const isComposing = themeComposingRef.current || event.nativeEvent.isComposing;
       if (isComposing && (
         event.key === "ArrowDown"
