@@ -482,18 +482,88 @@ test("cropping an image creates a local cropped data URL", async ({ page }) => {
   await waitForAuthority(page, /!\[sample\]\(data:image\/png;base64,/);
 });
 
-test("cancelling crop returns focus to the editor", async ({ page }) => {
+test("image dialogs keep keyboard focus inside and restore the originating control", async ({ page }) => {
+  const editor = await openEditor(page);
+  await page.locator('input[type="file"][accept*="image/*"]').setInputFiles(pngFile());
+
+  const image = editor.locator("img.lab-image");
+  await expect(image).toBeVisible();
+
+  const metadataButton = page.getByRole("button", { name: "Details image" });
+  await image.click();
+  await metadataButton.click();
+
+  const metadataDialog = page.getByRole("dialog", { name: "Image metadata" });
+  const altInput = metadataDialog.getByLabel("Alternative text");
+  const titleInput = metadataDialog.getByLabel("Title");
+  const closeMetadata = metadataDialog.getByRole("button", { name: "Close image metadata" });
+  const saveMetadata = metadataDialog.getByRole("button", { name: "Save metadata" });
+  await expect(altInput).toBeFocused();
+
+  await page.keyboard.press("Tab");
+  await expect(titleInput).toBeFocused();
+  await saveMetadata.focus();
+  await page.keyboard.press("Tab");
+  await expect(closeMetadata).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(saveMetadata).toBeFocused();
+
+  await page.evaluate(() => {
+    const outside = document.createElement("button");
+    outside.type = "button";
+    outside.id = "focus-trap-outside";
+    outside.textContent = "Outside dialog";
+    document.body.append(outside);
+    outside.focus();
+  });
+  await expect(altInput).toBeFocused();
+  await altInput.fill("discarded");
+  await page.keyboard.press("Escape");
+  await expect(metadataDialog).toHaveCount(0);
+  await expect(image).toHaveAttribute("alt", "red");
+  await expect(metadataButton).toBeFocused();
+
+  const cropButton = page.getByRole("button", { name: "Crop image" });
+  await cropButton.click();
+
+  const cropDialog = page.getByRole("dialog", { name: "Crop image" });
+  const closeCrop = cropDialog.getByRole("button", { name: "Close crop editor" });
+  const cancelCrop = cropDialog.getByRole("button", { name: "Cancel crop" });
+  const applyCrop = cropDialog.getByRole("button", { name: "Apply crop" });
+  await expect(closeCrop).toBeFocused();
+  await expect(applyCrop).toBeEnabled();
+
+  await page.keyboard.press("Tab");
+  await expect(cancelCrop).toBeFocused();
+  await applyCrop.focus();
+  await page.keyboard.press("Tab");
+  await expect(closeCrop).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(applyCrop).toBeFocused();
+
+  await page.evaluate(() => {
+    const outside = document.getElementById("focus-trap-outside");
+    outside?.focus();
+  });
+  await expect(closeCrop).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(cropDialog).toHaveCount(0);
+  await expect(cropButton).toBeFocused();
+});
+
+test("cancelling crop returns focus to the originating crop control", async ({ page }) => {
   const editor = await openEditor(page);
   await page.locator('input[type="file"][accept*="image/*"]').setInputFiles(svgFile());
 
   const image = editor.locator("img.lab-image");
   await expect(image).toBeVisible();
   await image.click();
-  await page.getByRole("button", { name: "Crop image" }).click();
+  const cropButton = page.getByRole("button", { name: "Crop image" });
+  await cropButton.click();
   await expect(page.getByRole("dialog", { name: "Crop image" })).toBeVisible();
 
   await page.keyboard.press("Escape");
 
   await expect(page.getByRole("dialog", { name: "Crop image" })).toHaveCount(0);
-  await expect(editor).toBeFocused();
+  await expect(cropButton).toBeFocused();
 });
