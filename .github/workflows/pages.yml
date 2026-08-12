@@ -38,7 +38,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Test
-        run: npm run test:all
+        run: npm run test:fast && npm run test:e2e
 
       - name: Lint
         run: npm run lint
