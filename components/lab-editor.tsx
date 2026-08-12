@@ -73,6 +73,7 @@ import {
   purgeDocumentSession,
   renameDocumentSession,
   touchDocumentSession,
+  touchDocumentSessionSync,
   unarchiveDocumentSession,
   unpinDocumentSession,
   updateAutomaticSessionTitle,
@@ -1880,8 +1881,15 @@ function LabEditorSession() {
         if (nextHealth.saved === true) {
           const markdown = latestMarkdown.get();
           recordVersion(documentId, markdown);
+          let metadataTouchedSynchronously = false;
+          try {
+            touchDocumentSessionSync(documentId);
+            metadataTouchedSynchronously = true;
+          } catch {
+            // Keep the locked async path as a fallback when metadata storage is unavailable.
+          }
           sessionTouchBarrier.enqueue(async () => {
-            await touchDocumentSession(documentId);
+            if (!metadataTouchedSynchronously) await touchDocumentSession(documentId);
             const titled = await updateAutomaticSessionTitle(
               documentId,
               automaticTitleFromMarkdown(markdown),
@@ -3918,13 +3926,12 @@ function LabEditorSession() {
 
   useEffect(() => {
     const flush = () => {
-      void (async () => {
-        try {
-          if (await persistence.flush()) await sessionTouchBarrier.wait();
-        } catch {
-          // Staged recovery drafts remain available if the page is being left.
-        }
-      })();
+      // The successful-save callback writes activity metadata synchronously.
+      // Do not await the async title update here: page teardown may terminate
+      // its Web Lock callback before it can complete.
+      void persistence.flush().catch(() => {
+        // Staged recovery drafts remain available if the page is being left.
+      });
     };
     const onPageHide = () => flush();
     const onVisibilityChange = () => {
@@ -3937,7 +3944,7 @@ function LabEditorSession() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       flush();
     };
-  }, [persistence, sessionTouchBarrier]);
+  }, [persistence]);
 
   const onKeyDownCapture = (event: React.KeyboardEvent) => {
     if (imageCropTarget || imageMetadataTarget) return;
