@@ -71,3 +71,35 @@ test("the theme submenu supports keyboard selection", async ({ page }) => {
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dracula");
   await expect(editor).toBeFocused();
 });
+
+test("Tab reaches the theme license link without selecting a theme", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("/theme");
+  await page.keyboard.press("Enter");
+
+  await page.keyboard.press("Tab");
+
+  await expect(page.getByRole("link", { name: "Licenses" })).toBeFocused();
+  await expect(page.getByTestId("theme-panel")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+});
+
+test("Enter commits an IME composition before it selects a theme", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("/theme");
+  await page.keyboard.press("Enter");
+
+  const search = page.getByRole("combobox", { name: "Search themes" });
+  await search.dispatchEvent("compositionstart");
+  await page.keyboard.press("Enter");
+
+  await expect(page.getByTestId("theme-panel")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+  await search.dispatchEvent("compositionend");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(editor).toBeFocused();
+});

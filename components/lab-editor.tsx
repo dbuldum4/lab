@@ -1810,6 +1810,7 @@ function LabEditorSession() {
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const searchIndexVersionRef = useRef(0);
   const searchComposingRef = useRef(false);
+  const themeComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
@@ -1908,6 +1909,9 @@ function LabEditorSession() {
       searchResultRefs.current.clear();
       setSearchResults([]);
       setSearchLoading(false);
+    }
+    if (previous?.mode === "theme" && value?.mode !== "theme") {
+      themeComposingRef.current = false;
     }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
@@ -4022,12 +4026,20 @@ function LabEditorSession() {
     }
 
     if (current.mode === "theme") {
+      const isComposing = themeComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
         const count = Math.max(1, filteredThemes.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && filteredThemes.length > 0) {
+      } else if (event.key === "Enter" && filteredThemes.length > 0) {
         event.preventDefault();
         chooseTheme(filteredThemes[selectedRef.current]?.id ?? filteredThemes[0].id);
       } else if (event.key === "Enter") {
@@ -4692,6 +4704,8 @@ function LabEditorSession() {
                   autoComplete="off"
                   placeholder="Search themes"
                   value={palette.query}
+                  onCompositionStart={() => { themeComposingRef.current = true; }}
+                  onCompositionEnd={() => { themeComposingRef.current = false; }}
                   onChange={(event) => {
                     setSelected(0);
                     setPalette({ ...palette, query: event.target.value });
@@ -4705,6 +4719,7 @@ function LabEditorSession() {
                 data-testid="theme-list"
                 role="listbox"
                 aria-label="Theme results"
+                tabIndex={-1}
               >
                 {filteredThemes.length > 0 ? filteredThemes.map((theme, index) => (
                   <div
