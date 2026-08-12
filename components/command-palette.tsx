@@ -2,7 +2,7 @@
 
 import { BorderBeam } from "border-beam";
 import { LayoutGroup, motion, type Transition } from "motion/react";
-import { useEffect, useRef, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import {
   CODE_LANGUAGES,
   filterCommands,
@@ -27,6 +27,7 @@ import type { VersionHistoryEntry } from "@/lib/version-history";
 import { THEMES, type ThemeId } from "@/lib/theme";
 import type { StorageHealth } from "@/lib/local-vault";
 import { formatStorageEstimate } from "@/lib/storage-estimate";
+import { filterPickerOptions } from "@/lib/picker-filter";
 
 export type LinkEditorState = {
   from: number;
@@ -165,11 +166,50 @@ export function CommandPalette({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
   const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
+  const pickerFilterInputRef = useRef<HTMLInputElement>(null);
+  const [pickerQuery, setPickerQuery] = useState("");
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const rankedCommands = rankCommandOptions(palette, sessionPinned, sessionArchived, commandContext);
   const filtered = filterCommands(palette, sessionPinned, sessionArchived, commandContext);
   const filteredThemes = filterThemes(palette);
   const formattedStorageEstimate = formatStorageEstimate(health.storageEstimate);
+  const filteredSessions = filterPickerOptions(sessions, pickerQuery, (session) => session.name);
+  const filteredBacklinks = filterPickerOptions(backlinks, pickerQuery, (backlink) => `${backlink.name} ${backlink.excerpt}`);
+  const filteredVersions = filterPickerOptions(versions, pickerQuery, (version) => version.markdown);
+
+  useEffect(() => {
+    if (!["sessions", "archives", "link-session", "backlinks", "history"].includes(palette?.mode ?? "")) return;
+    const frame = window.requestAnimationFrame(() => {
+      setPickerQuery("");
+      setSelected(0);
+      pickerFilterInputRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode, setSelected]);
+
+  const pickerInput = (label: string, options: readonly unknown[], select: (index: number) => void) => (
+    <div className="search-field picker-filter-field">
+      <input
+        ref={pickerFilterInputRef}
+        type="search"
+        role="combobox"
+        aria-expanded="true"
+        aria-controls={PALETTE_ID}
+        aria-label={label}
+        value={pickerQuery}
+        onChange={(event) => { setPickerQuery(event.target.value); setSelected(0); }}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault(); event.stopPropagation();
+            const direction = event.key === "ArrowDown" ? 1 : -1;
+            setSelected((selected + direction + Math.max(1, options.length)) % Math.max(1, options.length));
+          } else if (event.key === "Enter" && options.length > 0) {
+            event.preventDefault(); event.stopPropagation(); select(selected);
+          }
+        }}
+      />
+    </div>
+  );
 
   useEffect(() => {
     if (palette?.mode !== "name" && palette?.mode !== "search" && palette?.mode !== "theme") return;
@@ -402,7 +442,12 @@ export function CommandPalette({
               </div>
             ) : palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" ? (
               <div className="command-list session-list" data-testid="session-list">
-                {sessions.length > 0 ? sessions.map((session, index) => (
+                {pickerInput(
+                  palette.mode === "archives" ? "Search archived sessions" : palette.mode === "link-session" ? "Search sessions to link" : "Search sessions",
+                  filteredSessions,
+                  (index) => filteredSessions[index] && onSessionSelect(filteredSessions[index], palette.mode as PaletteSessionMode),
+                )}
+                {filteredSessions.length > 0 ? filteredSessions.map((session, index) => (
                   <div
                     className="command-item"
                     data-selected={index === selected}
@@ -429,7 +474,7 @@ export function CommandPalette({
                   </div>
                 )) : (
                   <div className="palette-message">
-                    <span>{palette.mode === "archives" ? "No archived sessions" : palette.mode === "link-session" ? "No other sessions to link" : "No sessions"}</span>
+                    <span>{pickerQuery ? "No sessions match" : palette.mode === "archives" ? "No archived sessions" : palette.mode === "link-session" ? "No other sessions to link" : "No sessions"}</span>
                     <small>Esc to return to the editor</small>
                   </div>
                 )}
@@ -536,10 +581,11 @@ export function CommandPalette({
                   <span>Backlinks</span>
                   <small>{backlinksLoading ? "Reading local notes…" : `${backlinks.length} incoming ${backlinks.length === 1 ? "link" : "links"}`}</small>
                 </div>
+                {pickerInput("Search backlinks", filteredBacklinks, (index) => filteredBacklinks[index] && openBacklink(filteredBacklinks[index]))}
                 <div className="command-list feature-result-list">
                   {backlinksLoading ? (
                     <div className="palette-message"><span>Finding links…</span><small>Verified local copies only</small></div>
-                  ) : backlinks.length > 0 ? backlinks.map((backlink, index) => (
+                  ) : filteredBacklinks.length > 0 ? filteredBacklinks.map((backlink, index) => (
                     <div
                       className="command-item feature-result-item"
                       data-selected={index === selected}
@@ -567,8 +613,9 @@ export function CommandPalette({
                   <span>Version history</span>
                   <small>{versions.length} local {versions.length === 1 ? "version" : "versions"}</small>
                 </div>
+                {pickerInput("Search version history", filteredVersions, (index) => filteredVersions[index] && restoreHistoryVersion(filteredVersions[index]))}
                 <div className="command-list feature-result-list">
-                  {versions.length > 0 ? versions.map((version, index) => {
+                  {filteredVersions.length > 0 ? filteredVersions.map((version, index) => {
                     const versionStats = calculateDocumentStats(version.markdown);
                     return (
                       <div

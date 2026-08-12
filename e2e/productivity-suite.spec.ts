@@ -109,12 +109,20 @@ test("automatic titles, pinning, and archive views stay in sync", async ({ page 
   await waitForSessionMetadata(page, documentId, { pinned: true, archived: true });
 
   await runSlash(page, "sessions");
-  await expect(page.getByTestId("session-list")).not.toContainText("Project Atlas");
+  const sessionList = page.getByTestId("session-list");
+  await expect(page.getByRole("combobox", { name: "Search sessions" })).toBeFocused();
+  await page.getByRole("combobox", { name: "Search sessions" }).fill("project");
+  await expect(sessionList).toContainText("No sessions match");
   await page.keyboard.press("Escape");
 
   await runSlash(page, "archives");
+  const archivedFilter = page.getByRole("combobox", { name: "Search archived sessions" });
+  await expect(archivedFilter).toBeFocused();
+  await archivedFilter.fill("Project   Atlas");
   const archived = page.getByTestId("session-list").getByRole("option").filter({ hasText: "Project Atlas" });
+  await expect(archived).toHaveCount(1);
   await expect(archived).toContainText("◆ Project Atlas");
+  await expect(archived).toHaveAttribute("data-current", "true");
 });
 
 test("hydration refreshes an existing automatic Untitled session title", async ({ page }) => {
@@ -276,11 +284,14 @@ test("local session links expose backlinks and navigate in both directions", asy
   });
   await page.keyboard.type(" ");
   await runSlash(page, "link-note");
-  const targetOption = page.getByRole("listbox", { name: "Choose a session to link" })
-    .getByRole("option")
-    .filter({ hasText: "Target Note" });
+  const linkPicker = page.getByRole("listbox", { name: "Choose a session to link" });
+  const linkFilter = page.getByRole("combobox", { name: "Search sessions to link" });
+  await expect(linkFilter).toBeFocused();
+  await linkFilter.fill(" target   note ");
+  const targetOption = linkPicker.getByRole("option").filter({ hasText: "Target Note" });
+  await expect(linkPicker.getByRole("option")).toHaveCount(1);
   await expect(targetOption).toBeVisible();
-  await targetOption.click();
+  await linkFilter.press("Enter");
 
   const localLink = sourceEditor.locator('a[href="#session=default"]');
   await expect(localLink).toHaveText("Target Note");
@@ -293,7 +304,12 @@ test("local session links expose backlinks and navigate in both directions", asy
   await expect(destination).toContainText("This is the link destination.");
 
   await appendSlash(page, destination, "backlinks");
-  const backlink = page.getByTestId("backlinks-panel").getByRole("option").filter({ hasText: "Source Note" });
+  const backlinks = page.getByTestId("backlinks-panel");
+  const backlinkFilter = page.getByRole("combobox", { name: "Search backlinks" });
+  await expect(backlinkFilter).toBeFocused();
+  await backlinkFilter.fill("source");
+  const backlink = backlinks.getByRole("option").filter({ hasText: "Source Note" });
+  await expect(backlinks.getByRole("option")).toHaveCount(1);
   await expect(backlink).toContainText("Related: Target Note");
   await backlink.click();
   await expect(page).toHaveURL(sourceUrl);
@@ -312,7 +328,11 @@ test("version history restores an earlier snapshot and keeps the displaced draft
   await editor.press("ControlOrMeta+Alt+h");
   const history = page.getByTestId("version-history-panel");
   await expect(history).toBeVisible();
+  const historyFilter = page.getByRole("combobox", { name: "Search version history" });
+  await expect(historyFilter).toBeFocused();
+  await historyFilter.fill("old snapshot");
   const oldVersion = history.getByRole("option").filter({ hasText: "2 words" });
+  await expect(history.getByRole("option")).toHaveCount(1);
   await expect(oldVersion).toBeVisible();
   page.once("dialog", async (dialog) => {
     expect(dialog.message()).toContain("The current note will be kept in version history");
