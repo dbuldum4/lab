@@ -3,6 +3,7 @@ import { webcrypto } from "node:crypto";
 import test, { afterEach, beforeEach } from "node:test";
 import {
   buildVaultBackup,
+  countEmbeddedLocalImages,
   exportLocalVault,
   isValidLocalImageDataUrl,
   parseVaultBackup,
@@ -287,6 +288,21 @@ test("asset replacement ignores fenced and inline code while deduplicating real 
   const restored = await restoreLocalVault(backup);
   assert.equal(restored.imported, 1);
   assert.equal(await loadLocalDocument(), markdown);
+});
+
+test("counts only real data-image Markdown destinations outside code", () => {
+  const markdown = [
+    `![real](${TEST_IMAGE})`,
+    `A data URL in prose: ${TEST_IMAGE}`,
+    `[linked data](${TEST_IMAGE})`,
+    "```markdown",
+    `![fenced](${TEST_IMAGE})`,
+    "```",
+    `\`![inline](${TEST_IMAGE})\``,
+    `![with title](${TEST_IMAGE} "pixel")`,
+  ].join("\n");
+
+  assert.equal(countEmbeddedLocalImages(markdown), 2);
 });
 
 test("restore rejects repeated asset expansion before allocating an oversized string", () => {
