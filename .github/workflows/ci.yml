@@ -42,8 +42,17 @@ jobs:
       - name: End-to-end tests
         run: npm run test:e2e
 
+      - name: Install WebKit
+        run: npx playwright install --with-deps webkit
+
+      - name: WebKit smoke tests
+        run: npm run test:e2e:webkit
+
       - name: Build
         run: npm run build
+
+      - name: GitHub Pages static export smoke test
+        run: npm run test:static-export
 
       - name: Upload Playwright report
         if: failure()

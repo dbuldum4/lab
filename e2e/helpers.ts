@@ -26,6 +26,14 @@ export async function openEditor(page: Page) {
   return editor;
 }
 
+/** Confirm a destructive Markdown replacement in happy-path import helpers. */
+export async function confirmMarkdownImport(page: Page) {
+  const dialog = page.getByRole("dialog", { name: "Confirm Markdown import" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Import file" }).click();
+  await expect(dialog).toBeHidden();
+}
+
 export async function backendState(page: Page): Promise<BackendState> {
   return page.evaluate(async ({ localKey }) => {
     const parse = (raw: string | null) => (raw ? JSON.parse(raw) as Snapshot : null);

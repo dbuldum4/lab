@@ -49,8 +49,8 @@ export function commandAvailability(commandId: string, context: CommandContext):
 
 function commandMatchScore(command: CommandLike, query: string): number {
   if (!query) return 0;
-  if (command.id === query) return 0;
-  if (command.label.toLowerCase().startsWith(query)) return 1;
+  if (normalizeSearchText(command.id) === query) return 0;
+  if (normalizeSearchText(command.label).startsWith(query)) return 1;
   return 2;
 }
 
@@ -64,9 +64,11 @@ export function rankCommands<T extends CommandLike>(
   rawQuery: string,
   context: CommandContext,
 ): RankedCommand<T>[] {
-  const query = rawQuery.trim().toLowerCase();
+  const query = normalizeSearchText(rawQuery);
   return commands
-    .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
+    .filter((command) => normalizeSearchText(
+      `${command.id} ${command.label} ${command.terms}`,
+    ).includes(query))
     .map((command, index) => ({
       command,
       availability: commandAvailability(command.id, context),
@@ -79,3 +81,4 @@ export function rankCommands<T extends CommandLike>(
     ))
     .map(({ command, availability }) => ({ command, availability }));
 }
+import { normalizeSearchText } from "./search-normalization.ts";

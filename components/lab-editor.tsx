@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 52436)
+Total output lines: 5102
+
 "use client";
 
 import {
@@ -30,6 +33,8 @@ import {
   LinkEditorPanel,
   ShortcutsPanel,
   StatsPanel,
+  trapTabWithin,
+  useModalFocusTrap,
 } from "@/components/editor-feature-panels";
 import {
   createEditorPersistenceController,
@@ -46,6 +51,7 @@ import {
   type LocalRecoveryDraft,
   type StorageHealth,
 } from "@/lib/local-vault";
+import { formatStorageEstimate } from "@/lib/storage-estimate";
 import {
   VAULT_BACKUP_FILENAME,
   MAX_VAULT_BACKUP_BYTES,
@@ -86,8 +92,10 @@ import {
 import { automaticTitleFromMarkdown } from "@/lib/automatic-title";
 import { calculateDocumentStats, type DocumentStats } from "@/lib/document-stats";
 import { EditorBlockExtensions } from "@/lib/editor-blocks";
+import { markdownExportFilename } from "@/lib/export-filename";
 import {
   normalizeSearchQuery,
+  searchMatchRanges,
   searchableMarkdown,
   searchLocalDocuments,
   type LocalSearchDocument,
@@ -115,6 +123,12 @@ import {
   type VersionHistoryEntry,
 } from "@/lib/version-history";
 import {
+  createEditorNoticeController,
+  type EditorNotice,
+  type EditorNoticeController,
+  type EditorNoticeKind,
+} from "@/lib/editor-notice";
+import {
   THEMES,
   THEME_STORAGE_KEY,
   themeFromDocument,
@@ -127,6 +141,7 @@ type PaletteMode =
   | "status"
   | "confirm-clear"
   | "confirm-delete"
+  | "confirm-import"
   | "name"
   | "sessions"
   | "archives"
@@ -147,6 +162,13 @@ type PaletteState = {
   top: number;
   mode: PaletteMode;
   anchor: PaletteAnchor;
+};
+
+type PendingMarkdownImport = {
+  markdown: string;
+  fileName: string;
+  revision: number;
+  currentMarkdown: string;
 };
 
 type Command = {
@@ -563,7 +585,14 @@ const BlockMathMarkdown = BlockMath.extend({
   },
 });
 
-const EMPTY_HEALTH: StorageHealth = { copies: 0, labels: [], persistent: false, errors: [], conflicts: 0 };
+const EMPTY_HEALTH: StorageHealth = {
+  copies: 0,
+  labels: [],
+  persistent: false,
+  errors: [],
+  conflicts: 0,
+  storageEstimate: null,
+};
 const PALETTE_ID = "slash-command-palette";
 const MATH_EDITOR_ID = "math-editor-popover";
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
@@ -798,20 +827,18 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
 }
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function highlightSearchText(value: string, query: string): ReactNode {
-  const terms = [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))]
-    .sort((left, right) => right.length - left.length);
-  if (terms.length === 0) return value;
-  const matcher = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
-  return value.split(matcher).map((part, index) => (
-    terms.includes(part.toLowerCase())
-      ? <mark key={`${part}-${index}`}>{part}</mark>
-      : <span key={`${part}-${index}`}>{part}</span>
-  ));
+  const ranges = searchMatchRanges(value, query);
+  if (ranges.length === 0) return value;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  ranges.forEach((range, index) => {
+    if (range.start > cursor) parts.push(<span key={`text-${index}`}>{value.slice(cursor, range.start)}</span>);
+    parts.push(<mark key={`match-${index}`}>{value.slice(range.start, range.end)}</mark>);
+    cursor = Math.max(cursor, range.end);
+  });
+  if (cursor < value.length) parts.push(<span key="text-tail">{value.slice(cursor)}</span>);
+  return parts;
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -1333,6 +1360,7 @@ const LabImage = Image.extend({
           button.addEventListener("pointerdown", (event) => {
             event.preventDefault();
             event.stopPropagation();
+            button.focus({ preventScroll: true });
           });
           button.addEventListener("click", (event) => {
             event.preventDefault();
@@ -1514,6 +1542,7 @@ function resizeCropRect(initial: CropRect, handle: CropHandle, delta: CropPoint)
 
 function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) {
   const dialogRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const interactionRef = useRef<CropInteraction | null>(null);
@@ -1523,9 +1552,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    dialogRef.current?.focus();
-  }, []);
+  useModalFocusTrap(dialogRef, closeButtonRef, onCancel);
 
   const updateRect = useCallback((next: CropRect) => {
     rectRef.current = next;
@@ -1588,2084 +1615,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
     } else if (interaction.mode === "move") {
       next = {
         ...interaction.initial,
-        x: clamp(interaction.initial.x + delta.x, 0, 1 - interaction.initial.width),
-        y: clamp(interaction.initial.y + delta.y, 0, 1 - interaction.initial.height),
-      };
-    } else if (interaction.handle) {
-      next = resizeCropRect(interaction.initial, interaction.handle, delta);
-    } else {
-      return;
-    }
-    updateRect(next);
-  }, [updateRect]);
-
-  const onPointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-    if (interactionRef.current?.pointerId !== event.pointerId) return;
-    finishPointer(event.pointerId);
-  }, [finishPointer]);
-
-  const applyCrop = useCallback(() => {
-    const image = imageRef.current;
-    const selection = rectRef.current;
-    if (!image || !imageReady || !image.naturalWidth || !image.naturalHeight) return;
-
-    setBusy(true);
-    setError(null);
-    try {
-      const sourceX = Math.max(0, Math.floor(selection.x * image.naturalWidth));
-      const sourceY = Math.max(0, Math.floor(selection.y * image.naturalHeight));
-      const sourceWidth = Math.max(1, Math.min(image.naturalWidth - sourceX, Math.round(selection.width * image.naturalWidth)));
-      const sourceHeight = Math.max(1, Math.min(image.naturalHeight - sourceY, Math.round(selection.height * image.naturalHeight)));
-      const canvas = document.createElement("canvas");
-      canvas.width = sourceWidth;
-      canvas.height = sourceHeight;
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("Canvas is unavailable");
-      context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, sourceWidth, sourceHeight);
-      const sourceType = src.match(/^data:(image\/(?:png|jpeg|webp))/i)?.[1] ?? "image/png";
-      onApply(canvas.toDataURL(sourceType));
-    } catch {
-      setBusy(false);
-      setError("This image could not be cropped in the browser.");
-    }
-  }, [imageReady, onApply, src]);
-
-  return (
-    <div className="image-crop-backdrop" role="presentation">
-      <section
-        ref={dialogRef}
-        className="image-crop-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="image-crop-title"
-        tabIndex={-1}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            onCancel();
-            return;
-          }
-          if (event.key !== "Tab") return;
-
-          const dialog = dialogRef.current;
-          if (!dialog) return;
-          const focusable = Array.from(
-            dialog.querySelectorAll<HTMLElement>(
-              "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
-            ),
-          ).filter((element) => element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
-          if (focusable.length === 0) {
-            event.preventDefault();
-            dialog.focus();
-            return;
-          }
-
-          const first = focusable[0];
-          const last = focusable[focusable.length - 1];
-          const active = document.activeElement;
-          const movingBackward = event.shiftKey;
-          if (
-            active === dialog
-            || !dialog.contains(active)
-            || (movingBackward && active === first)
-            || (!movingBackward && active === last)
-          ) {
-            event.preventDefault();
-            (movingBackward ? last : first).focus();
-          }
-        }}
-      >
-        <div className="image-crop-header">
-          <div>
-            <h2 id="image-crop-title">Crop image</h2>
-            <p>Drag to choose the visible area.</p>
-          </div>
-          <button type="button" className="image-crop-close" aria-label="Close crop editor" onClick={onCancel}>×</button>
-        </div>
-        <div
-          ref={stageRef}
-          className="image-crop-stage"
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-          onPointerCancel={onPointerUp}
-        >
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            ref={imageRef}
-            src={src}
-            alt={alt}
-            draggable={false}
-            onLoad={() => setImageReady(true)}
-            onError={() => setError("This image could not be loaded for cropping.")}
-          />
-          <div
-            className="image-crop-selection"
-            data-crop-selection="true"
-            style={{
-              left: `${rect.x * 100}%`,
-              top: `${rect.y * 100}%`,
-              width: `${rect.width * 100}%`,
-              height: `${rect.height * 100}%`,
-            }}
-          >
-            {CROP_HANDLES.map((handle) => (
-              <button
-                key={handle}
-                type="button"
-                className={`image-crop-handle image-crop-handle-${handle}`}
-                data-crop-handle={handle}
-                aria-label={`Adjust crop ${handle}`}
-                tabIndex={-1}
-              />
-            ))}
-          </div>
-        </div>
-        <div className="image-crop-footer">
-          <span className="image-crop-status" role="status" aria-live="polite">{error ?? ""}</span>
-          <div className="image-crop-actions">
-            <button type="button" className="image-crop-button image-crop-button-muted" aria-label="Cancel crop" onClick={onCancel}>Cancel</button>
-            <button type="button" className="image-crop-button" aria-label="Apply crop" onClick={applyCrop} disabled={!imageReady || busy}>Apply crop</button>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-const PlainUrlInput = Extension.create({
-  name: "plainUrlInput",
-  addInputRules() {
-    return [
-      new InputRule({
-        find: (text) => {
-          const match = text.match(/https?:\/\/[^\s)]+$/);
-          if (!match || match.index === undefined || text.slice(0, match.index).endsWith("](")) return null;
-          const href = match[0].replace(/[.,!?;:]+$/, "");
-          return href ? { index: match.index, text: href } : null;
-        },
-        handler: ({ state, range, match }) => {
-          if (isCodeBlock(state.selection.$from.parent)) return;
-          const href = match[0];
-          const linkMark = state.schema.marks.link;
-          if (!linkMark) return;
-          state.tr.replaceWith(
-            range.from,
-            range.to,
-            state.schema.text(href, [linkMark.create({ href })]),
-          );
-        },
-      }),
-    ];
-  },
-});
-
-const SlashCommandInput = Extension.create({
-  name: "slashCommandInput",
-  addInputRules() {
-    return [
-      new InputRule({
-        find: (text) => {
-          const match = text.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
-          if (!match || match.index === undefined) return null;
-          return { index: match.index, text: match[0] };
-        },
-        undoable: false,
-        handler: ({ state, range, match }) => {
-          if (isCodeBlock(state.selection.$from.parent)) return;
-          const typedLength = match[0].length - (range.to - range.from);
-          if (typedLength <= 0) return;
-          const typedText = match[0].slice(-typedLength);
-          state.tr.insertText(typedText, range.to, range.to).setMeta("addToHistory", false);
-        },
-      }),
-    ];
-  },
-});
-
-/**
- * Gate vault scope + persistence until the client has the real URL hash.
- * Static pre-render and SSR have no hash, so mounting LabEditorSession there
- * would permanently bind the default document for deep-linked sessions.
- * useSyncExternalStore avoids setState-in-effect while still deferring to client.
- */
-export function LabEditor() {
-  const mounted = useIsClient();
-  if (!mounted) {
-    return (
-      <div
-        className="lab-editor"
-        data-hydrating="true"
-        aria-busy="true"
-        aria-label="lab local-only Markdown note"
-      />
-    );
-  }
-  return <LabEditorSession />;
-}
-
-function LabEditorSession() {
-  const shellRef = useRef<HTMLDivElement>(null);
-  const outlinePanelRef = useRef<HTMLElement>(null);
-  const caretRef = useRef<HTMLDivElement>(null);
-  const caretStrokeRef = useRef<HTMLSpanElement>(null);
-  const paletteElementRef = useRef<HTMLDivElement>(null);
-  const mathEditorElementRef = useRef<HTMLDivElement>(null);
-  const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
-  const sessionNameInputRef = useRef<HTMLInputElement>(null);
-  const searchInputRef = useRef<HTMLInputElement>(null);
-  const themeSearchInputRef = useRef<HTMLInputElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
-  const vaultBackupInputRef = useRef<HTMLInputElement>(null);
-  const editorRef = useRef<Editor | null>(null);
-  // useEditor freezes editorProps on first create; keep notices current via ref.
-  const setNoticeRef = useRef<(message: string | null) => void>(() => undefined);
-  const paletteRef = useRef<PaletteState | null>(null);
-  // Link clicks happen inside the editorProps callback, which is created before
-  // the session-switch callback below. Keep the latest safe switch path in a
-  // ref so local links do not fall back to direct hash navigation.
-  const resumeSessionRef = useRef<(session: DocumentSession, hash?: string) => Promise<boolean>>(
-    async () => false,
-  );
-  const mathEditorRef = useRef<MathEditorState | null>(null);
-  const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
-  const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
-  const searchIndexVersionRef = useRef(0);
-  const searchComposingRef = useRef(false);
-  const themeComposingRef = useRef(false);
-  const paletteVersionRef = useRef(0);
-  const selectedRef = useRef(0);
-  const outlineOpenRef = useRef(false);
-  const outlineItemsRef = useRef<OutlineItem[]>([]);
-  const largeExecCommandRef = useRef<{
-    original: Document["execCommand"];
-    patched: Document["execCommand"];
-  } | null>(null);
-  const inlineMathMigrationPendingRef = useRef(true);
-  const [palette, setPaletteState] = useState<PaletteState | null>(null);
-  const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
-  const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
-  const [imageMetadataTarget, setImageMetadataTarget] = useState<ImageMetadataTarget | null>(null);
-  const [linkEditorState, setLinkEditorState] = useState<LinkEditorState | null>(null);
-  const linkEditorStateRef = useRef<LinkEditorState | null>(null);
-  const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [selected, setSelectedState] = useState(0);
-  const [commandContext, setCommandContext] = useState<CommandContext>(EMPTY_COMMAND_CONTEXT);
-  const [outlineOpen, setOutlineOpenState] = useState(false);
-  const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
-  const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
-  const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
-  const [latestMarkdown] = useState(() => {
-    let value = "";
-    return {
-      get: () => value,
-      set: (next: string) => { value = next; },
-    };
-  });
-  // This chain must be observable synchronously. A successful flush calls
-  // onHealth before its promise resolves; React state would leave /backup and
-  // /restore awaiting the render-time (stale) chain instead of that new touch.
-  const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
-  const [hydrating, setHydrating] = useState(true);
-  const [notice, setNotice] = useState<string | null>(null);
-  // Only constructed after LabEditor mounts on the client, so the hash is real.
-  // Invalid ids still map to the default document; the hash is rewritten in
-  // useLayoutEffect below so React StrictMode double init stays correct.
-  const [documentId] = useState(() => activeDocumentIdFromLocation());
-  const [openedWithInvalidSessionHash] = useState(
-    () => parseActiveDocumentLocation().hadInvalidSessionHash,
-  );
-  const [sessionName, setSessionName] = useState("Untitled");
-  const [savedSessionName, setSavedSessionName] = useState("Untitled");
-  const [sessions, setSessions] = useState<DocumentSession[]>([]);
-  const [sessionPinned, setSessionPinned] = useState(false);
-  const [sessionArchived, setSessionArchived] = useState(false);
-  const [sessionTitleSource, setSessionTitleSource] = useState<"automatic" | "manual">("automatic");
-  const [stats, setStats] = useState<DocumentStats>(() => calculateDocumentStats(""));
-  const [backlinks, setBacklinks] = useState<Backlink[]>([]);
-  const [backlinksLoading, setBacklinksLoading] = useState(false);
-  const [versions, setVersions] = useState<VersionHistoryEntry[]>([]);
-  const [activeTheme, setActiveTheme] = useState<ThemeId>(() => themeFromDocument(document.documentElement));
-  const prefersReducedMotion = usePrefersReducedMotion();
-  const mobileOutline = useMobileOutline();
-
-  const [persistence] = useState<EditorPersistenceController>(() => {
-    const e2eDelay = typeof window === "undefined"
-      ? undefined
-      : (window as Window & { __LAB_E2E_SAVE_DELAY__?: number }).__LAB_E2E_SAVE_DELAY__;
-    return createEditorPersistenceController({
-      delayMs: Number.isFinite(e2eDelay) ? e2eDelay : undefined,
-      onHealth: (nextHealth) => {
-        setHealth(nextHealth);
-        // documentId is stable for the mount lifetime (session switches reload),
-        // so capturing it here is intentional and avoids a ref.
-        if (nextHealth.saved === true) {
-          const markdown = latestMarkdown.get();
-          recordVersion(documentId, markdown);
-          sessionTouchBarrier.enqueue(async () => {
-            await touchDocumentSession(documentId);
-            const titled = await updateAutomaticSessionTitle(
-              documentId,
-              automaticTitleFromMarkdown(markdown),
-            );
-            if (titled.titleSource === "automatic") {
-              setSessionName(titled.name);
-              setSavedSessionName(titled.name);
-              setSessionTitleSource("automatic");
-            }
-          });
-        }
-      },
-      onNotice: setNotice,
-      onStageFailure: () => setNotice("This edit could not be staged locally. Please export a copy before closing the page."),
-    });
-  });
-
-  const setPalette = useCallback((value: PaletteState | null) => {
-    const previous = paletteRef.current;
-    if (previous === value) return;
-    if (previous?.mode === "search" && value?.mode !== "search") {
-      searchIndexVersionRef.current += 1;
-      searchComposingRef.current = false;
-      searchDocumentsRef.current = [];
-      searchResultRefs.current.clear();
-      setSearchResults([]);
-      setSearchLoading(false);
-    }
-    if (previous?.mode === "theme" && value?.mode !== "theme") {
-      themeComposingRef.current = false;
-    }
-    paletteVersionRef.current += 1;
-    paletteRef.current = value;
-    setPaletteState(value);
-  }, []);
-
-  const setSelected = useCallback((value: number) => {
-    if (selectedRef.current === value) return;
-    selectedRef.current = value;
-    setSelectedState(value);
-  }, []);
-
-  const setMathEditor = useCallback((value: MathEditorState | null) => {
-    mathEditorRef.current = value;
-    setMathEditorState(value);
-  }, []);
-
-  const setOutlineOpen = useCallback((value: boolean) => {
-    outlineOpenRef.current = value;
-    setOutlineOpenState(value);
-  }, []);
-
-  const syncOutlineActive = useCallback((instance: Editor) => {
-    const items = outlineItemsRef.current;
-    const nextActiveIndex = activeOutlineIndex(items, instance.state.selection.from);
-    const nextActiveId = items[nextActiveIndex]?.id ?? null;
-    setActiveOutlineIdState((current) => current === nextActiveId ? current : nextActiveId);
-  }, []);
-
-  const syncOutlineItems = useCallback((instance: Editor) => {
-    const nextItems = outlineFromEditor(instance);
-    if (!areOutlineItemsEqual(outlineItemsRef.current, nextItems)) {
-      outlineItemsRef.current = nextItems;
-      setOutlineItemsState(nextItems);
-    }
-    syncOutlineActive(instance);
-  }, [syncOutlineActive]);
-
-  const syncOutlineTransactions = useCallback((instance: Editor, transactions: readonly Transaction[]) => {
-    if (!outlineOpenRef.current) return;
-
-    let nextItems = outlineItemsRef.current;
-    let positionsChanged = false;
-    for (const transaction of transactions) {
-      if (!transaction.docChanged) continue;
-      if (transactionTouchesHeading(transaction)) {
-        syncOutlineItems(instance);
-        return;
-      }
-      nextItems = nextItems.map((item) => {
-        const position = transaction.mapping.map(item.position, 1);
-        if (position === item.position) return item;
-        positionsChanged = true;
-        return { ...item, position };
-      });
-    }
-
-    if (positionsChanged) outlineItemsRef.current = nextItems;
-    syncOutlineActive(instance);
-  }, [syncOutlineActive, syncOutlineItems]);
-
-  const toggleOutline = useCallback(() => {
-    const nextOpen = !outlineOpenRef.current;
-    if (nextOpen) {
-      const instance = editorRef.current;
-      if (instance && !instance.isDestroyed) syncOutlineItems(instance);
-    }
-    setOutlineOpen(nextOpen);
-  }, [setOutlineOpen, syncOutlineItems]);
-
-  const closeOutline = useCallback((focusEditor = true) => {
-    setOutlineOpen(false);
-    if (focusEditor) {
-      window.requestAnimationFrame(() => editorRef.current?.commands.focus());
-    }
-  }, [setOutlineOpen]);
-
-  useLayoutEffect(() => {
-    if (!outlineOpen || !mobileOutline) return;
-
-    const panel = outlinePanelRef.current;
-    const editorElement = editorRef.current?.view.dom;
-    if (!panel || !editorElement) return;
-
-    const editorWasInert = editorElement.hasAttribute("inert");
-    const editorAriaHidden = editorElement.getAttribute("aria-hidden");
-    editorElement.setAttribute("inert", "");
-    editorElement.setAttribute("aria-hidden", "true");
-
-    const focusInitialControl = () => {
-      const activeItem = panel.querySelector<HTMLElement>('.outline-item[aria-current="location"]');
-      const firstItem = panel.querySelector<HTMLElement>(".outline-item");
-      const closeButton = panel.querySelector<HTMLElement>(".outline-close");
-      (activeItem ?? firstItem ?? closeButton ?? panel).focus();
-    };
-
-    const keepFocusInPanel = (event: FocusEvent) => {
-      if (!panel.contains(event.target as Node)) focusInitialControl();
-    };
-
-    focusInitialControl();
-    document.addEventListener("focusin", keepFocusInPanel);
-
-    return () => {
-      document.removeEventListener("focusin", keepFocusInPanel);
-      if (!editorWasInert) editorElement.removeAttribute("inert");
-      if (editorAriaHidden === null) editorElement.removeAttribute("aria-hidden");
-      else editorElement.setAttribute("aria-hidden", editorAriaHidden);
-    };
-  }, [mobileOutline, outlineOpen]);
-
-  const openImageCrop = useCallback((node: PMNode, pos: number) => {
-    const src = String(node.attrs.src ?? "");
-    if (!src || !isAllowedImageSrc(src)) return;
-    setImageCropTarget({
-      pos,
-      src,
-      alt: String(node.attrs.alt ?? "Image"),
-    });
-  }, []);
-
-  const openImageMetadata = useCallback((node: PMNode, pos: number) => {
-    setImageMetadataTarget({
-      pos,
-      alt: String(node.attrs.alt ?? ""),
-      title: String(node.attrs.title ?? ""),
-    });
-  }, []);
-
-  useEffect(() => {
-    setNoticeRef.current = setNotice;
-  }, [setNotice]);
-
-  const mathAnchor = useCallback((instance: Editor, pos: number, kind: MathKind) => {
-    const shell = shellRef.current;
-    const dom = instance.view.nodeDOM(pos);
-    if (!shell || !(dom instanceof HTMLElement)) return null;
-
-    const shellBox = shell.getBoundingClientRect();
-    const nodeBox = dom.getBoundingClientRect();
-    const viewport = window.visualViewport;
-    const viewportLeft = viewport?.offsetLeft ?? 0;
-    const viewportTop = viewport?.offsetTop ?? 0;
-    const viewportWidth = viewport?.width ?? window.innerWidth;
-    const viewportBottom = viewportTop + (viewport?.height ?? window.innerHeight);
-    const width = Math.min(kind === "block" ? 480 : 420, Math.max(1, shellBox.width - 16));
-    const height = kind === "block" ? 150 : 108;
-    const leftViewport = clamp(
-      nodeBox.left,
-      viewportLeft + 8,
-      viewportLeft + viewportWidth - width - 8,
-    );
-    const below = nodeBox.bottom + 10;
-    const above = nodeBox.top - height - 10;
-    const topViewport = below + height <= viewportBottom - 8 ? below : above;
-    const top = clamp(topViewport, viewportTop + 8, viewportBottom - height - 8);
-    return {
-      left: leftViewport - shellBox.left,
-      top: top - shellBox.top,
-    };
-  }, []);
-
-  const repositionMathEditor = useCallback(() => {
-    const current = mathEditorRef.current;
-    const instance = editorRef.current;
-    if (!current || !instance) return;
-    const anchor = mathAnchor(instance, current.pos, current.kind);
-    if (!anchor) return;
-    if (Math.abs(current.left - anchor.left) < 0.5 && Math.abs(current.top - anchor.top) < 0.5) return;
-    setMathEditor({ ...current, ...anchor });
-  }, [mathAnchor, setMathEditor]);
-
-  const updateMathLatex = useCallback((latex: string) => {
-    const current = mathEditorRef.current;
-    if (!current) return;
-    // Keep the draft in React while the popover is open. The document is only
-    // mutated on commit, so Escape is genuinely history- and persistence-neutral.
-    setMathEditor({ ...current, latex });
-  }, [setMathEditor]);
-
-  const closeMathEditor = useCallback((
-    restore: boolean,
-    target: MathEditorState | null = null,
-    focus = true,
-  ) => {
-    const current = target ?? mathEditorRef.current;
-    const instance = editorRef.current;
-    if (!current || !instance) {
-      if (!target) setMathEditor(null);
-      return 0;
-    }
-
-    const node = instance.state.doc.nodeAt(current.pos);
-    let removedNodeSize = 0;
-    if (restore) {
-      if (current.isNew && !current.initialLatex && deleteMathNode(instance, current)) {
-        removedNodeSize = node?.nodeSize ?? 0;
-      }
-    } else if (current.isNew && !current.latex.trim()) {
-      if (deleteMathNode(instance, current)) removedNodeSize = node?.nodeSize ?? 0;
-    } else if (current.latex !== current.initialLatex) {
-      updateMathNode(instance, current, current.latex);
-    }
-
-    if (sameMathEditor(mathEditorRef.current, current)) {
-      setMathEditor(null);
-      if (focus) {
-        if (!restore && current.kind === "inline" && removedNodeSize === 0) {
-          const committedNode = instance.state.doc.nodeAt(current.pos);
-          const after = current.pos + (committedNode?.nodeSize ?? 1);
-          instance.chain().setTextSelection(after).focus().run();
-        } else {
-          instance.commands.focus();
-        }
-      }
-    }
-    return removedNodeSize;
-  }, [setMathEditor]);
-
-  const commitMathEditor = useCallback(() => closeMathEditor(false), [closeMathEditor]);
-  const cancelMathEditor = useCallback(() => closeMathEditor(true), [closeMathEditor]);
-
-  const openMathEditor = useCallback((kind: MathKind, node: PMNode, pos: number, isNew = false) => {
-    const instance = editorRef.current;
-    if (!instance) return;
-
-    const previous = mathEditorRef.current;
-    if (previous?.kind === kind && previous.pos === pos) return;
-
-    let nextPos = pos;
-    if (previous) {
-      const removedNodeSize = closeMathEditor(false, previous, false);
-      if (removedNodeSize > 0 && previous.pos < nextPos) nextPos -= removedNodeSize;
-    }
-
-    const nextNode = instance.state.doc.nodeAt(nextPos);
-    if (!nextNode || nextNode.type.name !== mathNodeType(kind)) return;
-    instance.commands.setNodeSelection(nextPos);
-    const anchor = mathAnchor(instance, nextPos, kind) ?? { left: 8, top: 88 };
-    const latex = String(nextNode.attrs.latex ?? node.attrs.latex ?? "");
-    setMathEditor({
-      kind,
-      pos: nextPos,
-      latex,
-      initialLatex: latex,
-      isNew,
-      ...anchor,
-    });
-  }, [closeMathEditor, mathAnchor, setMathEditor]);
-
-  // These callbacks are invoked by Tiptap's NodeViews after render. The
-  // extension factory is intentionally kept outside React's render lifecycle.
-  /* eslint-disable react-hooks/refs */
-  const mathExtensions = useMemo(() => [
-    BlockMathMarkdown.configure({
-      onClick: (node, pos) => openMathEditor("block", node, pos),
-      katexOptions: {
-        displayMode: true,
-        throwOnError: false,
-        strict: "warn",
-        trust: false,
-        output: "htmlAndMathml",
-      },
-    }),
-    InlineMathMarkdown.configure({
-      onClick: (node, pos) => openMathEditor("inline", node, pos),
-      katexOptions: {
-        displayMode: false,
-        throwOnError: false,
-        strict: "warn",
-        trust: false,
-        output: "htmlAndMathml",
-      },
-    }),
-  ], [openMathEditor]);
-  /* eslint-enable react-hooks/refs */
-
-  const imageExtension = useMemo(
-    () => LabImage.configure({ onCrop: openImageCrop, onMetadata: openImageMetadata } as Partial<LabImageOptions>),
-    [openImageCrop, openImageMetadata],
-  );
-
-  const editorExtensions = useMemo(() => [
-    StarterKit.configure({
-      heading: { levels: [1, 2, 3] },
-      link: {
-        openOnClick: true,
-        linkOnPaste: true,
-        // The built-in autolinker runs before MarkdownLinkInput and consumes URLs
-        // inside `[label](https://...)`. Plain URLs are handled by PlainUrlInput below.
-        autolink: false,
-        defaultProtocol: "https",
-        HTMLAttributes: { rel: "noopener noreferrer", target: "_blank" },
-      },
-    }),
-    TaskList,
-    TaskItem.configure({ nested: true }),
-    TableKit.configure({ table: { resizable: false } }),
-    Placeholder.configure({ placeholder: "" }),
-    imageExtension,
-    ...mathExtensions,
-    ...EditorBlockExtensions,
-    Markdown.configure({ markedOptions: { gfm: true } }),
-    MarkdownLinkInput,
-    PlainUrlInput,
-    SlashCommandInput,
-  ], [imageExtension, mathExtensions]);
-
-  const stopCaretBlink = useCallback(() => {
-    caretStrokeRef.current?.removeAttribute("data-blinking");
-  }, []);
-
-  const restartCaretBlink = useCallback(() => {
-    const stroke = caretStrokeRef.current;
-    if (!stroke) return;
-    stroke.removeAttribute("data-blinking");
-    void stroke.offsetWidth;
-    stroke.setAttribute("data-blinking", "true");
-  }, []);
-
-  const hideCaret = useCallback(() => {
-    caretRef.current?.removeAttribute("data-visible");
-    stopCaretBlink();
-  }, [stopCaretBlink]);
-
-  const positionCaret = useCallback((instance: Editor) => {
-    const shell = shellRef.current;
-    const caret = caretRef.current;
-    if (!shell || !caret || !instance.isFocused || !instance.state.selection.empty) {
-      hideCaret();
-      return;
-    }
-
-    try {
-      const point = instance.view.coordsAtPos(instance.state.selection.from);
-      const shellBox = shell.getBoundingClientRect();
-      const nextTransform = `translate3d(${point.left - shellBox.left}px, ${point.top - shellBox.top}px, 0)`;
-      const wasVisible = caret.hasAttribute("data-visible");
-      const moved = caret.style.transform !== nextTransform;
-
-      if (!wasVisible) caret.style.transition = "none";
-      caret.style.height = `${Math.max(18, point.bottom - point.top)}px`;
-      caret.style.transform = nextTransform;
-      caret.setAttribute("data-visible", "true");
-
-      if (!wasVisible) {
-        void caret.offsetWidth;
-        caret.style.removeProperty("transition");
-      }
-      if (moved || !wasVisible) restartCaretBlink();
-    } catch {
-      hideCaret();
-    }
-  }, [hideCaret, restartCaretBlink]);
-
-  const findSlash = useCallback((instance: Editor): PaletteState | null => {
-    const { $from } = instance.state.selection;
-    if (!instance.state.selection.empty || !$from.parent.isTextblock || isCodeBlock($from.parent)) return null;
-    const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
-    const match = before.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
-    if (!match) return null;
-    const token = `/${match[1]}`;
-    const from = instance.state.selection.from - token.length;
-    const point = instance.view.coordsAtPos(instance.state.selection.from);
-    const shellBox = shellRef.current?.getBoundingClientRect();
-    if (!shellBox) return null;
-    const viewport = window.visualViewport;
-    const viewportTop = viewport?.offsetTop ?? 0;
-    const viewportBottom = viewportTop + (viewport?.height ?? window.innerHeight);
-    const anchor = { left: point.left, top: point.top, bottom: point.bottom };
-    const width = Math.min(384, Math.max(1, shellBox.width - 16));
-    const estimatedHeight = Math.max(56, Math.min(316, viewportBottom - viewportTop - 16));
-    const left = clamp(point.left - shellBox.left, 8, shellBox.width - width - 8);
-    const below = point.bottom + 10;
-    const above = point.top - estimatedHeight - 10;
-    const topViewport = below + estimatedHeight <= viewportBottom - 8 ? below : above;
-    const top = clamp(topViewport, viewportTop + 8, viewportBottom - estimatedHeight - 8) - shellBox.top;
-    return { query: match[1], range: { from, to: instance.state.selection.from }, left, top, mode: "commands", anchor };
-  }, []);
-
-  const paletteAtSelection = useCallback((instance: Editor, mode: PaletteMode): PaletteState => {
-    const point = instance.view.coordsAtPos(instance.state.selection.from);
-    const shellBox = shellRef.current?.getBoundingClientRect();
-    const width = Math.min(384, Math.max(1, (shellBox?.width ?? window.innerWidth) - 16));
-    const shellLeft = shellBox?.left ?? 0;
-    const shellTop = shellBox?.top ?? 0;
-    const left = clamp(point.left - shellLeft, 8, (shellBox?.width ?? window.innerWidth) - width - 8);
-    const top = Math.max(8, point.bottom + 10 - shellTop);
-    return {
-      query: "",
-      range: { from: instance.state.selection.from, to: instance.state.selection.from },
-      left,
-      top,
-      mode,
-      anchor: { left: point.left, top: point.top, bottom: point.bottom },
-    };
-  }, []);
-
-  const repositionPalette = useCallback(() => {
-    const current = paletteRef.current;
-    const paletteElement = paletteElementRef.current;
-    const shell = shellRef.current;
-    if (!current || !paletteElement || !shell) return;
-
-    const shellBox = shell.getBoundingClientRect();
-    const paletteBox = paletteElement.getBoundingClientRect();
-    const viewport = window.visualViewport;
-    const viewportLeft = viewport?.offsetLeft ?? 0;
-    const viewportTop = viewport?.offsetTop ?? 0;
-    const viewportWidth = viewport?.width ?? window.innerWidth;
-    const viewportBottom = viewportTop + (viewport?.height ?? window.innerHeight);
-    const gap = 8;
-    const leftViewport = clamp(
-      current.anchor.left,
-      viewportLeft + gap,
-      viewportLeft + viewportWidth - paletteBox.width - gap,
-    );
-    const below = current.anchor.bottom + 10;
-    const above = current.anchor.top - paletteBox.height - 10;
-    const topViewport = below + paletteBox.height <= viewportBottom - gap ? below : above;
-    const clampedTop = clamp(
-      topViewport,
-      viewportTop + gap,
-      viewportBottom - paletteBox.height - gap,
-    );
-    const left = leftViewport - shellBox.left;
-    const top = clampedTop - shellBox.top;
-    if (Math.abs(current.left - left) < 0.5 && Math.abs(current.top - top) < 0.5) return;
-    setPalette({ ...current, left, top });
-  }, [setPalette]);
-
-  const syncInterface = useCallback(
-    (instance: Editor) => {
-      requestAnimationFrame(() => positionCaret(instance));
-      if (outlineOpenRef.current) {
-        syncOutlineActive(instance);
-      }
-      const nextCommandContext = commandContextFromEditor(instance);
-      setCommandContext((current) => (
-        current.inTable === nextCommandContext.inTable
-        && current.inCodeBlock === nextCommandContext.inCodeBlock
-        && current.inLink === nextCommandContext.inLink
-        && current.selectedImage === nextCommandContext.selectedImage
-          ? current
-          : nextCommandContext
-      ));
-      if (paletteRef.current && paletteRef.current.mode !== "commands") return;
-      const next = findSlash(instance);
-      setPalette(next);
-      setSelected(0);
-    },
-    [findSlash, positionCaret, setPalette, setSelected, syncOutlineActive],
-  );
-
-  const serializeMarkdown = useMemo(() => createIncrementalMarkdownSerializer(), []);
-
-  const editor = useEditor({
-    immediatelyRender: false,
-    // Tiptap's default style tag has no nonce. The equivalent base rules live
-    // in the static global stylesheet so nonce-only CSP remains effective.
-    injectCSS: false,
-    extensions: editorExtensions,
-    content: "",
-    contentType: "markdown",
-    autofocus: false,
-    editable: false,
-    editorProps: {
-      handleClickOn: (view, _pos, node, nodePos, event) => {
-        const target = event.target instanceof HTMLElement ? event.target : null;
-        if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
-        if (node.type.name !== "image") return false;
-        view.dispatch(view.state.tr.setSelection(new NodeSelection(view.state.doc.resolve(nodePos))));
-        return true;
-      },
-      handleClick: (view, pos, event) => {
-        const target = event.target instanceof HTMLElement ? event.target : null;
-        if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
-
-        const link = target?.closest<HTMLAnchorElement>("a[href]");
-        const linkedDocumentId = documentIdFromLocalHref(link?.getAttribute("href"));
-        if (link && linkedDocumentId) {
-          event.preventDefault();
-          const session = listDocumentSessions({ archived: "all" })
-            .find((candidate) => candidate.id === linkedDocumentId);
-          if (!session) {
-            setNoticeRef.current("That session link is no longer available.");
-            return true;
-          }
-          void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
-          return true;
-        }
-
-        const candidates = [pos, pos - 1, pos + 1, pos - 2, pos + 2];
-        const image = target?.closest("img.lab-image");
-        if (image) {
-          try {
-            candidates.unshift(view.posAtDOM(image, 0));
-          } catch {
-            // Fall back to the position ProseMirror calculated for the click.
-          }
-        }
-        const imagePos = candidates.find((candidate) => (
-          Number.isFinite(candidate)
-          && candidate >= 0
-          && candidate <= view.state.doc.content.size
-          && view.state.doc.nodeAt(candidate)?.type.name === "image"
-        ));
-        const node = imagePos === undefined ? null : view.state.doc.nodeAt(imagePos);
-        if (imagePos === undefined || node?.type.name !== "image") return false;
-        view.dispatch(view.state.tr.setSelection(new NodeSelection(view.state.doc.resolve(imagePos))));
-        return true;
-      },
-      handlePaste: (view, event) => {
-        const text = event.clipboardData?.getData("text/plain") ?? "";
-        const html = event.clipboardData?.getData("text/html") ?? "";
-        const { $from } = view.state.selection;
-        const insideCodeBlock = isCodeBlock($from.parent);
-
-        // Code blocks must never be split by an image node. Preserve the
-        // clipboard's text representation and ignore its file payload.
-        if (insideCodeBlock) {
-          event.preventDefault();
-          if (!text) return true;
-          view.dispatch(view.state.tr.insertText(text).scrollIntoView());
-          return true;
-        }
-
-        const files = event.clipboardData?.files;
-        if (files && files.length > 0) {
-          const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
-          if (imageFiles.length > 0 && editorRef.current) {
-            event.preventDefault();
-            let pasteSelection = {
-              from: view.state.selection.from,
-              to: view.state.selection.to,
-            };
-            const domSelection = window.getSelection();
-            if (
-              domSelection?.anchorNode
-              && domSelection.focusNode
-              && view.dom.contains(domSelection.anchorNode)
-              && view.dom.contains(domSelection.focusNode)
-            ) {
-              try {
-                pasteSelection = {
-                  from: view.posAtDOM(domSelection.anchorNode, domSelection.anchorOffset),
-                  to: view.posAtDOM(domSelection.focusNode, domSelection.focusOffset),
-                };
-              } catch {
-                // Keep the ProseMirror selection if the DOM selection is transient.
-              }
-            }
-            void insertImageFiles(editorRef.current, imageFiles, {
-              onNotice: (message) => setNoticeRef.current(message),
-              selection: pasteSelection,
-            });
-            return true;
-          }
-        }
-        // 2. Slash-fragment completion first because it interacts with
-        // slash-command input and undo history.
-        if ($from.parent.isTextblock && /^\/[a-z0-9-]*$/i.test(text)) {
-          const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
-          if (/(?:^|\s)\/[a-z0-9-]*$/i.test(before + text)) {
-            view.dispatch(view.state.tr.insertText(text).setMeta("addToHistory", false).scrollIntoView());
-            return true;
-          }
-        }
-
-        // 3. Exact math-node insertion for the app's established delimiters:
-        // `$$x^2$$` inline and `$$` on their own lines as block math.
-        if ($from.parent.isTextblock) {
-          const inlineMatch = text.match(INLINE_MATH_PATTERN);
-          if (inlineMatch) {
-            view.dispatch(
-              view.state.tr
-                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({ latex: inlineMatch[1] }))
-                .scrollIntoView(),
-            );
-            return true;
-          }
-          const blockMatch = text.match(BLOCK_MATH_PATTERN);
-          if (blockMatch) {
-            view.dispatch(
-              view.state.tr
-                .replaceSelectionWith(view.state.schema.nodes.blockMath.create({ latex: blockMatch[1] }))
-                .scrollIntoView(),
-            );
-            return true;
-          }
-        }
-
-        // 4. Partial Markdown-link completion, e.g. typing `[label](` and then
-        // pasting a URL.
-        const before = $from.parent.isTextblock
-          ? $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc")
-          : "";
-        const linkMatch = (before + text).match(MARKDOWN_LINK_PATTERN);
-        const linkMark = view.state.schema.marks.link;
-        if (
-          linkMatch?.index !== undefined
-          && linkMatch.index < before.length
-          && linkMatch[0].length > text.length
-          && view.state.selection.empty
-          && linkMark
-        ) {
-          const tokenFrom = Math.max(
-            $from.start(),
-            view.state.selection.from - (linkMatch[0].length - text.length),
-          );
-          view.dispatch(
-            view.state.tr
-              .replaceWith(
-                tokenFrom,
-                view.state.selection.to,
-                view.state.schema.text(linkMatch[1], [linkMark.create({ href: linkMatch[2] })]),
-              )
-              .scrollIntoView(),
-          );
-          return true;
-        }
-
-        // 5. Classify and execute the clipboard intent.
-        const intent = classifyClipboardPaste({ plainText: text, html, insideCodeBlock });
-        switch (intent.kind) {
-          case "native":
-            // Meaningful rich HTML: let Tiptap's schema-based parsing handle it.
-            return false;
-          case "plain-text":
-            // Plain prose: ProseMirror's native text handling splits paragraphs
-            // and normalizes line endings exactly as the editor expects. However,
-            // the markdown input rules also run on native pastes (ProseMirror
-            // routes plain-text pastes through `handleTextInput`), so ambiguous
-            // fragments like `_identifier_` or `5 * 3` would be auto-converted
-            // into emphasis marks. Insert such text literally instead.
-            if (!/[`*_~]/.test(text)) return false;
-            const lines = text.split(/\r\n?|\n/);
-            if (lines.length === 1) {
-              view.dispatch(view.state.tr.insertText(text).scrollIntoView());
-            } else {
-              const { paragraph } = view.state.schema.nodes;
-              const marks = view.state.storedMarks ?? $from.marks();
-              const blocks = lines
-                .filter((line) => line.length > 0)
-                .map((line) => paragraph.create(null, view.state.schema.text(line, marks)));
-              view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.from(blocks), 0, 0)).scrollIntoView());
-            }
-            return true;
-          case "markdown": {
-            const editor = editorRef.current;
-            if (!editor) return false;
-            editor.commands.insertContentAt(
-              {
-                from: view.state.selection.from,
-                to: view.state.selection.to,
-              },
-              intent.markdown,
-              {
-                contentType: "markdown",
-                updateSelection: true,
-              },
-            );
-            return true;
-          }
-          case "inline-math":
-            view.dispatch(
-              view.state.tr
-                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({ latex: intent.latex }))
-                .scrollIntoView(),
-            );
-            return true;
-          case "block-math":
-            view.dispatch(
-              view.state.tr
-                .replaceSelectionWith(view.state.schema.nodes.blockMath.create({ latex: intent.latex }))
-                .scrollIntoView(),
-            );
-            return true;
-        }
-        return false;
-      },
-      handleDrop: (view, event) => {
-        const dragEvent = event as DragEvent;
-        const files = dragEvent.dataTransfer?.files;
-        if (files && files.length > 0) {
-          const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
-          if (imageFiles.length > 0 && editorRef.current) {
-            // Insert under the pointer, not at the current caret.
-            const dropPos = view.posAtCoords({
-              left: dragEvent.clientX,
-              top: dragEvent.clientY,
-            })?.pos;
-            if (
-              typeof dropPos === "number"
-              && isCodeBlock(view.state.doc.resolve(dropPos).parent)
-            ) {
-              event.preventDefault();
-              return true;
-            }
-            event.preventDefault();
-            void insertImageFiles(editorRef.current, imageFiles, {
-              onNotice: (message) => setNoticeRef.current(message),
-              pos: dropPos,
-            });
-            return true;
-          }
-        }
-        return false;
-      },
-      handleDOMEvents: {
-        dragover: (view, event) => {
-          const dataTransfer = (event as DragEvent).dataTransfer;
-          if (!dataTransfer) return false;
-          const hasImageFile = Array.from(dataTransfer.items).some(
-            (item) => item.kind === "file" && item.type.startsWith("image/"),
-          );
-          if (!hasImageFile) return false;
-          event.preventDefault();
-          dataTransfer.dropEffect = "copy";
-          return true;
-        },
-      },
-      handleKeyDown: (view, event) => {
-        if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "o") {
-          event.preventDefault();
-          toggleOutline();
-          return true;
-        }
-
-        if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "e") {
-          if (isCodeBlock(view.state.selection.$from.parent)) return false;
-          event.preventDefault();
-          const { from, to } = view.state.selection;
-          const selectedText = from !== to && view.state.selection.$from.parent === view.state.selection.$to.parent
-            ? view.state.doc.textBetween(from, to, "\n", " ")
-            : "";
-          const node = view.state.schema.nodes.inlineMath.create({ latex: selectedText });
-          const tr = view.state.tr.replaceSelectionWith(node).scrollIntoView();
-          view.dispatch(tr);
-          const pos = Math.min(from, view.state.doc.content.size);
-          const inserted = view.state.doc.nodeAt(pos);
-          if (inserted?.type.name === "inlineMath") {
-            openMathEditor("inline", inserted, pos, !selectedText);
-          }
-          return true;
-        }
-
-        if (view.state.selection instanceof NodeSelection) {
-          const selectedNode = view.state.selection.node;
-          if (selectedNode.type.name === "image" && (event.key === "Backspace" || event.key === "Delete")) {
-            event.preventDefault();
-            const { from, to } = view.state.selection;
-            view.dispatch(closeHistory(view.state.tr.delete(from, to).scrollIntoView()));
-            return true;
-          }
-          const kind = selectedNode.type.name === "inlineMath"
-            ? "inline"
-            : selectedNode.type.name === "blockMath"
-              ? "block"
-              : null;
-          if (kind && (event.key === "Enter" || event.key === " ")) {
-            event.preventDefault();
-            openMathEditor(kind, selectedNode, view.state.selection.from);
-            return true;
-          }
-        }
-
-        if (event.key === ")") {
-          const { $from } = view.state.selection;
-          if ($from.parent.isTextblock && !isCodeBlock($from.parent)) {
-            const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
-            const linkMatch = (before + event.key).match(MARKDOWN_LINK_PATTERN);
-            const linkMark = view.state.schema.marks.link;
-            if (
-              linkMatch?.index !== undefined
-              && linkMatch.index < before.length
-              && linkMatch[0].length > event.key.length
-              && linkMark
-            ) {
-              const tokenFrom = Math.max(
-                $from.start(),
-                view.state.selection.from - (linkMatch[0].length - event.key.length),
-              );
-              view.dispatch(
-                view.state.tr.replaceWith(
-                  tokenFrom,
-                  view.state.selection.from,
-                  view.state.schema.text(linkMatch[1], [linkMark.create({ href: linkMatch[2] })]),
-                ).scrollIntoView(),
-              );
-              return true;
-            }
-          }
-        }
-        const { from, empty, $from } = view.state.selection;
-        if (paletteRef.current?.mode !== "commands" || !empty) return false;
-        if (event.key === "Delete" && $from.parentOffset < $from.parent.content.size) {
-          // Keep forward deletion in its own history event instead of merging
-          // it with the slash token's input-rule transactions.
-          view.dispatch(closeHistory(view.state.tr.delete(from, from + 1)));
-          return true;
-        }
-        if (event.key === "Backspace" && (event.metaKey || event.altKey || event.ctrlKey)) {
-          // Native modified deletion differs between browsers and operating
-          // systems. Keep slash-command editing deterministic while the
-          // palette is open: Meta deletes to the start of the text block;
-          // Alt (macOS) and Ctrl (Windows/Linux) delete the preceding word.
-          event.preventDefault();
-          const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
-          const start = event.metaKey
-            ? $from.start()
-            : from - (before.length - backwardWordStart(before));
-          if (start >= from) return true;
-          view.dispatch(closeHistory(view.state.tr.delete(start, from)));
-          return true;
-        }
-        if (event.key === "Backspace" && $from.parentOffset > 0) {
-          view.dispatch(view.state.tr.delete(from - 1, from).setMeta("addToHistory", false));
-          return true;
-        }
-        return false;
-      },
-      attributes: {
-        class: "lab-document",
-        "aria-label": "lab local-only Markdown note",
-        role: "textbox",
-        "aria-multiline": "true",
-        "aria-autocomplete": "list",
-        "aria-haspopup": "listbox",
-        autocapitalize: "sentences",
-        autocomplete: "off",
-        spellcheck: "true",
-      },
-    },
-    onCreate: ({ editor: instance }) => {
-      editorRef.current = instance;
-      const originalExecCommand = document.execCommand.bind(document);
-      const patchedExecCommand: Document["execCommand"] = (commandId, showUI, value) => {
-        if (commandId.toLowerCase() === "inserttext" && value && value.length <= 256) {
-          const selection = window.getSelection();
-          if (
-            selection
-            && !selection.isCollapsed
-            && selection.anchorNode
-            && selection.focusNode
-            && instance.view.dom.contains(selection.anchorNode)
-            && instance.view.dom.contains(selection.focusNode)
-          ) {
-            try {
-              const anchor = instance.view.posAtDOM(selection.anchorNode, selection.anchorOffset);
-              const head = instance.view.posAtDOM(selection.focusNode, selection.focusOffset);
-              const from = Math.min(anchor, head);
-              const to = Math.max(anchor, head);
-              if (to - from >= 4096) {
-                instance.view.dispatch(
-                  closeHistory(
-                    instance.view.state.tr.insertText(value, from, to).scrollIntoView(),
-                  ),
-                );
-                return true;
-              }
-            } catch {
-              // Keep native editing when the DOM range is transient.
-            }
-          }
-        }
-        return originalExecCommand(commandId, showUI, value);
-      };
-      document.execCommand = patchedExecCommand;
-      largeExecCommandRef.current = { original: originalExecCommand, patched: patchedExecCommand };
-    },
-    onDestroy: () => {
-      const execCommandPatch = largeExecCommandRef.current;
-      if (execCommandPatch && document.execCommand === execCommandPatch.patched) {
-        document.execCommand = execCommandPatch.original;
-      }
-      largeExecCommandRef.current = null;
-    },
-    onTransaction: ({ editor: instance, transaction, appendedTransactions }) => {
-      if (outlineOpenRef.current) {
-        syncOutlineTransactions(instance, [transaction, ...appendedTransactions]);
-      }
-      if (!transaction.docChanged) return;
-      const current = linkEditorStateRef.current;
-      if (!current) return;
-      // The panel keeps a ProseMirror document range. Map both boundaries
-      // through every edit while it is open so text inserted before the link
-      // cannot make Save replace an unrelated range.
-      const from = transaction.mapping.map(current.from, 1);
-      const to = transaction.mapping.map(current.to, -1);
-      if (from >= to) {
-        linkEditorStateRef.current = null;
-        setLinkEditorState(null);
-        setPalette(null);
-        setNoticeRef.current("The link is no longer available.");
-        return;
-      }
-      const next = { ...current, from, to };
-      linkEditorStateRef.current = next;
-      setLinkEditorState(next);
-    },
-    onUpdate: ({ editor: instance, transaction, appendedTransactions }) => {
-      const hasMathMigration = inlineMathMigrationPendingRef.current
-        || transactionContainsDollar(transaction)
-        || appendedTransactions.some(transactionContainsDollar);
-      if (hasMathMigration) {
-        inlineMathMigrationPendingRef.current = false;
-        if (migrateInlineMath(instance)) return;
-      }
-      syncInterface(instance);
-      const markdown = serializeMarkdown(instance);
-      latestMarkdown.set(markdown);
-      persistence.onEdit(markdown);
-    },
-    onSelectionUpdate: ({ editor: instance }) => syncInterface(instance),
-    onFocus: ({ editor: instance }) => syncInterface(instance),
-    onBlur: hideCaret,
-  });
-
-  const rankedCommands = useMemo(() => {
-    if (!palette || palette.mode !== "commands") return [];
-    const commands = COMMANDS
-      .filter((command) => command.id !== (sessionPinned ? "pin" : "unpin"))
-      .filter((command) => command.id !== (sessionArchived ? "archive" : "unarchive"));
-    return rankCommands(commands, palette.query, commandContext);
-  }, [commandContext, palette, sessionArchived, sessionPinned]);
-
-  const filtered = useMemo(() => {
-    return rankedCommands
-      .filter(({ availability }) => availability.available)
-      .map(({ command }) => command);
-  }, [rankedCommands]);
-
-  const filteredThemes = useMemo(() => {
-    if (!palette || palette.mode !== "theme") return [];
-    const normalize = (value: string) => value
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase();
-    const query = normalize(palette.query.trim());
-    if (!query) return [...THEMES];
-    return THEMES.filter((theme) => (
-      normalize(`${theme.label} ${theme.detail}`).includes(query)
-    ));
-  }, [palette]);
-
-  const mathError = useMemo(() => {
-    if (!mathEditorState) return null;
-    if (!mathEditorState.latex.trim()) return "Enter a LaTeX expression.";
-    try {
-      katex.renderToString(mathEditorState.latex, {
-        displayMode: mathEditorState.kind === "block",
-        throwOnError: true,
-        strict: "warn",
-        trust: false,
-        output: "htmlAndMathml",
-      });
-      return null;
-    } catch {
-      return "This expression could not be parsed yet.";
-    }
-  }, [mathEditorState]);
-
-  const mathPreview = useMemo(() => {
-    if (!mathEditorState?.latex.trim() || mathError) return null;
-    try {
-      return katex.renderToString(mathEditorState.latex, {
-        displayMode: mathEditorState.kind === "block",
-        throwOnError: false,
-        strict: "warn",
-        trust: false,
-        output: "htmlAndMathml",
-      });
-    } catch {
-      return null;
-    }
-  }, [mathEditorState, mathError]);
-
-  const mathEditorIdentity = mathEditorState
-    ? `${mathEditorState.kind}:${mathEditorState.pos}`
-    : null;
-
-  useEffect(() => {
-    if (!mathEditorIdentity) return;
-    const frame = window.requestAnimationFrame(() => {
-      const input = mathInputRef.current;
-      if (!input) return;
-      input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [mathEditorIdentity]);
-
-  useEffect(() => {
-    if (palette?.mode !== "name") return;
-    const frame = window.requestAnimationFrame(() => {
-      sessionNameInputRef.current?.focus();
-      sessionNameInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "search") return;
-    const frame = window.requestAnimationFrame(() => {
-      searchInputRef.current?.focus();
-      searchInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "theme") return;
-    const frame = window.requestAnimationFrame(() => {
-      themeSearchInputRef.current?.focus();
-      themeSearchInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "theme") return;
-    const activeThemeOption = filteredThemes[selected];
-    if (!activeThemeOption) return;
-    const frame = window.requestAnimationFrame(() => {
-      document
-        .getElementById(`${PALETTE_ID}-theme-${activeThemeOption.id}`)
-        ?.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [filteredThemes, palette?.mode, selected]);
-
-  useEffect(() => {
-    if (palette?.mode !== "search" || searchLoading) return;
-    const activeResult = searchResults[selected];
-    if (!activeResult) return;
-    const frame = window.requestAnimationFrame(() => {
-      searchResultRefs.current
-        .get(activeResult.documentId)
-        ?.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode, searchLoading, searchResults, selected]);
-
-  useLayoutEffect(() => {
-    repositionMathEditor();
-  }, [mathEditorState, repositionMathEditor]);
-
-  useEffect(() => {
-    if (!editor) return;
-    const documentElement = editor.view.dom;
-    if (palette?.mode === "commands") {
-      const activeCommand = filtered[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeCommand) {
-        documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-${activeCommand.id}`);
-      } else {
-        // The no-results panel is still the controlled listbox, but it has no
-        // option for aria-activedescendant to reference.
-        documentElement.removeAttribute("aria-activedescendant");
-      }
-      return;
-    }
-    if (palette?.mode === "sessions" || palette?.mode === "archives" || palette?.mode === "link-session") {
-      const activeSession = sessions[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeSession) {
-        documentElement.setAttribute(
-          "aria-activedescendant",
-          `${PALETTE_ID}-session-${activeSession.id}`,
-        );
-      } else {
-        documentElement.removeAttribute("aria-activedescendant");
-      }
-      return;
-    }
-    if (palette?.mode === "language") {
-      const activeLanguage = CODE_LANGUAGES[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeLanguage) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-language-${activeLanguage.id || "plain"}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    if (palette?.mode === "backlinks") {
-      const activeBacklink = backlinks[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeBacklink) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-backlink-${activeBacklink.documentId}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    if (palette?.mode === "history") {
-      const activeVersion = versions[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeVersion) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-version-${activeVersion.id}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    if (palette?.mode === "search" || palette?.mode === "theme") {
-      // The focused searchbox owns its result list. The editor is only the
-      // command launcher and must not claim that list as its active descendant.
-      documentElement.setAttribute("aria-expanded", "false");
-      documentElement.removeAttribute("aria-controls");
-      documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    documentElement.setAttribute("aria-expanded", "false");
-    documentElement.removeAttribute("aria-controls");
-    documentElement.removeAttribute("aria-activedescendant");
-  }, [backlinks, editor, filtered, palette, searchResults, selected, sessions, versions]);
-
-  /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
-  const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
-    try {
-      if (await persistence.flush()) return "ok";
-    } catch {
-      // The controller normally converts save errors into a false result, but
-      // session switching must remain safe if a custom persistence boundary
-      // rejects unexpectedly.
-    }
-    // Authority conflicts and replica failures both yield false. Staged recovery
-    // drafts remain available via /recover, so offer an explicit escape hatch.
-    const switchAnyway = window.confirm(
-      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
-    );
-    if (switchAnyway) return "dirty";
-    setNotice("This note could not be saved before switching sessions.");
-    return "cancel";
-  }, [persistence]);
-
-  /**
-   * Stop accepting edits so the async gap before navigation cannot stage/save more text.
-   * Disables the editor first, then flushes via dispose. Returns false if the user
-   * declines to switch after a failed final flush (reloads to restore a live controller).
-   * When `allowDirtySwitch` is true the user already confirmed a failed flush, so
-   * dispose does not prompt a second time.
-   */
-  const freezePersistenceForNavigation = useCallback(async (allowDirtySwitch = false) => {
-    editor?.setEditable(false, false);
-    let flushed = true;
-    try {
-      flushed = await persistence.dispose();
-    } catch {
-      flushed = false;
-    }
-    if (flushed || allowDirtySwitch) return true;
-    const switchAnyway = window.confirm(
-      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
-    );
-    if (switchAnyway) return true;
-    setNotice("This note could not be saved before switching sessions.");
-    // dispose() is irreversible; reload restores a live persistence controller.
-    window.location.reload();
-    return false;
-  }, [editor, persistence]);
-
-  const navigateToSession = useCallback((session: DocumentSession, hashOverride?: string) => {
-    // Preserve an explicit local-link hash, including the legacy
-    // `#session=default` form. Command/session-list navigation still uses the
-    // canonical hash from documentSessionHash when no override is supplied.
-    const hash = hashOverride ?? documentSessionHash(session.id);
-    const target = `${window.location.pathname}${window.location.search}${hash}`;
-    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    // Same-path hash changes do not load a new document by themselves. Push a
-    // real history entry, then reload so documentId and vault scope rebind.
-    // Back/forward are handled by the popstate listener below (also reload).
-    // Full reload is intentional: vault scope and persistence are bound at mount
-    // and must rebind cleanly to the new document namespace.
-    if (current === target) {
-      window.location.reload();
-      return;
-    }
-    window.history.pushState({ labDocumentId: session.id }, "", target);
-    window.location.reload();
-  }, []);
-
-  const resumeSession = useCallback(async (session: DocumentSession, hashOverride?: string) => {
-    const flushResult = await flushBeforeSessionSwitch();
-    if (flushResult === "cancel") return false;
-    if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return false;
-    navigateToSession(session, hashOverride);
-    return true;
-  }, [flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession]);
-
-  // Keep local-link clicks wired to the current persistence/session boundary.
-  useEffect(() => {
-    resumeSessionRef.current = resumeSession;
-  }, [resumeSession]);
-
-  useEffect(() => {
-    linkEditorStateRef.current = linkEditorState;
-  }, [linkEditorState]);
-
-  const searchSessionList = useCallback(() => {
-    const available = [...listDocumentSessions({ archived: "all" })];
-    const currentName = sessionName.trim() || "Untitled";
-    const current = available.find((session) => session.id === documentId);
-    if (current) {
-      current.name = currentName;
-    } else {
-      available.push({
-        id: documentId,
-        name: currentName,
-        titleSource: sessionTitleSource,
-        pinned: sessionPinned,
-        archived: sessionArchived,
-        createdAt: 0,
-        updatedAt: 0,
-      });
-    }
-    return available;
-  }, [documentId, sessionArchived, sessionName, sessionPinned, sessionTitleSource]);
-
-  const refreshSearchIndex = useCallback(async () => {
-    const requestVersion = searchIndexVersionRef.current + 1;
-    searchIndexVersionRef.current = requestVersion;
-    setSearchLoading(true);
-    try {
-      // Include the current in-memory note even when a save is still debounced
-      // or an authority conflict has made the latest edit unsavable.
-      const available = searchSessionList();
-      setSessions(available);
-      const currentMarkdown = editor ? serializeMarkdown(editor) : "";
-      const documents: LocalSearchDocument[] = (await Promise.all(available.map(async (session) => {
-        if (session.id === documentId) {
-          return {
-            id: session.id,
-            name: session.name,
-            markdown: currentMarkdown,
-            searchableText: searchableMarkdown(currentMarkdown),
-            updatedAt: session.updatedAt,
-          } satisfies LocalSearchDocument;
-        }
-
-        let markdown = "";
-        try {
-          const verifiedMarkdown = await readVerifiedLocalDocument(session.id);
-          if (verifiedMarkdown === null) return null;
-          markdown = verifiedMarkdown;
-        } catch {
-          // A readable session name is still searchable when one of its
-          // replicas is temporarily unavailable.
-        }
-        if (isLocalDocumentDeleted(session.id)) return null;
-        return {
-          id: session.id,
-          name: session.name,
-          markdown,
-          searchableText: searchableMarkdown(markdown),
-          updatedAt: session.updatedAt,
-        } satisfies LocalSearchDocument;
-      }))).flatMap((document) => document ? [document] : []);
-
-      if (requestVersion !== searchIndexVersionRef.current) return;
-      searchDocumentsRef.current = documents;
-      const currentPalette = paletteRef.current;
-      if (currentPalette?.mode === "search") {
-        setSearchResults(searchLocalDocuments(documents, currentPalette.query));
-      }
-    } finally {
-      if (requestVersion === searchIndexVersionRef.current) setSearchLoading(false);
-    }
-  }, [documentId, editor, searchSessionList, serializeMarkdown]);
-
-  const updateSearchQuery = useCallback((query: string) => {
-    const current = paletteRef.current;
-    if (!current || current.mode !== "search") return;
-    setPalette({ ...current, query });
-    setSelected(0);
-    setSearchResults(searchLocalDocuments(searchDocumentsRef.current, query));
-  }, [setPalette, setSelected]);
-
-  const refreshBacklinks = useCallback(async () => {
-    setBacklinksLoading(true);
-    try {
-      const available = searchSessionList();
-      const currentMarkdown = editor ? serializeMarkdown(editor) : "";
-      const documents: BacklinkDocument[] = (await Promise.all(available.map(async (session) => {
-        if (session.id === documentId) {
-          return { id: session.id, name: session.name, markdown: currentMarkdown, updatedAt: session.updatedAt };
-        }
-        try {
-          const markdown = await readVerifiedLocalDocument(session.id);
-          if (markdown === null || isLocalDocumentDeleted(session.id)) return null;
-          return { id: session.id, name: session.name, markdown, updatedAt: session.updatedAt };
-        } catch {
-          return null;
-        }
-      }))).flatMap((document) => document ? [document] : []);
-      setBacklinks(findBacklinks(documents, documentId));
-    } finally {
-      setBacklinksLoading(false);
-    }
-  }, [documentId, editor, searchSessionList, serializeMarkdown]);
-
-  const openCurrentLinkEditor = useCallback((anchor?: PaletteState) => {
-    if (!editor) return false;
-    const linkType = editor.schema.marks.link;
-    const range = linkType ? getMarkRange(editor.state.selection.$from, linkType) : undefined;
-    if (!range) {
-      setNotice("Place the caret inside a link to edit it.");
-      return false;
-    }
-    const mark = editor.state.doc.resolve(range.from + 1).marks().find((candidate) => candidate.type === linkType)
-      ?? editor.state.selection.$from.marks().find((candidate) => candidate.type === linkType);
-    if (!mark) {
-      setNotice("That link could not be read.");
-      return false;
-    }
-    setLinkEditorState({
-      from: range.from,
-      to: range.to,
-      label: editor.state.doc.textBetween(range.from, range.to, " ", " "),
-      href: String(mark.attrs.href ?? ""),
-    });
-    setPalette({
-      ...(anchor ?? paletteAtSelection(editor, "link-editor")),
-      query: "",
-      mode: "link-editor",
-      range: { from: editor.state.selection.from, to: editor.state.selection.from },
-    });
-    return true;
-  }, [editor, paletteAtSelection, setPalette]);
-
-  const saveEditedLink = useCallback((label: string, href: string) => {
-    const state = linkEditorState;
-    if (!editor || !state) return;
-    const nextLabel = label.trim();
-    const nextHref = href.trim();
-    if (!nextLabel || !nextHref) {
-      setNotice("Enter both link text and a destination.");
-      return;
-    }
-    const isLocal = documentIdFromLocalHref(nextHref) !== null;
-    let valid = isLocal;
-    if (!valid) {
-      try {
-        const parsed = new URL(nextHref);
-        valid = parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:";
-      } catch {
-        valid = false;
-      }
-    }
-    if (!valid) {
-      setNotice("Use an HTTP, HTTPS, email, or local session link.");
-      return;
-    }
-    const link = editor.schema.marks.link.create({ href: nextHref });
-    editor.view.dispatch(
-      editor.state.tr.replaceWith(state.from, state.to, editor.schema.text(nextLabel, [link])).scrollIntoView(),
-    );
-    setLinkEditorState(null);
-    setPalette(null);
-    editor.commands.focus();
-  }, [editor, linkEditorState, setPalette]);
-
-  const removeEditedLink = useCallback(() => {
-    const state = linkEditorState;
-    if (!editor || !state) return;
-    editor.view.dispatch(
-      editor.state.tr.replaceWith(state.from, state.to, editor.schema.text(state.label)).scrollIntoView(),
-    );
-    setLinkEditorState(null);
-    setPalette(null);
-    editor.commands.focus();
-  }, [editor, linkEditorState, setPalette]);
-
-  const insertSessionLink = useCallback((session: DocumentSession) => {
-    if (!editor) return;
-    const href = localSessionHref(session.id);
-    const mark = editor.schema.marks.link.create({ href });
-    editor.view.dispatch(editor.state.tr.replaceSelectionWith(editor.schema.text(session.name, [mark]), false).scrollIntoView());
-    setPalette(null);
-    editor.commands.focus();
-    setNotice(`Linked to “${session.name}”.`);
-  }, [editor, setPalette]);
-
-  const chooseCodeLanguage = useCallback((language: string) => {
-    if (!editor || !editor.isActive("codeBlock")) {
-      setNotice("The code block is no longer selected.");
-      setPalette(null);
-      return;
-    }
-    editor.chain().focus().updateAttributes("codeBlock", { language: language || null }).run();
-    setPalette(null);
-    setNotice(language ? `Set code language to ${language}.` : "Cleared the code language.");
-  }, [editor, setPalette]);
-
-  const restoreHistoryVersion = useCallback((version: VersionHistoryEntry) => {
-    if (!editor) return;
-    const confirmed = window.confirm(
-      `Restore the version from ${new Date(version.createdAt).toLocaleString()}? The current note will be kept in version history.`,
-    );
-    if (!confirmed) return;
-    recordVersion(documentId, serializeMarkdown(editor));
-    editor.commands.setContent(version.markdown, { contentType: "markdown" });
-    setPalette(null);
-    editor.commands.focus("start");
-    setNotice("Restored an earlier local version.");
-  }, [documentId, editor, serializeMarkdown, setPalette]);
-
-  const openBacklink = useCallback((backlink: Backlink) => {
-    const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
-    if (!session) {
-      setNotice("That linking session is no longer available.");
-      return;
-    }
-    void resumeSession(session);
-  }, [resumeSession]);
-
-  const openSearchResult = useCallback((result: LocalSearchResult) => {
-    const session = sessions.find((candidate) => candidate.id === result.documentId) ?? {
-      id: result.documentId,
-      name: result.name,
-      titleSource: "automatic" as const,
-      pinned: false,
-      archived: false,
-      createdAt: result.updatedAt,
-      updatedAt: result.updatedAt,
-    };
-    if (session.id === documentId) {
-      setPalette(null);
-      editor?.commands.focus();
-      return;
-    }
-    void resumeSession(session);
-  }, [documentId, editor, resumeSession, setPalette, sessions]);
-
-  const deleteActiveSession = useCallback(async () => {
-    if (documentId === DEFAULT_DOCUMENT_ID) {
-      setNotice("The original session cannot be deleted. Use /clear to empty it.");
-      return false;
-    }
-    // Stop accepting edits so keystrokes during the async purge cannot land in
-    // the DOM and be lost when the reload lands. Drop debounced writes first
-    // (abandon) so a late save cannot revive the session.
-    editor?.setEditable(false, false);
-    await persistence.abandon();
-    try {
-      await purgeDocumentSession(documentId);
-      clearVersions(documentId);
-    } catch {
-      // abandon() is irreversible; reload restores a live persistence controller.
-      // Tombstones are only published after a durable delete marker succeeds, so
-      // a failed purge keeps the note loadable after reload.
-      setNotice("This session could not be deleted locally. Reloading…");
-      window.location.reload();
-      return false;
-    }
-    // Replace so Back does not return to the deleted session URL, then reload.
-    const target = `${window.location.pathname}${window.location.search}`;
-    window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
-    window.location.reload();
-    return true;
-  }, [documentId, editor, persistence]);
-
-  const submitSessionName = useCallback(() => {
-    const nextName = sessionName.trim();
-    if (!nextName) {
-      setNotice("Enter a name for this session.");
-      return;
-    }
-    void renameDocumentSession(documentId, nextName)
-      .then((session) => {
-        setSessionName(session.name);
-        setSavedSessionName(session.name);
-        setSessionTitleSource("manual");
-        setNotice(`Named this session “${session.name}”.`);
-        setPalette(null);
-        editor?.commands.focus();
-      })
-      .catch(() => setNotice("This session name could not be saved locally."));
-  }, [documentId, editor, sessionName, setPalette]);
-
-  const chooseTheme = useCallback((themeId: ThemeId) => {
-    document.documentElement.dataset.theme = themeId;
-    setActiveTheme(themeId);
-    try {
-      window.localStorage.setItem(THEME_STORAGE_KEY, themeId);
-      setNotice(`Changed the theme to ${THEMES.find((theme) => theme.id === themeId)?.label ?? themeId}.`);
-    } catch {
-      setNotice("Changed the theme for this page. The browser could not save the choice.");
-    }
-    setPalette(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
-  }, [setPalette]);
-
-  const runCommand = useCallback(
-    (command: Command) => {
-      if (!editor || !paletteRef.current) return;
-      const availability = commandAvailability(command.id, commandContextFromEditor(editor));
-      if (!availability.available) {
-        setNotice(availability.reason ?? "This command is not available here.");
-        setPalette(null);
-        return;
-      }
-      const current = paletteRef.current;
-      const anchor = { ...current };
-      // Slash text is UI chrome, not an edit the user should have to undo. In particular,
-      // making this transaction part of history clears the redo branch before /redo runs.
-      editor.view.dispatch(
-        editor.state.tr.delete(current.range.from, current.range.to).setMeta("addToHistory", false),
-      );
-      editor.commands.focus();
-      setPalette(null);
-
-      if (command.id === "status") {
-        const requestVersion = paletteVersionRef.current;
-        void inspectLocalStorage()
-          .then((result) => {
-            // The user may have typed, escaped, or opened another palette while
-            // storage was being inspected. A late result must not resurrect it.
-            if (paletteVersionRef.current !== requestVersion || paletteRef.current !== null) return;
-            setHealth(result);
-            setNotice(result.errors.length > 0 ? "Some local storage locations are unavailable." : null);
-            setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "status" });
-          })
-          .catch(() => {
-            if (paletteVersionRef.current === requestVersion && paletteRef.current === null) {
-              setNotice("Could not inspect local storage.");
-            }
-        });
-        return;
-      }
-      if (command.id === "search") {
-        setSearchResults([]);
-        setSelected(0);
-        setPalette({
-          ...anchor,
-          query: "",
-          range: { from: editor.state.selection.from, to: editor.state.selection.from },
-          mode: "search",
-        });
-        void refreshSearchIndex();
-        return;
-      }
-      if (command.id === "stats") {
-        setStats(calculateDocumentStats(serializeMarkdown(editor)));
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "stats" });
-        return;
-      }
-      if (command.id === "shortcuts") {
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "shortcuts" });
-        return;
-      }
-      if (command.id === "theme") {
-        setSelected(Math.max(0, THEMES.findIndex((theme) => theme.id === activeTheme)));
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "theme" });
-        return;
-      }
-      if (command.id === "history") {
-        const available = listVersions(documentId);
-        setVersions(available);
-        setSelected(0);
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "history" });
-        return;
-      }
-      if (command.id === "backlinks") {
-        setBacklinks([]);
-        setSelected(0);
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "backlinks" });
-        void refreshBacklinks();
-        return;
-      }
-      if (command.id === "edit-link") {
-        openCurrentLinkEditor(anchor);
-        return;
-      }
-      if (command.id === "link-note") {
-        const available = listDocumentSessions({ archived: "all" }).filter((session) => session.id !== documentId);
-        setSessions(available);
-        setSelected(0);
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "link-session" });
-        return;
-      }
-      if (command.id === "language") {
-        if (!editor.isActive("codeBlock")) {
-          editor.chain().focus().setCodeBlock().run();
-        }
-        const currentLanguage = String(editor.getAttributes("codeBlock").language ?? "");
-        setSelected(Math.max(0, CODE_LANGUAGES.findIndex((language) => language.id === currentLanguage)));
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "language" });
-        return;
-      }
-      if (command.id === "image-metadata") {
-        if (!(editor.state.selection instanceof NodeSelection) || editor.state.selection.node.type.name !== "image") {
-          setNotice("Select an image to edit its metadata.");
-          return;
-        }
-        openImageMetadata(editor.state.selection.node, editor.state.selection.from);
-        return;
-      }
-      if (command.id === "backup") {
-        const revisionAtRequest = persistence.getState().editRevision;
-        void (async () => {
-          if (!(await persistence.flush())) {
-            setNotice("The vault could not be backed up because this note was not fully saved.");
-            return;
-          }
-          if (!(await sessionTouchBarrier.wait())) {
-            setNotice("The vault could not be backed up because session metadata was not fully saved.");
-            return;
-          }
-          if (revisionAtRequest !== persistence.getState().editRevision) {
-            setNotice("The note changed while the vault backup was being prepared. Export was cancelled.");
-            return;
-          }
-          try {
-            const backup = await exportLocalVault();
-            if (revisionAtRequest !== persistence.getState().editRevision) {
-              setNotice("The note changed while the vault backup was being prepared. Export was cancelled.");
-              return;
-            }
-            downloadVaultBackup(backup);
-            setNotice(`Exported ${backup.sessions.length} ${backup.sessions.length === 1 ? "session" : "sessions"} and ${backup.assets.length} embedded ${backup.assets.length === 1 ? "image" : "images"}.`);
-          } catch {
-            setNotice("The local vault backup could not be created.");
-          }
-        })();
-        return;
-      }
-      if (command.id === "restore") {
-        vaultBackupInputRef.current?.click();
-        return;
-      }
-      if (command.id === "clear") {
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-clear" });
-        return;
-      }
-      if (command.id === "delete") {
-        if (documentId === DEFAULT_DOCUMENT_ID) {
-          setNotice("The original session cannot be deleted. Use /clear to empty it.");
-          return;
-        }
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-delete" });
-        return;
-      }
-      if (command.id === "recover") {
-        const revisionAtRequest = persistence.getState().editRevision;
-        void listLocalRecoveryDrafts()
-          .then((drafts) => {
-            if (revisionAtRequest !== persistence.getState().editRevision) {
-              setNotice("The note changed while recovery drafts were loading. Export was cancelled.");
-              return;
-            }
-            if (drafts.length === 0) {
-              setNotice("No conflicting local drafts are available.");
-              return;
-            }
-            downloadMarkdown(drafts.length === 1 ? "lab-recovery.md" : "lab-recovery-bundle.md", recoveryBundle(drafts));
-            setNotice(`Exported ${drafts.length} recovery ${drafts.length === 1 ? "draft" : "drafts"}.`);
-          })
-          .catch(() => setNotice("Could not export the local recovery drafts."));
-        return;
-      }
-      if (command.id === "new") {
-        void (async () => {
-          const flushResult = await flushBeforeSessionSwitch();
-          if (flushResult === "cancel") return;
-          // Freeze before the async create gap so keystrokes cannot land on the
-          // outgoing session after the last successful flush.
-          if (!(await freezePersistenceForNavigation(flushResult === "dirty"))) return;
-          try {
-            const session = await createDocumentSession();
-            navigateToSession(session);
-          } catch {
-            setNotice("A new session could not be created locally. Reloading…");
-            window.location.reload();
-          }
-        })();
-        return;
-      }
-      if (command.id === "name") {
-        setSessionName(savedSessionName);
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "name" });
-        return;
-      }
-      if (command.id === "pin" || command.id === "unpin") {
-        const pinning = command.id === "pin";
-        void (pinning ? pinDocumentSession(documentId) : unpinDocumentSession(documentId))
-          .then((session) => {
-            setSessionPinned(session.pinned);
-            setNotice(session.pinned ? "Pinned this session." : "Unpinned this session.");
-          })
-          .catch(() => setNotice("This session's pin state could not be saved."));
-        return;
-      }
-      if (command.id === "archive" || command.id === "unarchive") {
-        const archiving = command.id === "archive";
-        if (archiving && documentId === DEFAULT_DOCUMENT_ID) {
-          setNotice("The original session cannot be archived.");
-          return;
-        }
-        void (archiving ? archiveDocumentSession(documentId) : unarchiveDocumentSession(documentId))
-          .then((session) => {
-            setSessionArchived(session.archived);
-            setNotice(session.archived ? "Archived this session. Use /archives to find it." : "Returned this session to the active list.");
-          })
-          .catch(() => setNotice("This session's archive state could not be saved."));
-        return;
-      }
-      if (command.id === "sessions") {
-        const available = listDocumentSessions();
-        setSessions(available);
-        const activeIndex = available.findIndex((session) => session.id === documentId);
-        setSelected(Math.max(0, activeIndex));
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "sessions" });
-        return;
-      }
-      if (command.id === "archives") {
-        const available = listDocumentSessions({ archived: true });
-        setSessions(available);
-        setSelected(0);
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "archives" });
-        return;
-      }
-      if (command.id === "outline") {
-        toggleOutline();
-        return;
-      }
-      if (command.id === "undo") {
-        editor.commands.undo();
-        return;
-      }
-      if (command.id === "redo") {
-        editor.commands.redo();
+        x: clamp(interaction.init…22436 tokens truncated…ds.redo();
         return;
       }
       const chain = editor.chain().focus();
@@ -3728,12 +1678,12 @@ function LabEditorSession() {
         case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
-          downloadMarkdown("lab.md", serializeMarkdown(editor));
+          downloadMarkdown(markdownExportFilename(savedSessionName), serializeMarkdown(editor));
           break;
         }
       }
     },
-    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setNotice, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3813,7 +1763,7 @@ function LabEditorSession() {
       window.removeEventListener("hashchange", rebindIfSessionChanged);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, setNotice]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3921,7 +1871,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, syncInterface]);
+  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3998,6 +1948,10 @@ function LabEditorSession() {
       event.preventDefault();
       if (current.mode === "name") setSessionName(savedSessionName);
       if (current.mode === "link-editor") setLinkEditorState(null);
+      if (current.mode === "confirm-import") {
+        cancelMarkdownImport();
+        return;
+      }
       setPalette(null);
       editor?.commands.focus();
       return;
@@ -4112,6 +2066,14 @@ function LabEditorSession() {
       return;
     }
 
+    if (current.mode === "confirm-import") {
+      if (event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
+        event.preventDefault();
+        void confirmMarkdownImport();
+      }
+      return;
+    }
+
     if (current.mode === "confirm-clear") {
       if (event.key === "Enter") {
         event.preventDefault();
@@ -4160,20 +2122,51 @@ function LabEditorSession() {
 
   const onImport = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+    event.target.value = "";
     if (!file || !editor) return;
+    if (pendingMarkdownImportRef.current) {
+      pendingMarkdownImportRef.current = null;
+      setPendingMarkdownImport(null);
+      importConfirmingRef.current = false;
+      setImportConfirming(false);
+      if (paletteRef.current?.mode === "confirm-import") setPalette(null);
+    }
+    const requestId = importRequestRef.current + 1;
+    importRequestRef.current = requestId;
     const revisionAtSelection = persistence.getState().editRevision;
+    const currentMarkdown = serializeMarkdown(editor);
     void file.text()
       .then((markdown) => {
-        if (revisionAtSelection !== persistence.getState().editRevision) {
+        if (requestId !== importRequestRef.current) return;
+        if (
+          revisionAtSelection !== persistence.getState().editRevision
+          || serializeMarkdown(editor) !== currentMarkdown
+        ) {
           setNotice("The note changed while the file was loading. Import was cancelled.");
           return;
         }
-        editor.commands.setContent(markdown, { contentType: "markdown" });
-        editor.commands.focus("start");
+        if (!currentMarkdown.trim()) {
+          applyMarkdownImport(markdown, file.name);
+          return;
+        }
+        const pending = {
+          markdown,
+          fileName: file.name,
+          revision: revisionAtSelection,
+          currentMarkdown,
+        };
+        pendingMarkdownImportRef.current = pending;
+        setPendingMarkdownImport(pending);
+        importConfirmingRef.current = false;
+        setImportConfirming(false);
         setNotice(null);
+        setPalette(paletteAtSelection(editor, "confirm-import"));
       })
-      .catch(() => setNotice("The selected file could not be read as Markdown."));
-    event.target.value = "";
+      .catch(() => {
+        if (requestId === importRequestRef.current) {
+          setNotice("The selected file could not be read as Markdown.");
+        }
+      });
   };
 
   const onVaultRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -4261,13 +2254,11 @@ function LabEditorSession() {
     }
     instance.commands.setNodeSelection(target.pos);
     instance.commands.updateAttributes("image", { src: dataUrl, width: null, height: null });
-    instance.commands.focus();
     setImageCropTarget(null);
   }, [imageCropTarget]);
 
   const cancelImageCrop = useCallback(() => {
     setImageCropTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const applyImageMetadata = useCallback((metadata: { alt: string; title: string }) => {
@@ -4285,13 +2276,11 @@ function LabEditorSession() {
       title: metadata.title.trim() || null,
     });
     setImageMetadataTarget(null);
-    instance.commands.focus();
     setNotice("Updated image alt text and title.");
-  }, [imageMetadataTarget]);
+  }, [imageMetadataTarget, setNotice]);
 
   const cancelImageMetadata = useCallback(() => {
     setImageMetadataTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -4521,8 +2510,8 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" || palette.mode === "confirm-import" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : palette.mode === "confirm-import" ? "Confirm Markdown import" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
             rankedCommands.length > 0 ? (
@@ -4886,6 +2875,30 @@ function LabEditorSession() {
               }}
               saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
             />
+          ) : palette.mode === "confirm-import" ? (
+            <div className="palette-message palette-confirm" data-testid="confirm-import">
+              <span>Replace this note with “{pendingMarkdownImport?.fileName || "the selected Markdown file"}”?</span>
+              <small>The current note will be kept in version history.</small>
+              <div className="feature-form-actions">
+                <button
+                  ref={importConfirmButtonRef}
+                  type="button"
+                  className="feature-button feature-button-primary"
+                  disabled={importConfirming}
+                  onClick={() => { void confirmMarkdownImport(); }}
+                >
+                  Import file
+                </button>
+                <button
+                  type="button"
+                  className="feature-button"
+                  disabled={importConfirming}
+                  onClick={() => cancelMarkdownImport()}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
               <span>Clear the note?</span>
@@ -4901,6 +2914,7 @@ function LabEditorSession() {
               <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>
               <small>{health.labels.join(" · ") || "Storage is unavailable"}</small>
               {health.conflicts > 0 ? <small>{health.conflicts} recoverable {health.conflicts === 1 ? "draft" : "drafts"} · /recover to export</small> : null}
+              {formattedStorageEstimate ? <small>Approximate browser storage: {formattedStorageEstimate}</small> : null}
               <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"} · no network access</small>
             </div>
           )}
@@ -4909,7 +2923,26 @@ function LabEditorSession() {
           </motion.div>
         </div>
       ) : null}
-      {notice ? <p className="editor-notice" role="status">{notice}</p> : null}
+      {notice ? (
+        <div
+          className="editor-notice"
+          data-kind={notice.kind}
+          data-testid="editor-notice"
+          role={notice.kind === "info" ? "status" : "alert"}
+          aria-live={notice.kind === "info" ? "polite" : "assertive"}
+          aria-atomic="true"
+        >
+          <span className="editor-notice-message">{notice.message}</span>
+          <button
+            className="feature-button editor-notice-dismiss"
+            type="button"
+            aria-label="Dismiss notification"
+            onClick={() => { noticeController.dismiss(notice.id); }}
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

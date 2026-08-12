@@ -1,14 +1,15 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { openEditor, waitForAuthority } from "./helpers";
+import { confirmMarkdownImport, openEditor, waitForAuthority } from "./helpers";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-async function importMarkdown(page: Page, markdown: string) {
+async function importMarkdown(page: Page, markdown: string, confirm = false) {
   await page.locator('input[type="file"][accept*="markdown"]').setInputFiles({
     name: "productivity-suite.md",
     mimeType: "text/markdown",
     buffer: Buffer.from(markdown),
   });
+  if (confirm) await confirmMarkdownImport(page);
 }
 
 async function runSlash(page: Page, query: string) {
@@ -201,7 +202,7 @@ test("table row and column commands work in place and code language round-trips"
   await runSlash(page, "table-column-after");
   await expect(table.locator("tr").first().locator("th, td")).toHaveCount(4);
 
-  await importMarkdown(page, "```\nconst answer = 42;\n```");
+  await importMarkdown(page, "```\nconst answer = 42;\n```", true);
   const code = editor.locator("pre code");
   await expect(code).toHaveText("const answer = 42;");
   await code.click();

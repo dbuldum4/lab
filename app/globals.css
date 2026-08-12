@@ -2526,6 +2526,9 @@ img.ProseMirror-separator {
   right: 24px;
   bottom: 24px;
   z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   max-width: min(420px, calc(100vw - 48px));
   margin: 0;
   border: 1px solid var(--border-strong);
@@ -2535,6 +2538,18 @@ img.ProseMirror-separator {
   color: var(--text-soft);
   font-size: 13px;
   line-height: 1.4;
+}
+
+.editor-notice-message {
+  flex: 1;
+  min-width: 0;
+}
+
+.editor-notice-dismiss {
+  flex-shrink: 0;
+  margin: -3px -5px 0 0;
+  padding: 5px 7px;
+  font-size: 10px;
 }
 
 .not-found {

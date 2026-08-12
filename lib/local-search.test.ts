@@ -1,10 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  normalizeSearchQuery,
+  normalizeSearchText,
   searchableMarkdown,
+  searchMatchRanges,
   searchExcerpt,
   searchLocalDocuments,
 } from "./local-search.ts";
+
+test("normalizes accents, compatibility characters, case, and repeated whitespace", () => {
+  assert.equal(normalizeSearchText("  Rosé   PINE  "), "rose pine");
+  assert.equal(normalizeSearchQuery("CAFÉ\u00a0  plans"), "cafe plans");
+  assert.equal(normalizeSearchText("ﬃnal"), "ffinal");
+});
+
+test("matches accented names and content while preserving readable originals", () => {
+  const results = searchLocalDocuments([
+    { id: "cafe", name: "Café plans", markdown: "Meet for crème brûlée after lunch." },
+  ], "  CAFE   creme ");
+
+  assert.equal(results[0]?.name, "Café plans");
+  assert.equal(results[0]?.match, "name-and-content");
+  assert.match(results[0]?.excerpt ?? "", /crème brûlée/);
+});
+
+test("maps accent-insensitive highlights back to original source ranges", () => {
+  assert.deepEqual(searchMatchRanges("Café and cafe\u0301", "CAFE"), [
+    { start: 0, end: 4 },
+    { start: 9, end: 14 },
+  ]);
+  assert.deepEqual(searchMatchRanges("office ﬃnal", "ffinal"), [{ start: 7, end: 11 }]);
+});
 
 test("searches session names and Markdown text case-insensitively", () => {
   const results = searchLocalDocuments([
@@ -73,6 +100,14 @@ test("excerpts keep a distant match near the visible start of the card", () => {
   const excerpt = searchExcerpt(markdown, "needle", 48);
   assert.ok(excerpt.indexOf("needle") >= 0);
   assert.ok(excerpt.indexOf("needle") < 30, excerpt);
+});
+
+test("accent-insensitive excerpt matches do not use normalized indexes on original text", () => {
+  const decomposedCafe = `cafe\u0301`;
+  const markdown = `${"long introduction ".repeat(40)}${decomposedCafe} ${"trailing context ".repeat(40)}`;
+  const excerpt = searchExcerpt(markdown, "cafe", 32);
+  assert.match(excerpt, new RegExp(decomposedCafe));
+  assert.ok(excerpt.indexOf(decomposedCafe) < 20, excerpt);
 });
 
 test("empty queries do not expose any local documents", () => {

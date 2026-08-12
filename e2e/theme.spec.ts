@@ -51,6 +51,15 @@ test("theme search ignores accents", async ({ page }) => {
   await expect(options.first()).toHaveAccessibleName(/Rosé Pine Dawn/);
 });
 
+test("command search ignores accents", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("/códe");
+
+  const commands = page.getByRole("listbox", { name: "Slash commands" });
+  await expect(commands).toBeVisible();
+  await expect(commands.getByRole("option", { name: /Code block/ })).toBeVisible();
+});
+
 test("the deployed notice page contains attribution and a non-endorsement statement", async ({ page }) => {
   await page.goto("/third-party-notices/");
   await expect(page.getByRole("heading", { name: "Third-party theme notices" })).toBeVisible();
