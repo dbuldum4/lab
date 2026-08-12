@@ -1728,12 +1728,23 @@ function LabEditorSession() {
   const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNoticeState] = useState<EditorNotice | null>(null);
+  const [latestNotice] = useState(() => {
+    let value: EditorNotice | null = null;
+    return {
+      get: () => value,
+      set: (next: EditorNotice | null) => { value = next; },
+    };
+  });
   const [noticeController] = useState<EditorNoticeController>(() => (
     createEditorNoticeController({ onChange: setNoticeState })
   ));
   const setNotice = useCallback((message: string | null, kind?: EditorNoticeKind) => {
-    noticeController.set(message, kind);
-  }, [noticeController]);
+    latestNotice.set(noticeController.set(message, kind));
+  }, [latestNotice, noticeController]);
+
+  useEffect(() => {
+    latestNotice.set(notice);
+  }, [latestNotice, notice]);
 
   useEffect(() => {
     noticeController.activate();
@@ -3835,7 +3846,7 @@ function LabEditorSession() {
         // Health inspection can finish after a command, import, or save has
         // published a more relevant notice. Never replace an active user
         // notice; a later health refresh can report storage state once clear.
-        if (!updateNotice || noticeController.get()) return;
+        if (!updateNotice || latestNotice.get()) return;
         const loadNotice = nextHealth.errors.length > 0
           ? "Some local storage locations are unavailable."
           : nextHealth.conflicts > 0
@@ -3941,7 +3952,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, noticeController, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
+  }, [documentId, editor, latestMarkdown, latestNotice, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
