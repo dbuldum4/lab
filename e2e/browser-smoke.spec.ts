@@ -25,7 +25,7 @@ test(`${BROWSER_SMOKE_TAG} starts and accepts editor typing`, async ({ page }) =
 
 test(`${BROWSER_SMOKE_TAG} hydrates while persistent-storage permission is pending`, async ({ page }) => {
   await page.addInitScript(() => {
-    Object.defineProperty(navigator.storage, "persist", {
+    Object.defineProperty(Object.getPrototypeOf(navigator.storage), "persist", {
       configurable: true,
       value: () => new Promise<boolean>(() => undefined),
     });
@@ -41,7 +41,7 @@ test(`${BROWSER_SMOKE_TAG} keeps newer notices after delayed persistence permiss
     const state = window as typeof window & {
       resolvePersistencePermission?: () => void;
     };
-    Object.defineProperty(navigator.storage, "persist", {
+    Object.defineProperty(Object.getPrototypeOf(navigator.storage), "persist", {
       configurable: true,
       value: () => new Promise<boolean>((resolve) => {
         state.resolvePersistencePermission = () => resolve(true);
