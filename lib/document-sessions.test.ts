@@ -17,6 +17,7 @@ import {
   renameDocumentSession,
   restoreExistingDocumentSession,
   touchDocumentSession,
+  touchDocumentSessionSync,
   unarchiveDocumentSession,
   unpinDocumentSession,
   updateAutomaticSessionTitle,
@@ -149,6 +150,23 @@ test("sessions are independent, resumable, and rename atomically per id", async 
   assert.equal(sessions.find((session) => session.id === beta.id)?.titleSource, "manual");
   assert.ok(touched.updatedAt > beforeTouch);
   assert.equal(sessions.find((session) => session.id === alpha.id)?.updatedAt, touched.updatedAt);
+});
+
+test("synchronous activity touches survive a blocked metadata lock", async () => {
+  const draft = await createDocumentSession("Draft");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      locks: {
+        request: () => new Promise<never>(() => {}),
+      },
+    },
+  });
+
+  const touched = touchDocumentSessionSync(draft.id);
+  assert.equal(touched.id, draft.id);
+  assert.ok(touched.updatedAt > draft.updatedAt);
+  assert.equal((await getDocumentSession(draft.id))?.updatedAt, touched.updatedAt);
 });
 
 test("legacy session rows receive safe metadata defaults", async () => {
