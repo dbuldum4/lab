@@ -81,6 +81,7 @@ import {
 import { automaticTitleFromMarkdown } from "@/lib/automatic-title";
 import { calculateDocumentStats, type DocumentStats } from "@/lib/document-stats";
 import { EditorBlockExtensions } from "@/lib/editor-blocks";
+import { markdownExportFilename } from "@/lib/export-filename";
 import {
   normalizeSearchQuery,
   searchableMarkdown,
@@ -3692,7 +3693,7 @@ function LabEditorSession() {
         case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
-          downloadMarkdown("lab.md", serializeMarkdown(editor));
+          downloadMarkdown(markdownExportFilename(savedSessionName), serializeMarkdown(editor));
           break;
         }
       }
