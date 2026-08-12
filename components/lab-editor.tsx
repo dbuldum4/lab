@@ -24,7 +24,7 @@ import StarterKit from "@tiptap/starter-kit";
 import { BorderBeam } from "border-beam";
 import katex from "katex";
 import { LayoutGroup, motion, type Transition } from "motion/react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ChangeEvent, type ReactNode, type RefObject } from "react";
 import {
   ImageMetadataDialog,
   LinkEditorPanel,
@@ -88,6 +88,7 @@ import {
   type LocalSearchDocument,
   type LocalSearchResult,
 } from "@/lib/local-search";
+import { filterPickerOptions } from "@/lib/picker-filter";
 import {
   documentIdFromLocalHref,
   findBacklinks,
@@ -134,6 +135,7 @@ type PaletteMode =
   | "backlinks"
   | "history"
   | "link-editor";
+type PickerMode = "sessions" | "archives" | "link-session" | "backlinks" | "history";
 type PaletteAnchor = { left: number; top: number; bottom: number };
 type PaletteState = {
   query: string;
@@ -202,6 +204,60 @@ type CropInteraction = {
   initial: CropRect;
   handle?: CropHandle;
 };
+
+function isPickerMode(mode: PaletteMode | undefined): mode is PickerMode {
+  return mode === "sessions"
+    || mode === "archives"
+    || mode === "link-session"
+    || mode === "backlinks"
+    || mode === "history";
+}
+
+type PickerFilterFieldProps = {
+  inputRef: RefObject<HTMLInputElement | null>;
+  ariaLabel: string;
+  placeholder: string;
+  value: string;
+  activeDescendant?: string;
+  onChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onCompositionStart: () => void;
+  onCompositionEnd: () => void;
+};
+
+function PickerFilterField({
+  inputRef,
+  ariaLabel,
+  placeholder,
+  value,
+  activeDescendant,
+  onChange,
+  onCompositionStart,
+  onCompositionEnd,
+}: PickerFilterFieldProps) {
+  return (
+    <div className="search-field picker-filter-field">
+      <span className="search-field-prefix" aria-hidden="true">⌕</span>
+      <input
+        ref={inputRef}
+        type="search"
+        role="combobox"
+        aria-label={ariaLabel}
+        aria-expanded="true"
+        aria-controls={PALETTE_ID}
+        aria-activedescendant={activeDescendant}
+        aria-autocomplete="list"
+        aria-haspopup="listbox"
+        autoComplete="off"
+        placeholder={placeholder}
+        value={value}
+        onChange={onChange}
+        onCompositionStart={onCompositionStart}
+        onCompositionEnd={onCompositionEnd}
+      />
+      <kbd>Esc</kbd>
+    </div>
+  );
+}
 
 const CROP_HANDLES: CropHandle[] = [
   "top-left",
@@ -1792,6 +1848,7 @@ function LabEditorSession() {
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
+  const pickerFilterInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1811,6 +1868,7 @@ function LabEditorSession() {
   const searchIndexVersionRef = useRef(0);
   const searchComposingRef = useRef(false);
   const themeComposingRef = useRef(false);
+  const pickerComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
@@ -1912,6 +1970,9 @@ function LabEditorSession() {
     }
     if (previous?.mode === "theme" && value?.mode !== "theme") {
       themeComposingRef.current = false;
+    }
+    if (isPickerMode(previous?.mode) && !isPickerMode(value?.mode)) {
+      pickerComposingRef.current = false;
     }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
@@ -2852,6 +2913,31 @@ function LabEditorSession() {
     ));
   }, [palette]);
 
+  const filteredSessions = useMemo(() => {
+    if (!palette || !isPickerMode(palette.mode) || (palette.mode !== "sessions" && palette.mode !== "archives" && palette.mode !== "link-session")) {
+      return [];
+    }
+    return filterPickerOptions(
+      sessions,
+      palette.query,
+      (session) => `${session.name} ${session.pinned ? "pinned" : ""} ${session.archived ? "archived" : ""}`,
+    );
+  }, [palette, sessions]);
+
+  const filteredBacklinks = useMemo(() => {
+    if (!palette || palette.mode !== "backlinks") return [];
+    return filterPickerOptions(backlinks, palette.query, (backlink) => `${backlink.name} ${backlink.excerpt}`);
+  }, [backlinks, palette]);
+
+  const filteredVersions = useMemo(() => {
+    if (!palette || palette.mode !== "history") return [];
+    return filterPickerOptions(versions, palette.query, (version) => {
+      const versionStats = calculateDocumentStats(version.markdown);
+      const preview = searchableMarkdown(version.markdown).slice(0, 140);
+      return `${new Date(version.createdAt).toLocaleString()} ${versionStats.words} ${preview}`;
+    });
+  }, [palette, versions]);
+
   const mathError = useMemo(() => {
     if (!mathEditorState) return null;
     if (!mathEditorState.latex.trim()) return "Enter a LaTeX expression.";
@@ -2927,6 +3013,15 @@ function LabEditorSession() {
   }, [palette?.mode]);
 
   useEffect(() => {
+    if (!isPickerMode(palette?.mode)) return;
+    const frame = window.requestAnimationFrame(() => {
+      pickerFilterInputRef.current?.focus();
+      pickerFilterInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
+  useEffect(() => {
     if (palette?.mode !== "theme") return;
     const activeThemeOption = filteredThemes[selected];
     if (!activeThemeOption) return;
@@ -2950,6 +3045,34 @@ function LabEditorSession() {
     return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode, searchLoading, searchResults, selected]);
 
+  useEffect(() => {
+    if (!isPickerMode(palette?.mode)) return;
+    const activeId = palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session"
+      ? filteredSessions[selected] ? `${PALETTE_ID}-session-${filteredSessions[selected].id}` : null
+      : palette.mode === "backlinks"
+        ? filteredBacklinks[selected] ? `${PALETTE_ID}-backlink-${filteredBacklinks[selected].documentId}` : null
+        : filteredVersions[selected] ? `${PALETTE_ID}-version-${filteredVersions[selected].id}` : null;
+    if (!activeId) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(activeId)?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [filteredBacklinks, filteredSessions, filteredVersions, palette?.mode, selected]);
+
+  useEffect(() => {
+    if (!isPickerMode(palette?.mode)) return;
+    const count = palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session"
+      ? filteredSessions.length
+      : palette.mode === "backlinks"
+        ? filteredBacklinks.length
+        : filteredVersions.length;
+    if (count === 0) {
+      if (selectedRef.current !== 0) setSelected(0);
+      return;
+    }
+    if (selectedRef.current >= count) setSelected(count - 1);
+  }, [filteredBacklinks.length, filteredSessions.length, filteredVersions.length, palette?.mode, setSelected]);
+
   useLayoutEffect(() => {
     repositionMathEditor();
   }, [mathEditorState, repositionMathEditor]);
@@ -2971,7 +3094,7 @@ function LabEditorSession() {
       return;
     }
     if (palette?.mode === "sessions" || palette?.mode === "archives" || palette?.mode === "link-session") {
-      const activeSession = sessions[selected];
+      const activeSession = filteredSessions[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeSession) {
@@ -2993,7 +3116,7 @@ function LabEditorSession() {
       return;
     }
     if (palette?.mode === "backlinks") {
-      const activeBacklink = backlinks[selected];
+      const activeBacklink = filteredBacklinks[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeBacklink) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-backlink-${activeBacklink.documentId}`);
@@ -3001,7 +3124,7 @@ function LabEditorSession() {
       return;
     }
     if (palette?.mode === "history") {
-      const activeVersion = versions[selected];
+      const activeVersion = filteredVersions[selected];
       documentElement.setAttribute("aria-expanded", "true");
       documentElement.setAttribute("aria-controls", PALETTE_ID);
       if (activeVersion) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-version-${activeVersion.id}`);
@@ -3019,7 +3142,7 @@ function LabEditorSession() {
     documentElement.setAttribute("aria-expanded", "false");
     documentElement.removeAttribute("aria-controls");
     documentElement.removeAttribute("aria-activedescendant");
-  }, [backlinks, editor, filtered, palette, searchResults, selected, sessions, versions]);
+  }, [backlinks, editor, filtered, filteredBacklinks, filteredSessions, filteredVersions, palette, searchResults, selected, sessions, versions]);
 
   /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
   const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
@@ -3180,6 +3303,13 @@ function LabEditorSession() {
     setPalette({ ...current, query });
     setSelected(0);
     setSearchResults(searchLocalDocuments(searchDocumentsRef.current, query));
+  }, [setPalette, setSelected]);
+
+  const updatePickerQuery = useCallback((query: string) => {
+    const current = paletteRef.current;
+    if (!current || !isPickerMode(current.mode)) return;
+    setPalette({ ...current, query });
+    setSelected(0);
   }, [setPalette, setSelected]);
 
   const refreshBacklinks = useCallback(async () => {
@@ -3908,7 +4038,7 @@ function LabEditorSession() {
 
   useLayoutEffect(() => {
     repositionPalette();
-  }, [backlinks.length, filtered.length, filteredThemes.length, palette, repositionPalette, sessions.length, versions.length]);
+  }, [backlinks.length, filtered.length, filteredBacklinks.length, filteredSessions.length, filteredThemes.length, filteredVersions.length, palette, repositionPalette, sessions.length, versions.length]);
 
   useEffect(() => {
     const flush = () => {
@@ -3993,14 +4123,22 @@ function LabEditorSession() {
     }
 
     if (current.mode === "sessions" || current.mode === "archives" || current.mode === "link-session") {
+      const isComposing = pickerComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, sessions.length);
+        const count = Math.max(1, filteredSessions.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && sessions.length > 0) {
+      } else if ((event.key === "Enter" || event.key === "Tab") && filteredSessions.length > 0) {
         event.preventDefault();
-        const session = sessions[selectedRef.current] ?? sessions[0];
+        const session = filteredSessions[selectedRef.current] ?? filteredSessions[0];
         if (current.mode === "link-session") {
           insertSessionLink(session);
         } else if (session.id === documentId) {
@@ -4051,27 +4189,43 @@ function LabEditorSession() {
     }
 
     if (current.mode === "backlinks") {
+      const isComposing = pickerComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, backlinks.length);
+        const count = Math.max(1, filteredBacklinks.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && backlinks.length > 0) {
+      } else if ((event.key === "Enter" || event.key === "Tab") && filteredBacklinks.length > 0) {
         event.preventDefault();
-        openBacklink(backlinks[selectedRef.current] ?? backlinks[0]);
+        openBacklink(filteredBacklinks[selectedRef.current] ?? filteredBacklinks[0]);
       }
       return;
     }
 
     if (current.mode === "history") {
+      const isComposing = pickerComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, versions.length);
+        const count = Math.max(1, filteredVersions.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && versions.length > 0) {
+      } else if ((event.key === "Enter" || event.key === "Tab") && filteredVersions.length > 0) {
         event.preventDefault();
-        restoreHistoryVersion(versions[selectedRef.current] ?? versions[0]);
+        restoreHistoryVersion(filteredVersions[selectedRef.current] ?? filteredVersions[0]);
       }
       return;
     }
@@ -4623,7 +4777,19 @@ function LabEditorSession() {
             </div>
           ) : palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" ? (
             <div className="command-list session-list" data-testid="session-list">
-              {sessions.length > 0 ? sessions.map((session, index) => (
+              <PickerFilterField
+                inputRef={pickerFilterInputRef}
+                ariaLabel={palette.mode === "archives" ? "Search archived sessions" : palette.mode === "link-session" ? "Search sessions to link" : "Search sessions"}
+                placeholder={palette.mode === "archives" ? "Filter archived sessions" : palette.mode === "link-session" ? "Filter sessions to link" : "Filter sessions"}
+                value={palette.query}
+                activeDescendant={filteredSessions[selected]
+                  ? `${PALETTE_ID}-session-${filteredSessions[selected].id}`
+                  : undefined}
+                onChange={(event) => updatePickerQuery(event.target.value)}
+                onCompositionStart={() => { pickerComposingRef.current = true; }}
+                onCompositionEnd={() => { pickerComposingRef.current = false; }}
+              />
+              {filteredSessions.length > 0 ? filteredSessions.map((session, index) => (
                 <div
                   className="command-item"
                   data-selected={index === selected}
@@ -4657,8 +4823,10 @@ function LabEditorSession() {
                 </div>
               )) : (
                 <div className="palette-message">
-                  <span>{palette.mode === "archives" ? "No archived sessions" : palette.mode === "link-session" ? "No other sessions to link" : "No sessions"}</span>
-                  <small>Esc to return to the editor</small>
+                  <span>{palette.query.trim()
+                    ? `No ${palette.mode === "archives" ? "archived sessions" : palette.mode === "link-session" ? "sessions to link" : "sessions"} match “${palette.query.trim()}”.`
+                    : palette.mode === "archives" ? "No archived sessions" : palette.mode === "link-session" ? "No other sessions to link" : "No sessions"}</span>
+                  <small>{palette.query.trim() ? "Try another filter" : "Type to filter · Esc to return to the editor"}</small>
                 </div>
               )}
             </div>
@@ -4762,12 +4930,24 @@ function LabEditorSession() {
             <div className="feature-list-panel" data-testid="backlinks-panel">
               <div className="feature-list-header">
                 <span>Backlinks</span>
-                <small>{backlinksLoading ? "Reading local notes…" : `${backlinks.length} incoming ${backlinks.length === 1 ? "link" : "links"}`}</small>
+                <small>{backlinksLoading ? "Reading local notes…" : `${filteredBacklinks.length}${palette.query.trim() ? ` of ${backlinks.length}` : ""} incoming ${filteredBacklinks.length === 1 ? "link" : "links"}`}</small>
               </div>
+              <PickerFilterField
+                inputRef={pickerFilterInputRef}
+                ariaLabel="Search backlinks"
+                placeholder="Filter backlinks"
+                value={palette.query}
+                activeDescendant={filteredBacklinks[selected]
+                  ? `${PALETTE_ID}-backlink-${filteredBacklinks[selected].documentId}`
+                  : undefined}
+                onChange={(event) => updatePickerQuery(event.target.value)}
+                onCompositionStart={() => { pickerComposingRef.current = true; }}
+                onCompositionEnd={() => { pickerComposingRef.current = false; }}
+              />
               <div className="command-list feature-result-list">
                 {backlinksLoading ? (
                   <div className="palette-message"><span>Finding links…</span><small>Verified local copies only</small></div>
-                ) : backlinks.length > 0 ? backlinks.map((backlink, index) => (
+                ) : filteredBacklinks.length > 0 ? filteredBacklinks.map((backlink, index) => (
                   <div
                     className="command-item feature-result-item"
                     data-selected={index === selected}
@@ -4785,7 +4965,10 @@ function LabEditorSession() {
                     <small>{backlink.excerpt}</small>
                   </div>
                 )) : (
-                  <div className="palette-message"><span>No backlinks yet</span><small>Use /link-note in another session to create one</small></div>
+                  <div className="palette-message">
+                    <span>{palette.query.trim() ? `No backlinks match “${palette.query.trim()}”.` : "No backlinks yet"}</span>
+                    <small>{palette.query.trim() ? "Try another filter" : "Use /link-note in another session to create one"}</small>
+                  </div>
                 )}
               </div>
             </div>
@@ -4793,11 +4976,24 @@ function LabEditorSession() {
             <div className="feature-list-panel" data-testid="version-history-panel">
               <div className="feature-list-header">
                 <span>Version history</span>
-                <small>{versions.length} local {versions.length === 1 ? "version" : "versions"}</small>
+                <small>{filteredVersions.length}{palette.query.trim() ? ` of ${versions.length}` : ""} local {filteredVersions.length === 1 ? "version" : "versions"}</small>
               </div>
+              <PickerFilterField
+                inputRef={pickerFilterInputRef}
+                ariaLabel="Search version history"
+                placeholder="Filter saved versions"
+                value={palette.query}
+                activeDescendant={filteredVersions[selected]
+                  ? `${PALETTE_ID}-version-${filteredVersions[selected].id}`
+                  : undefined}
+                onChange={(event) => updatePickerQuery(event.target.value)}
+                onCompositionStart={() => { pickerComposingRef.current = true; }}
+                onCompositionEnd={() => { pickerComposingRef.current = false; }}
+              />
               <div className="command-list feature-result-list">
-                {versions.length > 0 ? versions.map((version, index) => {
+                {filteredVersions.length > 0 ? filteredVersions.map((version, index) => {
                   const versionStats = calculateDocumentStats(version.markdown);
+                  const preview = searchableMarkdown(version.markdown).slice(0, 140);
                   return (
                     <div
                       className="command-item feature-result-item"
@@ -4813,11 +5009,14 @@ function LabEditorSession() {
                       onMouseEnter={() => setSelected(index)}
                     >
                       <span>{new Date(version.createdAt).toLocaleString()}</span>
-                      <small>{versionStats.words} {versionStats.words === 1 ? "word" : "words"} · Enter to restore</small>
+                      <small>{versionStats.words} {versionStats.words === 1 ? "word" : "words"} · Enter to restore · {preview || "Empty note"}</small>
                     </div>
                   );
                 }) : (
-                  <div className="palette-message"><span>No saved versions yet</span><small>Versions appear after durable local saves</small></div>
+                  <div className="palette-message">
+                    <span>{palette.query.trim() ? `No saved versions match “${palette.query.trim()}”.` : "No saved versions yet"}</span>
+                    <small>{palette.query.trim() ? "Try another filter" : "Versions appear after durable local saves"}</small>
+                  </div>
                 )}
               </div>
             </div>
