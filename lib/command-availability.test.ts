@@ -24,10 +24,7 @@ test("marks context-specific commands unavailable with an actionable reason", ()
     assert.equal(result.reason, "Place the caret inside a table first.");
   }
 
-  assert.deepEqual(commandAvailability("language", plainContext), {
-    available: false,
-    reason: "Place the caret inside a code block first.",
-  });
+  assert.deepEqual(commandAvailability("language", plainContext), { available: true });
   assert.deepEqual(commandAvailability("edit-link", plainContext), {
     available: false,
     reason: "Place the caret inside a link first.",
@@ -57,13 +54,13 @@ test("ranks available commands before matching unavailable commands", () => {
   const ranked = rankCommands(commands, "", plainContext);
   assert.deepEqual(ranked.map(({ command }) => command.id), [
     "table",
+    "language",
     "text",
     "table-row-after",
-    "language",
   ]);
   assert.deepEqual(
     ranked.filter(({ availability }) => availability.available).map(({ command }) => command.id),
-    ["table", "text"],
+    ["table", "language", "text"],
   );
 });
 
