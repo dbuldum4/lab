@@ -25,6 +25,8 @@ test(`${BROWSER_SMOKE_TAG} starts and accepts editor typing`, async ({ page }) =
 
 test(`${BROWSER_SMOKE_TAG} hydrates while persistent-storage permission is pending`, async ({ page }) => {
   await page.addInitScript(() => {
+    // Patch the prototype because WebKit may return a fresh StorageManager
+    // wrapper for each navigator.storage access.
     Object.defineProperty(Object.getPrototypeOf(navigator.storage), "persist", {
       configurable: true,
       value: () => new Promise<boolean>(() => undefined),
