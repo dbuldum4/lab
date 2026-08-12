@@ -66,6 +66,7 @@ test("storage status reports the real redundant copies", async ({ page }) => {
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("storage-status")).toContainText("local");
   await expect(page.getByTestId("storage-status")).toContainText("IndexedDB");
+  await expect(page.getByTestId("storage-status")).toContainText("Approximate browser storage:");
 });
 
 test("a staged draft survives abrupt page termination and a new session owner", async ({ context, page }) => {

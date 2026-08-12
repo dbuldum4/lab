@@ -46,6 +46,7 @@ import {
   type LocalRecoveryDraft,
   type StorageHealth,
 } from "@/lib/local-vault";
+import { formatStorageEstimate } from "@/lib/storage-estimate";
 import {
   VAULT_BACKUP_FILENAME,
   MAX_VAULT_BACKUP_BYTES,
@@ -556,7 +557,14 @@ const BlockMathMarkdown = BlockMath.extend({
   },
 });
 
-const EMPTY_HEALTH: StorageHealth = { copies: 0, labels: [], persistent: false, errors: [], conflicts: 0 };
+const EMPTY_HEALTH: StorageHealth = {
+  copies: 0,
+  labels: [],
+  persistent: false,
+  errors: [],
+  conflicts: 0,
+  storageEstimate: null,
+};
 const PALETTE_ID = "slash-command-palette";
 const MATH_EDITOR_ID = "math-editor-popover";
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
@@ -1853,6 +1861,7 @@ function LabEditorSession() {
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
   const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
+  const formattedStorageEstimate = formatStorageEstimate(health.storageEstimate);
   const [latestMarkdown] = useState(() => {
     let value = "";
     return {
@@ -5030,6 +5039,7 @@ function LabEditorSession() {
               <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>
               <small>{health.labels.join(" · ") || "Storage is unavailable"}</small>
               {health.conflicts > 0 ? <small>{health.conflicts} recoverable {health.conflicts === 1 ? "draft" : "drafts"} · /recover to export</small> : null}
+              {formattedStorageEstimate ? <small>Approximate browser storage: {formattedStorageEstimate}</small> : null}
               <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"} · no network access</small>
             </div>
           )}

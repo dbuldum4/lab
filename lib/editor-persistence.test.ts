@@ -7,7 +7,15 @@ import {
 import type { StorageHealth } from "./local-vault.ts";
 
 function health(saved: boolean, errors: string[] = [], conflicts = 0): StorageHealth {
-  return { copies: saved ? 1 : 0, labels: saved ? ["localStorage"] : [], persistent: false, errors, conflicts, saved };
+  return {
+    copies: saved ? 1 : 0,
+    labels: saved ? ["localStorage"] : [],
+    persistent: false,
+    errors,
+    conflicts,
+    storageEstimate: null,
+    saved,
+  };
 }
 
 class ManualScheduler {

@@ -1,3 +1,5 @@
+import { parseStorageEstimate, type StorageEstimate } from "./storage-estimate.ts";
+
 export const DEFAULT_DOCUMENT_ID = "default";
 const LEGACY_LOCAL_KEY = "lab.document.v1";
 const LEGACY_PENDING_KEY = "lab.document.pending.v1";
@@ -28,6 +30,8 @@ export type StorageHealth = {
   errors: string[];
   /** Number of distinct, verified cross-tab drafts available for export. */
   conflicts: number;
+  /** Browser-provided, approximate usage/quota metadata; unavailable on some browsers. */
+  storageEstimate: StorageEstimate | null;
   /** Present on save results. False means this tab's candidate lost an authority conflict. */
   saved?: boolean;
 };
@@ -1251,6 +1255,17 @@ async function persistentStorageGranted() {
   }
 }
 
+async function readStorageEstimate(): Promise<StorageEstimate | null> {
+  try {
+    const storage = typeof navigator === "undefined" ? undefined : navigator.storage;
+    if (!storage || typeof storage.estimate !== "function") return null;
+    return parseStorageEstimate(await storage.estimate());
+  } catch {
+    // Quota estimates are optional metadata and must not affect replica health.
+    return null;
+  }
+}
+
 /**
  * Replica writes happen after the authority commit. The authority check here
  * is only a freshness optimization for replicas; it is not used as a lock or
@@ -1381,11 +1396,14 @@ async function inspectLocalStorageNow(extraErrors: string[] = []): Promise<Stora
     const read = pendingReads[index];
     return read.snapshot ? [{ document, read, snapshot: read.snapshot }] : [];
   });
+  const persistent = await persistentStorageGranted();
+  const storageEstimate = await readStorageEstimate();
   return {
     copies: labels.length,
     labels,
-    persistent: await persistentStorageGranted(),
+    persistent,
     conflicts: recoveryCandidates(pendingCandidates, winner as CanonicalSnapshot | null, currentPending).length,
+    storageEstimate,
     errors: [...new Set([
       ...extraErrors,
       ...authorityErrors,
