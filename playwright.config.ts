@@ -17,6 +17,13 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+      testIgnore: "**/webkit-smoke.spec.ts",
+    },
+    {
+      name: "webkit-smoke",
+      testMatch: "**/webkit-smoke.spec.ts",
+      grep: /@webkit-smoke/,
+      use: { ...devices["Desktop Safari"], browserName: "webkit" },
     },
   ],
   webServer: {

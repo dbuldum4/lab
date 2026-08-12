@@ -268,7 +268,7 @@ function focusableElements(container: HTMLElement) {
     .filter((element) => element.tabIndex >= 0 && element.getAttribute("aria-hidden") !== "true");
 }
 
-function useModalFocusTrap(
+export function useModalFocusTrap(
   dialogRef: RefObject<HTMLElement | null>,
   initialFocusRef: RefObject<HTMLElement | null>,
   onCancel: () => void,
@@ -310,7 +310,7 @@ function useModalFocusTrap(
   }, [dialogRef, initialFocusRef]);
 }
 
-function trapTabWithin(event: KeyboardEvent<HTMLElement>, dialog: HTMLElement | null) {
+export function trapTabWithin(event: KeyboardEvent<HTMLElement>, dialog: HTMLElement | null) {
   if (event.key !== "Tab" || !dialog) return;
   const focusable = focusableElements(dialog);
   if (focusable.length === 0) {

@@ -581,6 +581,39 @@ test("each individual replica missing, stale, or corrupt is repaired", async () 
   }
 });
 
+test("storage estimate metadata is optional and never changes replica health", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true });
+  await saveLocalDocument("estimated note");
+  const storage = environment.opfs?.storage;
+  assert.ok(storage);
+
+  Object.defineProperty(storage, "estimate", {
+    configurable: true,
+    value: async () => ({ usage: 12_345, quota: 98_765 }),
+  });
+  const supported = await inspectLocalStorage();
+  assert.deepEqual(supported.storageEstimate, { usage: 12_345, quota: 98_765 });
+  assert.equal(supported.copies, 3);
+  assert.equal(supported.persistent, true);
+
+  Object.defineProperty(storage, "estimate", {
+    configurable: true,
+    value: async () => { throw new Error("estimate denied"); },
+  });
+  const rejected = await inspectLocalStorage();
+  assert.equal(rejected.storageEstimate, null);
+  assert.equal(rejected.copies, supported.copies);
+  assert.equal(rejected.persistent, supported.persistent);
+  assert.deepEqual(rejected.errors, supported.errors);
+
+  Object.defineProperty(storage, "estimate", { configurable: true, value: undefined });
+  const unsupported = await inspectLocalStorage();
+  assert.equal(unsupported.storageEstimate, null);
+  assert.equal(unsupported.copies, supported.copies);
+  assert.equal(unsupported.persistent, supported.persistent);
+  assert.deepEqual(unsupported.errors, supported.errors);
+});
+
 test("orphaned namespaced drafts are discoverable without deleting another pending record", async () => {
   switchEnvironment({ browser: true, locks: "success" });
   const originalNow = Date.now;
