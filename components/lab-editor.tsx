@@ -110,6 +110,12 @@ import {
   type VersionHistoryEntry,
 } from "@/lib/version-history";
 import {
+  createEditorNoticeController,
+  type EditorNotice,
+  type EditorNoticeController,
+  type EditorNoticeKind,
+} from "@/lib/editor-notice";
+import {
   THEMES,
   THEME_STORAGE_KEY,
   themeFromDocument,
@@ -1845,7 +1851,20 @@ function LabEditorSession() {
   // /restore awaiting the render-time (stale) chain instead of that new touch.
   const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
   const [hydrating, setHydrating] = useState(true);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNoticeState] = useState<EditorNotice | null>(null);
+  const [noticeController] = useState<EditorNoticeController>(() => (
+    createEditorNoticeController({ onChange: setNoticeState })
+  ));
+  const setNotice = useCallback((message: string | null, kind?: EditorNoticeKind) => {
+    noticeController.set(message, kind);
+  }, [noticeController]);
+
+  useEffect(() => {
+    noticeController.activate();
+    return () => {
+      noticeController.dispose();
+    };
+  }, [noticeController]);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
   // Invalid ids still map to the default document; the hash is rewritten in
   // useLayoutEffect below so React StrictMode double init stays correct.
@@ -3038,7 +3057,7 @@ function LabEditorSession() {
     if (switchAnyway) return "dirty";
     setNotice("This note could not be saved before switching sessions.");
     return "cancel";
-  }, [persistence]);
+  }, [persistence, setNotice]);
 
   /**
    * Stop accepting edits so the async gap before navigation cannot stage/save more text.
@@ -3064,7 +3083,7 @@ function LabEditorSession() {
     // dispose() is irreversible; reload restores a live persistence controller.
     window.location.reload();
     return false;
-  }, [editor, persistence]);
+  }, [editor, persistence, setNotice]);
 
   const navigateToSession = useCallback((session: DocumentSession, hashOverride?: string) => {
     // Preserve an explicit local-link hash, including the legacy
@@ -3232,7 +3251,7 @@ function LabEditorSession() {
       range: { from: editor.state.selection.from, to: editor.state.selection.from },
     });
     return true;
-  }, [editor, paletteAtSelection, setPalette]);
+  }, [editor, paletteAtSelection, setNotice, setPalette]);
 
   const saveEditedLink = useCallback((label: string, href: string) => {
     const state = linkEditorState;
@@ -3264,7 +3283,7 @@ function LabEditorSession() {
     setLinkEditorState(null);
     setPalette(null);
     editor.commands.focus();
-  }, [editor, linkEditorState, setPalette]);
+  }, [editor, linkEditorState, setNotice, setPalette]);
 
   const removeEditedLink = useCallback(() => {
     const state = linkEditorState;
@@ -3285,7 +3304,7 @@ function LabEditorSession() {
     setPalette(null);
     editor.commands.focus();
     setNotice(`Linked to “${session.name}”.`);
-  }, [editor, setPalette]);
+  }, [editor, setNotice, setPalette]);
 
   const chooseCodeLanguage = useCallback((language: string) => {
     if (!editor || !editor.isActive("codeBlock")) {
@@ -3296,7 +3315,7 @@ function LabEditorSession() {
     editor.chain().focus().updateAttributes("codeBlock", { language: language || null }).run();
     setPalette(null);
     setNotice(language ? `Set code language to ${language}.` : "Cleared the code language.");
-  }, [editor, setPalette]);
+  }, [editor, setNotice, setPalette]);
 
   const restoreHistoryVersion = useCallback((version: VersionHistoryEntry) => {
     if (!editor) return;
@@ -3309,7 +3328,7 @@ function LabEditorSession() {
     setPalette(null);
     editor.commands.focus("start");
     setNotice("Restored an earlier local version.");
-  }, [documentId, editor, serializeMarkdown, setPalette]);
+  }, [documentId, editor, serializeMarkdown, setNotice, setPalette]);
 
   const openBacklink = useCallback((backlink: Backlink) => {
     const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
@@ -3318,7 +3337,7 @@ function LabEditorSession() {
       return;
     }
     void resumeSession(session);
-  }, [resumeSession]);
+  }, [resumeSession, setNotice]);
 
   const openSearchResult = useCallback((result: LocalSearchResult) => {
     const session = sessions.find((candidate) => candidate.id === result.documentId) ?? {
@@ -3364,7 +3383,7 @@ function LabEditorSession() {
     window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
     window.location.reload();
     return true;
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, setNotice]);
 
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
@@ -3382,7 +3401,7 @@ function LabEditorSession() {
         editor?.commands.focus();
       })
       .catch(() => setNotice("This session name could not be saved locally."));
-  }, [documentId, editor, sessionName, setPalette]);
+  }, [documentId, editor, sessionName, setNotice, setPalette]);
 
   const chooseTheme = useCallback((themeId: ThemeId) => {
     document.documentElement.dataset.theme = themeId;
@@ -3395,7 +3414,7 @@ function LabEditorSession() {
     }
     setPalette(null);
     window.requestAnimationFrame(() => editorRef.current?.commands.focus());
-  }, [setPalette]);
+  }, [setNotice, setPalette]);
 
   const runCommand = useCallback(
     (command: Command) => {
@@ -3697,7 +3716,7 @@ function LabEditorSession() {
         }
       }
     },
-    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setNotice, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3777,7 +3796,7 @@ function LabEditorSession() {
       window.removeEventListener("hashchange", rebindIfSessionChanged);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, setNotice]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3885,7 +3904,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, syncInterface]);
+  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -4249,7 +4268,7 @@ function LabEditorSession() {
     setImageMetadataTarget(null);
     instance.commands.focus();
     setNotice("Updated image alt text and title.");
-  }, [imageMetadataTarget]);
+  }, [imageMetadataTarget, setNotice]);
 
   const cancelImageMetadata = useCallback(() => {
     setImageMetadataTarget(null);
@@ -4859,7 +4878,26 @@ function LabEditorSession() {
           </motion.div>
         </div>
       ) : null}
-      {notice ? <p className="editor-notice" role="status">{notice}</p> : null}
+      {notice ? (
+        <div
+          className="editor-notice"
+          data-kind={notice.kind}
+          data-testid="editor-notice"
+          role={notice.kind === "info" ? "status" : "alert"}
+          aria-live={notice.kind === "info" ? "polite" : "assertive"}
+          aria-atomic="true"
+        >
+          <span className="editor-notice-message">{notice.message}</span>
+          <button
+            className="feature-button editor-notice-dismiss"
+            type="button"
+            aria-label="Dismiss notification"
+            onClick={() => { noticeController.dismiss(notice.id); }}
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
