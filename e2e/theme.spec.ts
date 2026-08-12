@@ -53,10 +53,10 @@ test("delayed persistence permission does not clear a newer theme notice", async
     (window as typeof window & { resolvePersistencePermission?: () => void })
       .resolvePersistencePermission?.();
   });
-  // Let the permission continuation and its asynchronous storage inspection
-  // finish; the resulting health update must not clear the newer theme notice.
-  await page.waitForTimeout(500);
-  await expect(notice).toHaveText("Changed the theme to Light.");
+  // Let the permission continuation run, then assert before the routine notice's
+  // intentional auto-dismiss window. The health refresh must not clear it.
+  await page.waitForTimeout(50);
+  await expect(notice).toHaveText("Changed the theme to Light.", { timeout: 1_000 });
 });
 
 test("the theme submenu filters themes while keeping keyboard selection", async ({ page }) => {
