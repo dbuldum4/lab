@@ -22,6 +22,13 @@ when selected. The outline is keyboard accessible: use `Tab` to reach it,
 opens as a local overlay and closes after navigation. Its open/closed state is
 UI-only and is not saved with the document.
 
+## Themes
+
+Use `/theme` to open the theme submenu. Dark is the default theme. The browser
+stores your selection on this device. The submenu also includes Light,
+Dracula, Nord, Solarized Dark, and Catppuccin Mocha. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the third-party licenses.
+
 ## Run locally
 
 Requires Node.js 22.6 or newer.

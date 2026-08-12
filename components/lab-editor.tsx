@@ -109,6 +109,12 @@ import {
   recordVersion,
   type VersionHistoryEntry,
 } from "@/lib/version-history";
+import {
+  THEMES,
+  THEME_STORAGE_KEY,
+  themeFromDocument,
+  type ThemeId,
+} from "@/lib/theme";
 
 type SlashRange = { from: number; to: number };
 type PaletteMode =
@@ -124,6 +130,7 @@ type PaletteMode =
   | "stats"
   | "shortcuts"
   | "language"
+  | "theme"
   | "backlinks"
   | "history"
   | "link-editor";
@@ -313,6 +320,7 @@ const COMMANDS: Command[] = [
   { id: "stats", label: "Document stats", detail: "Words, characters, blocks, and reading time", terms: "count reading time metrics" },
   { id: "history", label: "Version history", detail: "Restore an earlier local version", terms: "revisions snapshots time machine" },
   { id: "shortcuts", label: "Keyboard shortcuts", detail: "Show every app shortcut", terms: "keys hotkeys help" },
+  { id: "theme", label: "Theme", detail: "Choose the app colors", terms: "appearance light dark dracula nord solarized catppuccin" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
@@ -1853,6 +1861,7 @@ function LabEditorSession() {
   const [backlinks, setBacklinks] = useState<Backlink[]>([]);
   const [backlinksLoading, setBacklinksLoading] = useState(false);
   const [versions, setVersions] = useState<VersionHistoryEntry[]>([]);
+  const [activeTheme, setActiveTheme] = useState<ThemeId>(() => themeFromDocument(document.documentElement));
   const prefersReducedMotion = usePrefersReducedMotion();
   const mobileOutline = useMobileOutline();
 
@@ -2944,6 +2953,14 @@ function LabEditorSession() {
       else documentElement.removeAttribute("aria-activedescendant");
       return;
     }
+    if (palette?.mode === "theme") {
+      const activeOption = THEMES[selected];
+      documentElement.setAttribute("aria-expanded", "true");
+      documentElement.setAttribute("aria-controls", PALETTE_ID);
+      if (activeOption) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-theme-${activeOption.id}`);
+      else documentElement.removeAttribute("aria-activedescendant");
+      return;
+    }
     if (palette?.mode === "backlinks") {
       const activeBacklink = backlinks[selected];
       documentElement.setAttribute("aria-expanded", "true");
@@ -3336,6 +3353,19 @@ function LabEditorSession() {
       .catch(() => setNotice("This session name could not be saved locally."));
   }, [documentId, editor, sessionName, setPalette]);
 
+  const chooseTheme = useCallback((themeId: ThemeId) => {
+    document.documentElement.dataset.theme = themeId;
+    setActiveTheme(themeId);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeId);
+      setNotice(`Changed the theme to ${THEMES.find((theme) => theme.id === themeId)?.label ?? themeId}.`);
+    } catch {
+      setNotice("Changed the theme for this page. The browser could not save the choice.");
+    }
+    setPalette(null);
+    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+  }, [setPalette]);
+
   const runCommand = useCallback(
     (command: Command) => {
       if (!editor || !paletteRef.current) return;
@@ -3386,6 +3416,11 @@ function LabEditorSession() {
       }
       if (command.id === "shortcuts") {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "shortcuts" });
+        return;
+      }
+      if (command.id === "theme") {
+        setSelected(Math.max(0, THEMES.findIndex((theme) => theme.id === activeTheme)));
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "theme" });
         return;
       }
       if (command.id === "history") {
@@ -3631,7 +3666,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3955,6 +3990,18 @@ function LabEditorSession() {
       } else if (event.key === "Enter" || event.key === "Tab") {
         event.preventDefault();
         chooseCodeLanguage(CODE_LANGUAGES[selectedRef.current]?.id ?? "");
+      }
+      return;
+    }
+
+    if (current.mode === "theme") {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        setSelected((selectedRef.current + direction + THEMES.length) % THEMES.length);
+      } else if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        chooseTheme(THEMES[selectedRef.current]?.id ?? "dark");
       }
       return;
     }
@@ -4380,7 +4427,7 @@ function LabEditorSession() {
             className="command-palette-frame"
             size="line"
             colorVariant="mono"
-            theme="dark"
+            theme={THEMES.find((theme) => theme.id === activeTheme)?.colorScheme ?? "dark"}
             staticColors
             duration={3.2}
             active={(palette.mode === "commands" || palette.mode === "search") && !prefersReducedMotion}
@@ -4392,8 +4439,8 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "link-editor" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "theme" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "link-editor" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
@@ -4593,6 +4640,36 @@ function LabEditorSession() {
                 >
                   <span>{language.label}</span>
                   <small>{language.id ? `\`\`\`${language.id}` : "No fence identifier"}</small>
+                </div>
+              ))}
+            </div>
+          ) : palette.mode === "theme" ? (
+            <div className="command-list theme-list" data-testid="theme-list">
+              {THEMES.map((theme, index) => (
+                <div
+                  className="command-item theme-item"
+                  data-selected={index === selected}
+                  data-current={theme.id === activeTheme}
+                  id={`${PALETTE_ID}-theme-${theme.id}`}
+                  key={theme.id}
+                  role="option"
+                  aria-selected={index === selected}
+                  aria-current={theme.id === activeTheme ? "true" : undefined}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    chooseTheme(theme.id);
+                  }}
+                  onMouseEnter={() => setSelected(index)}
+                >
+                  <span className="theme-label">
+                    <span className="theme-swatches" aria-hidden="true">
+                      {theme.swatches.map((color) => (
+                        <span key={color} style={{ backgroundColor: color }} />
+                      ))}
+                    </span>
+                    {theme.label}
+                  </span>
+                  <small>{theme.id === activeTheme ? "Current" : theme.detail}</small>
                 </div>
               ))}
             </div>
