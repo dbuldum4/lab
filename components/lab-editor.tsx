@@ -3024,7 +3024,7 @@ function LabEditorSession() {
   /** Result of the pre-navigation flush: ok, user accepted dirty switch, or cancel. */
   const flushBeforeSessionSwitch = useCallback(async (): Promise<"ok" | "dirty" | "cancel"> => {
     try {
-      if (await persistence.flush()) return "ok";
+      if (await persistence.flush() && await sessionTouchBarrier.wait()) return "ok";
     } catch {
       // The controller normally converts save errors into a false result, but
       // session switching must remain safe if a custom persistence boundary
@@ -3038,7 +3038,7 @@ function LabEditorSession() {
     if (switchAnyway) return "dirty";
     setNotice("This note could not be saved before switching sessions.");
     return "cancel";
-  }, [persistence]);
+  }, [persistence, sessionTouchBarrier]);
 
   /**
    * Stop accepting edits so the async gap before navigation cannot stage/save more text.
@@ -3055,7 +3055,13 @@ function LabEditorSession() {
     } catch {
       flushed = false;
     }
-    if (flushed || allowDirtySwitch) return true;
+    if (flushed || allowDirtySwitch) {
+      // dispose() can perform a retry after the first pre-navigation flush
+      // failed. That retry enqueues the session metadata touch synchronously
+      // from its health callback, so wait before reloading as well.
+      await sessionTouchBarrier.wait();
+      return true;
+    }
     const switchAnyway = window.confirm(
       "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
     );
@@ -3064,7 +3070,7 @@ function LabEditorSession() {
     // dispose() is irreversible; reload restores a live persistence controller.
     window.location.reload();
     return false;
-  }, [editor, persistence]);
+  }, [editor, persistence, sessionTouchBarrier]);
 
   const navigateToSession = useCallback((session: DocumentSession, hashOverride?: string) => {
     // Preserve an explicit local-link hash, including the legacy
@@ -3756,7 +3762,7 @@ function LabEditorSession() {
       void (async () => {
         editor?.setEditable(false, false);
         try {
-          await persistence.flush();
+          if (await persistence.flush()) await sessionTouchBarrier.wait();
         } catch {
           // Staged recovery drafts remain available via /recover after reload.
         }
@@ -3777,7 +3783,7 @@ function LabEditorSession() {
       window.removeEventListener("hashchange", rebindIfSessionChanged);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, sessionTouchBarrier]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3912,7 +3918,13 @@ function LabEditorSession() {
 
   useEffect(() => {
     const flush = () => {
-      void persistence.flush();
+      void (async () => {
+        try {
+          if (await persistence.flush()) await sessionTouchBarrier.wait();
+        } catch {
+          // Staged recovery drafts remain available if the page is being left.
+        }
+      })();
     };
     const onPageHide = () => flush();
     const onVisibilityChange = () => {
@@ -3925,7 +3937,7 @@ function LabEditorSession() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       flush();
     };
-  }, [persistence]);
+  }, [persistence, sessionTouchBarrier]);
 
   const onKeyDownCapture = (event: React.KeyboardEvent) => {
     if (imageCropTarget || imageMetadataTarget) return;
