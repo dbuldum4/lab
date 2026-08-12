@@ -38,9 +38,6 @@ export function commandAvailability(commandId: string, context: CommandContext):
   if (TABLE_COMMANDS.has(commandId) && !context.inTable) {
     return { available: false, reason: TABLE_REASON };
   }
-  if (commandId === "language" && !context.inCodeBlock) {
-    return { available: false, reason: "Place the caret inside a code block first." };
-  }
   if (commandId === "edit-link" && !context.inLink) {
     return { available: false, reason: "Place the caret inside a link first." };
   }
