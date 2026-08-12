@@ -41,11 +41,21 @@ async function resolveFile(root, requestPath) {
   }
 }
 
-export async function startStaticServer(rootDirectory, requestedPort = 0) {
+export async function startStaticServer(rootDirectory, requestedPort = 0, basePath = "") {
   const root = resolve(rootDirectory);
+  const normalizedBasePath = basePath
+    ? `/${basePath.replace(/^\/+|\/+$/g, "")}`
+    : "";
   const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    const file = await resolveFile(root, url.pathname);
+    const requestPath = normalizedBasePath === ""
+      ? url.pathname
+      : url.pathname === normalizedBasePath
+        ? "/"
+        : url.pathname.startsWith(`${normalizedBasePath}/`)
+          ? url.pathname.slice(normalizedBasePath.length)
+          : null;
+    const file = requestPath === null ? null : await resolveFile(root, requestPath);
     if (!file) {
       response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       response.end("Not found");
@@ -75,12 +85,13 @@ const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
 if (invokedPath === fileURLToPath(import.meta.url)) {
   const root = process.argv[2];
   const port = Number.parseInt(process.argv[3] ?? "3101", 10);
-  if (!root || !Number.isInteger(port) || port < 1 || port > 65_535) {
-    console.error("Usage: node scripts/perf/static-server.mjs <directory> [port]");
+  const basePath = process.argv[4] ?? "";
+  if (!root || !Number.isInteger(port) || port < 1 || port > 65_535 || (basePath && !basePath.startsWith("/"))) {
+    console.error("Usage: node scripts/perf/static-server.mjs <directory> [port] [basePath]");
     process.exit(64);
   }
-  const running = await startStaticServer(root, port);
-  console.log(`Serving ${resolve(root)} at ${running.url}`);
+  const running = await startStaticServer(root, port, basePath);
+  console.log(`Serving ${resolve(root)} at ${running.url}${basePath}`);
   const stop = async () => {
     await running.close();
     process.exit(0);
