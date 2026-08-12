@@ -789,10 +789,13 @@ test("Chromium quota override fails closed or degrades safely, then self-heals a
 
     const markdown = "quota recovery draft";
     await editor.fill(markdown);
-    await expect(page.getByRole("status")).toContainText(
+    const saveNotice = page.getByTestId("editor-notice");
+    await expect(saveNotice).toContainText(
       /could not be saved locally|one or more local copies could not be updated/,
       { timeout: 15000 },
     );
+    await expect(saveNotice).toHaveAttribute("role", "alert");
+    await expect(saveNotice).toHaveAttribute("aria-live", "assertive");
 
     const constrained = await backendState(page);
     if (constrained.authority) {

@@ -335,9 +335,14 @@ test("oversized images are rejected with a notice", async ({ page }) => {
     element.dispatchEvent(new Event("change", { bubbles: true }));
   });
 
-  await expect(page.locator(".editor-notice")).toContainText(/too large to store locally/i, {
+  const notice = page.getByTestId("editor-notice");
+  await expect(notice).toContainText(/too large to store locally/i, {
     timeout: 10000,
   });
+  await expect(notice).toHaveAttribute("role", "alert");
+  await expect(notice).toHaveAttribute("aria-live", "assertive");
+  await notice.getByRole("button", { name: "Dismiss notification" }).click();
+  await expect(notice).toBeHidden();
   await expect(editor.locator("img.lab-image")).toHaveCount(0);
 });
 
