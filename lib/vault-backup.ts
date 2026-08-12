@@ -25,6 +25,7 @@ export const MAX_VAULT_BACKUP_BYTES = 64 * 1024 * 1024;
 const ASSET_URI_PREFIX = "lab-asset://";
 const ASSET_ID_PATTERN = /^asset-[a-z0-9_-]{1,64}$/;
 const DOCUMENT_ID_PATTERN = /^[a-zA-Z0-9_-]{1,96}$/;
+const DATA_IMAGE_URL_PATTERN = /data:image\/[a-z0-9.+-]+(?:;[a-z0-9!#$&^_.+-]+)*,[^\s)]+/gi;
 const MARKDOWN_DATA_IMAGE_PATTERN = /(!\[(?:\\.|[^\]\\\r\n])*\]\(\s*)(data:image\/[a-z0-9.+-]+(?:;[a-z0-9!#$&^_.+-]+)*,[^\s)]+)(?=\s*(?:"(?:[^"\\]|\\.)*")?\s*\))/gi;
 const MARKDOWN_ASSET_IMAGE_PATTERN = /(!\[(?:\\.|[^\]\\\r\n])*\]\(\s*)(lab-asset:\/\/[a-z0-9_-]{1,64})(?=\s*(?:"(?:[^"\\]|\\.)*")?\s*\))/g;
 const MAX_SESSIONS = 2_000;
@@ -843,7 +844,7 @@ export function backupAssetUri(id: string) {
 export function countEmbeddedLocalImages(markdown: string) {
   let count = 0;
   transformMarkdownOutsideCode(markdown, (segment) => {
-    count += [...segment.matchAll(MARKDOWN_DATA_IMAGE_PATTERN)].length;
+    count += [...segment.matchAll(DATA_IMAGE_URL_PATTERN)].length;
     return segment;
   });
   return count;
