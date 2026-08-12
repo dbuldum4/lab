@@ -10,12 +10,19 @@ export function resolvePlaywrightCommand(rootDirectory, platform = process.platf
   return resolve(rootDirectory, "node_modules", ".bin", executable);
 }
 
+export function shouldUseShell(platform = process.platform) {
+  return platform === "win32";
+}
+
 function run(command, args, extraEnvironment = {}) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(command, args, {
       cwd: projectRoot,
       env: { ...process.env, ...extraEnvironment },
       stdio: "inherit",
+      // npm exposes Playwright as a .cmd shim on Windows; cmd.exe is required
+      // to execute that file through child_process.spawn.
+      shell: shouldUseShell(),
     });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
