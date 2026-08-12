@@ -3854,7 +3854,9 @@ function LabEditorSession() {
             : openedWithInvalidSessionHash
               ? "That session link was invalid. Opened the original note."
               : null;
-        setNotice(loadNotice);
+        // A healthy inspection has no message to publish. Avoid turning that
+        // absence into a destructive `setNotice(null)` that can race a command.
+        if (loadNotice) setNotice(loadNotice);
       } catch {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       }
