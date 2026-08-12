@@ -166,7 +166,7 @@ test("synchronous activity touches survive a blocked metadata lock", async () =>
   const touched = touchDocumentSessionSync(draft.id);
   assert.equal(touched.id, draft.id);
   assert.ok(touched.updatedAt > draft.updatedAt);
-  assert.equal((await getDocumentSession(draft.id))?.updatedAt, touched.updatedAt);
+  assert.equal(listDocumentSessions().find((session) => session.id === draft.id)?.updatedAt, touched.updatedAt);
 });
 
 test("legacy session rows receive safe metadata defaults", async () => {
