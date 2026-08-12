@@ -30,6 +30,8 @@ import {
   LinkEditorPanel,
   ShortcutsPanel,
   StatsPanel,
+  trapTabWithin,
+  useModalFocusTrap,
 } from "@/components/editor-feature-panels";
 import {
   createEditorPersistenceController,
@@ -1310,6 +1312,7 @@ const LabImage = Image.extend({
           button.addEventListener("pointerdown", (event) => {
             event.preventDefault();
             event.stopPropagation();
+            button.focus({ preventScroll: true });
           });
           button.addEventListener("click", (event) => {
             event.preventDefault();
@@ -1491,6 +1494,7 @@ function resizeCropRect(initial: CropRect, handle: CropHandle, delta: CropPoint)
 
 function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) {
   const dialogRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const interactionRef = useRef<CropInteraction | null>(null);
@@ -1500,9 +1504,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    dialogRef.current?.focus();
-  }, []);
+  useModalFocusTrap(dialogRef, closeButtonRef, onCancel);
 
   const updateRect = useCallback((next: CropRect) => {
     rectRef.current = next;
@@ -1622,34 +1624,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
             onCancel();
             return;
           }
-          if (event.key !== "Tab") return;
-
-          const dialog = dialogRef.current;
-          if (!dialog) return;
-          const focusable = Array.from(
-            dialog.querySelectorAll<HTMLElement>(
-              "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
-            ),
-          ).filter((element) => element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
-          if (focusable.length === 0) {
-            event.preventDefault();
-            dialog.focus();
-            return;
-          }
-
-          const first = focusable[0];
-          const last = focusable[focusable.length - 1];
-          const active = document.activeElement;
-          const movingBackward = event.shiftKey;
-          if (
-            active === dialog
-            || !dialog.contains(active)
-            || (movingBackward && active === first)
-            || (!movingBackward && active === last)
-          ) {
-            event.preventDefault();
-            (movingBackward ? last : first).focus();
-          }
+          trapTabWithin(event, dialogRef.current);
         }}
       >
         <div className="image-crop-header">
@@ -1657,7 +1632,15 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
             <h2 id="image-crop-title">Crop image</h2>
             <p>Drag to choose the visible area.</p>
           </div>
-          <button type="button" className="image-crop-close" aria-label="Close crop editor" onClick={onCancel}>×</button>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            className="image-crop-close"
+            aria-label="Close crop editor"
+            onClick={onCancel}
+          >
+            ×
+          </button>
         </div>
         <div
           ref={stageRef}
@@ -4223,13 +4206,11 @@ function LabEditorSession() {
     }
     instance.commands.setNodeSelection(target.pos);
     instance.commands.updateAttributes("image", { src: dataUrl, width: null, height: null });
-    instance.commands.focus();
     setImageCropTarget(null);
   }, [imageCropTarget]);
 
   const cancelImageCrop = useCallback(() => {
     setImageCropTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const applyImageMetadata = useCallback((metadata: { alt: string; title: string }) => {
@@ -4247,13 +4228,11 @@ function LabEditorSession() {
       title: metadata.title.trim() || null,
     });
     setImageMetadataTarget(null);
-    instance.commands.focus();
     setNotice("Updated image alt text and title.");
   }, [imageMetadataTarget]);
 
   const cancelImageMetadata = useCallback(() => {
     setImageMetadataTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
