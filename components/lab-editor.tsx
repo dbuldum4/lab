@@ -21,15 +21,14 @@ import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
 import { NodeSelection, type Transaction } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import { BorderBeam } from "border-beam";
 import katex from "katex";
-import { LayoutGroup, motion, type Transition } from "motion/react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  CommandPalette,
+  type LinkEditorState,
+} from "@/components/command-palette";
 import {
   ImageMetadataDialog,
-  LinkEditorPanel,
-  ShortcutsPanel,
-  StatsPanel,
   trapTabWithin,
   useModalFocusTrap,
 } from "@/components/editor-feature-panels";
@@ -48,7 +47,6 @@ import {
   type LocalRecoveryDraft,
   type StorageHealth,
 } from "@/lib/local-vault";
-import { formatStorageEstimate } from "@/lib/storage-estimate";
 import {
   VAULT_BACKUP_FILENAME,
   MAX_VAULT_BACKUP_BYTES,
@@ -64,15 +62,8 @@ import {
 } from "@/lib/editor-transactions";
 import {
   commandAvailability,
-  rankCommands,
   type CommandContext,
 } from "@/lib/command-availability";
-import {
-  COMMANDS,
-  KEYBOARD_SHORTCUTS,
-  isDynamicCommandVisible,
-  type Command,
-} from "@/lib/command-registry";
 import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
@@ -97,8 +88,6 @@ import { calculateDocumentStats, type DocumentStats } from "@/lib/document-stats
 import { EditorBlockExtensions } from "@/lib/editor-blocks";
 import { markdownExportFilename } from "@/lib/export-filename";
 import {
-  normalizeSearchQuery,
-  searchMatchRanges,
   searchableMarkdown,
   searchLocalDocuments,
   type LocalSearchDocument,
@@ -137,35 +126,17 @@ import {
   themeFromDocument,
   type ThemeId,
 } from "@/lib/theme";
-
-type SlashRange = { from: number; to: number };
-type PaletteMode =
-  | "commands"
-  | "status"
-  | "confirm-clear"
-  | "confirm-delete"
-  | "confirm-import"
-  | "name"
-  | "sessions"
-  | "archives"
-  | "link-session"
-  | "search"
-  | "stats"
-  | "shortcuts"
-  | "language"
-  | "theme"
-  | "backlinks"
-  | "history"
-  | "link-editor";
-type PaletteAnchor = { left: number; top: number; bottom: number };
-type PaletteState = {
-  query: string;
-  range: SlashRange;
-  left: number;
-  top: number;
-  mode: PaletteMode;
-  anchor: PaletteAnchor;
-};
+import {
+  CODE_LANGUAGES,
+  COMMANDS,
+  filterCommands,
+  filterThemes,
+  PALETTE_ID,
+  rankCommandOptions,
+  type Command,
+  type PaletteMode,
+  type PaletteState,
+} from "@/lib/command-palette";
 
 type PendingMarkdownImport = {
   markdown: string;
@@ -197,13 +168,6 @@ type ImageMetadataTarget = {
   title: string;
 };
 
-type LinkEditorState = {
-  from: number;
-  to: number;
-  label: string;
-  href: string;
-};
-
 type CropRect = {
   x: number;
   y: number;
@@ -232,44 +196,6 @@ const CROP_HANDLES: CropHandle[] = [
   "left",
 ];
 
-const SLASH_PALETTE_INITIAL = {
-  opacity: 0,
-  transform: "translateY(0px) scale(0.93)",
-};
-const SLASH_PALETTE_TRANSITION: Transition = {
-  type: "spring",
-  stiffness: 560,
-  damping: 34,
-  mass: 0.62,
-};
-const SLASH_SELECTION_TRANSITION: Transition = {
-  type: "spring",
-  stiffness: 480,
-  damping: 35,
-  mass: 0.58,
-};
-
-const CODE_LANGUAGES = [
-  { id: "", label: "Plain text" },
-  { id: "typescript", label: "TypeScript" },
-  { id: "javascript", label: "JavaScript" },
-  { id: "tsx", label: "TSX" },
-  { id: "jsx", label: "JSX" },
-  { id: "python", label: "Python" },
-  { id: "bash", label: "Shell" },
-  { id: "json", label: "JSON" },
-  { id: "html", label: "HTML" },
-  { id: "css", label: "CSS" },
-  { id: "sql", label: "SQL" },
-  { id: "rust", label: "Rust" },
-  { id: "go", label: "Go" },
-  { id: "java", label: "Java" },
-  { id: "c", label: "C" },
-  { id: "cpp", label: "C++" },
-  { id: "yaml", label: "YAML" },
-  { id: "markdown", label: "Markdown" },
-] as const;
-
 const EMPTY_COMMAND_CONTEXT: CommandContext = {
   inTable: false,
   inCodeBlock: false,
@@ -287,7 +213,6 @@ function commandContextFromEditor(instance: Editor): CommandContext {
     selectedImage: selection instanceof NodeSelection && selection.node.type.name === "image",
   };
 }
-
 const MarkdownLinkInput = Extension.create({
   name: "markdownLinkInput",
   addInputRules() {
@@ -510,7 +435,6 @@ const EMPTY_HEALTH: StorageHealth = {
   conflicts: 0,
   storageEstimate: null,
 };
-const PALETTE_ID = "slash-command-palette";
 const MATH_EDITOR_ID = "math-editor-popover";
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
 const INLINE_MATH_PATTERN = /^\$\$((?:\\\$|[^$\n])+?)\$\$$/;
@@ -742,20 +666,6 @@ function deleteMathNode(instance: Editor, current: MathEditorState) {
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
-}
-
-function highlightSearchText(value: string, query: string): ReactNode {
-  const ranges = searchMatchRanges(value, query);
-  if (ranges.length === 0) return value;
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  ranges.forEach((range, index) => {
-    if (range.start > cursor) parts.push(<span key={`text-${index}`}>{value.slice(cursor, range.start)}</span>);
-    parts.push(<mark key={`match-${index}`}>{value.slice(range.start, range.end)}</mark>);
-    cursor = Math.max(cursor, range.end);
-  });
-  if (cursor < value.length) parts.push(<span key="text-tail">{value.slice(cursor)}</span>);
-  return parts;
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -1737,10 +1647,6 @@ function LabEditorSession() {
   const paletteElementRef = useRef<HTMLDivElement>(null);
   const mathEditorElementRef = useRef<HTMLDivElement>(null);
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
-  const sessionNameInputRef = useRef<HTMLInputElement>(null);
-  const searchInputRef = useRef<HTMLInputElement>(null);
-  const themeSearchInputRef = useRef<HTMLInputElement>(null);
-  const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1756,7 +1662,6 @@ function LabEditorSession() {
   );
   const mathEditorRef = useRef<MathEditorState | null>(null);
   const searchDocumentsRef = useRef<LocalSearchDocument[]>([]);
-  const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const searchIndexVersionRef = useRef(0);
   const searchComposingRef = useRef(false);
   const themeComposingRef = useRef(false);
@@ -1788,7 +1693,6 @@ function LabEditorSession() {
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
   const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
-  const formattedStorageEstimate = formatStorageEstimate(health.storageEstimate);
   const [latestMarkdown] = useState(() => {
     let value = "";
     return {
@@ -1875,7 +1779,6 @@ function LabEditorSession() {
       searchIndexVersionRef.current += 1;
       searchComposingRef.current = false;
       searchDocumentsRef.current = [];
-      searchResultRefs.current.clear();
       setSearchResults([]);
       setSearchLoading(false);
     }
@@ -2800,30 +2703,16 @@ function LabEditorSession() {
     onBlur: hideCaret,
   });
 
-  const rankedCommands = useMemo(() => {
-    if (!palette || palette.mode !== "commands") return [];
-    const commands = COMMANDS
-      .filter((command) => isDynamicCommandVisible(command.id, {
-        pinned: sessionPinned,
-        archived: sessionArchived,
-      }));
-    return rankCommands(commands, palette.query, commandContext);
-  }, [commandContext, palette, sessionArchived, sessionPinned]);
+  const filtered = useMemo(
+    () => filterCommands(palette, sessionPinned, sessionArchived, commandContext),
+    [commandContext, palette, sessionArchived, sessionPinned],
+  );
+  const rankedCommands = useMemo(
+    () => rankCommandOptions(palette, sessionPinned, sessionArchived, commandContext),
+    [commandContext, palette, sessionArchived, sessionPinned],
+  );
 
-  const filtered = useMemo(() => {
-    return rankedCommands
-      .filter(({ availability }) => availability.available)
-      .map(({ command }) => command);
-  }, [rankedCommands]);
-
-  const filteredThemes = useMemo(() => {
-    if (!palette || palette.mode !== "theme") return [];
-    const query = normalizeSearchQuery(palette.query);
-    if (!query) return [...THEMES];
-    return THEMES.filter((theme) => (
-      normalizeSearchQuery(`${theme.label} ${theme.detail}`).includes(query)
-    ));
-  }, [palette]);
+  const filteredThemes = useMemo(() => filterThemes(palette), [palette]);
 
   const mathError = useMemo(() => {
     if (!mathEditorState) return null;
@@ -2871,65 +2760,6 @@ function LabEditorSession() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [mathEditorIdentity]);
-
-  useEffect(() => {
-    if (palette?.mode !== "name") return;
-    const frame = window.requestAnimationFrame(() => {
-      sessionNameInputRef.current?.focus();
-      sessionNameInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "confirm-import" || importConfirming) return;
-    const frame = window.requestAnimationFrame(() => {
-      importConfirmButtonRef.current?.focus();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [importConfirming, palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "search") return;
-    const frame = window.requestAnimationFrame(() => {
-      searchInputRef.current?.focus();
-      searchInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "theme") return;
-    const frame = window.requestAnimationFrame(() => {
-      themeSearchInputRef.current?.focus();
-      themeSearchInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode]);
-
-  useEffect(() => {
-    if (palette?.mode !== "theme") return;
-    const activeThemeOption = filteredThemes[selected];
-    if (!activeThemeOption) return;
-    const frame = window.requestAnimationFrame(() => {
-      document
-        .getElementById(`${PALETTE_ID}-theme-${activeThemeOption.id}`)
-        ?.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [filteredThemes, palette?.mode, selected]);
-
-  useEffect(() => {
-    if (palette?.mode !== "search" || searchLoading) return;
-    const activeResult = searchResults[selected];
-    if (!activeResult) return;
-    const frame = window.requestAnimationFrame(() => {
-      searchResultRefs.current
-        .get(activeResult.documentId)
-        ?.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode, searchLoading, searchResults, selected]);
 
   useLayoutEffect(() => {
     repositionMathEditor();
@@ -4558,447 +4388,67 @@ function LabEditorSession() {
       <input ref={vaultBackupInputRef} hidden type="file" accept=".json,.lab-vault,application/json" tabIndex={-1} aria-hidden="true" onChange={onVaultRestore} />
       <input ref={imageInputRef} hidden type="file" accept="image/*" multiple tabIndex={-1} aria-hidden="true" onChange={onImageImport} />
 
-      {palette ? (
-        <div
-          ref={paletteElementRef}
-          className="command-palette-positioner"
-          style={{ left: Math.round(palette.left), top: Math.round(palette.top) }}
-        >
-          <motion.div
-            className="command-palette-motion"
-            initial={prefersReducedMotion ? { opacity: 0, transform: "none" } : SLASH_PALETTE_INITIAL}
-            animate={{ opacity: 1, transform: "translateY(0px) scale(1)" }}
-            transition={prefersReducedMotion ? { duration: 0.08, ease: [0.23, 1, 0.32, 1] } : SLASH_PALETTE_TRANSITION}
-          >
-          <BorderBeam
-            className="command-palette-frame"
-            size="line"
-            colorVariant="mono"
-            theme={THEMES.find((theme) => theme.id === activeTheme)?.colorScheme ?? "dark"}
-            staticColors
-            duration={3.2}
-            active={(palette.mode === "commands" || palette.mode === "search") && !prefersReducedMotion}
-            strength={0.42}
-            brightness={1.05}
-            saturation={0}
-            borderRadius={13}
-          >
-          <div
-            id={PALETTE_ID}
-            className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" || palette.mode === "confirm-import" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : palette.mode === "confirm-import" ? "Confirm Markdown import" : "Slash commands"}
-          >
-          {palette.mode === "commands" ? (
-            rankedCommands.length > 0 ? (
-              <LayoutGroup id="slash-command-selection">
-                <div className="command-list">
-                  {rankedCommands.map(({ command, availability }) => {
-                    const selectableIndex = availability.available
-                      ? filtered.findIndex((candidate) => candidate.id === command.id)
-                      : -1;
-                    const isSelected = selectableIndex >= 0 && selectableIndex === selected;
-                    const reasonId = `${PALETTE_ID}-${command.id}-reason`;
-                    return (
-                      <div
-                        className="command-item"
-                        data-motion-selection={isSelected}
-                        data-selected={isSelected}
-                        data-disabled={!availability.available}
-                        id={`${PALETTE_ID}-${command.id}`}
-                        key={command.id}
-                        role="option"
-                        aria-selected={isSelected}
-                        aria-disabled={!availability.available}
-                        aria-describedby={reasonId}
-                        onMouseDown={(event) => {
-                          event.preventDefault();
-                          if (availability.available) runCommand(command);
-                        }}
-                        onMouseEnter={() => {
-                          if (selectableIndex >= 0) setSelected(selectableIndex);
-                        }}
-                      >
-                        {isSelected ? (
-                          <motion.div
-                            className="command-selection-motion"
-                            layoutId="slash-command-selection"
-                            transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
-                            aria-hidden="true"
-                          />
-                        ) : null}
-                        <span>{command.label}</span>
-                        <small id={reasonId}>{availability.reason ?? command.detail}</small>
-                      </div>
-                    );
-                  })}
-                </div>
-              </LayoutGroup>
-            ) : (
-              <div className="palette-message">No command</div>
-            )
-          ) : palette.mode === "search" ? (
-            <div className="search-panel" data-testid="search-panel">
-              <div className="search-field">
-                <span className="search-field-prefix" aria-hidden="true">/</span>
-                <input
-                  ref={searchInputRef}
-                  type="search"
-                  role="combobox"
-                  aria-label="Search local notes"
-                  aria-expanded="true"
-                  aria-controls={`${PALETTE_ID}-results`}
-                  aria-activedescendant={!searchLoading && searchResults[selected]
-                    ? `${PALETTE_ID}-search-${searchResults[selected].documentId}`
-                    : undefined}
-                  aria-autocomplete="list"
-                  aria-haspopup="listbox"
-                  autoComplete="off"
-                  placeholder="Search sessions and note text"
-                  value={palette.query}
-                  onChange={(event) => updateSearchQuery(event.target.value)}
-                  onCompositionStart={() => { searchComposingRef.current = true; }}
-                  onCompositionEnd={() => { searchComposingRef.current = false; }}
-                />
-                <kbd>Esc</kbd>
-              </div>
-              <div className="search-summary" role="status" aria-live="polite">
-                {searchLoading
-                  ? "Indexing local notes…"
-                  : palette.query.trim()
-                    ? `${searchResults.length} ${searchResults.length === 1 ? "match" : "matches"}`
-                    : `${sessions.length} local ${sessions.length === 1 ? "session" : "sessions"}`}
-              </div>
-              <div id={`${PALETTE_ID}-results`} className="search-results" role="listbox" aria-label="Search results">
-                {searchLoading ? (
-                  <div className="search-empty">Reading verified local copies…</div>
-                ) : palette.query.trim() && searchResults.length > 0 ? (
-                  searchResults.map((result, index) => (
-                    <div
-                      ref={(element) => {
-                        if (element) searchResultRefs.current.set(result.documentId, element);
-                        else searchResultRefs.current.delete(result.documentId);
-                      }}
-                      className="search-result"
-                      data-testid="search-result"
-                      data-selected={index === selected}
-                      data-current={result.documentId === documentId}
-                      id={`${PALETTE_ID}-search-${result.documentId}`}
-                      key={result.documentId}
-                      role="option"
-                      aria-selected={index === selected}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        openSearchResult(result);
-                      }}
-                      onMouseEnter={() => setSelected(index)}
-                    >
-                      <div className="search-result-heading">
-                        <span>{highlightSearchText(result.name, palette.query)}</span>
-                        <small>
-                          {result.documentId === documentId ? "Current session · " : ""}
-                          {result.match === "name"
-                            ? "Session name"
-                            : result.match === "content"
-                              ? "Note text"
-                              : "Name + note text"}
-                        </small>
-                      </div>
-                      <div className="search-result-excerpt">
-                        {highlightSearchText(result.excerpt || "Session name match", palette.query)}
-                      </div>
-                    </div>
-                  ))
-                ) : palette.query.trim() ? (
-                  <div className="search-empty">No local notes match “{palette.query.trim()}”.</div>
-                ) : (
-                  <div className="search-empty">Search session names and the text of every local note.</div>
-                )}
-              </div>
-              <div className="search-footer">↑↓ move · Enter open · Esc close · local only</div>
-            </div>
-          ) : palette.mode === "name" ? (
-            <div className="session-name-panel">
-              <label htmlFor="session-name-input">Session name</label>
-              <input
-                ref={sessionNameInputRef}
-                id="session-name-input"
-                value={sessionName}
-                maxLength={80}
-                autoComplete="off"
-                onChange={(event) => setSessionName(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    submitSessionName();
-                  }
-                }}
-              />
-              <small>Enter to save · Esc to cancel</small>
-            </div>
-          ) : palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" ? (
-            <div className="command-list session-list" data-testid="session-list">
-              {sessions.length > 0 ? sessions.map((session, index) => (
-                <div
-                  className="command-item"
-                  data-selected={index === selected}
-                  data-current={session.id === documentId}
-                  id={`${PALETTE_ID}-session-${session.id}`}
-                  key={session.id}
-                  role="option"
-                  aria-selected={index === selected}
-                  aria-current={session.id === documentId ? "true" : undefined}
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    if (palette.mode === "link-session") {
-                      insertSessionLink(session);
-                    } else if (session.id === documentId) {
-                      setPalette(null);
-                      editor?.commands.focus();
-                    } else {
-                      void resumeSession(session);
-                    }
-                  }}
-                  onMouseEnter={() => setSelected(index)}
-                >
-                  <span>{session.pinned ? "◆ " : ""}{session.name}</span>
-                  <small>
-                    {palette.mode === "link-session"
-                      ? session.archived ? "Archived · insert local link" : "Insert local link"
-                      : session.id === documentId
-                        ? "Current session"
-                        : session.updatedAt > 0 ? new Date(session.updatedAt).toLocaleString() : "Original session"}
-                  </small>
-                </div>
-              )) : (
-                <div className="palette-message">
-                  <span>{palette.mode === "archives" ? "No archived sessions" : palette.mode === "link-session" ? "No other sessions to link" : "No sessions"}</span>
-                  <small>Esc to return to the editor</small>
-                </div>
-              )}
-            </div>
-          ) : palette.mode === "stats" ? (
-            <StatsPanel stats={stats} />
-          ) : palette.mode === "shortcuts" ? (
-            <ShortcutsPanel shortcuts={KEYBOARD_SHORTCUTS} />
-          ) : palette.mode === "language" ? (
-            <div className="command-list language-list" data-testid="language-list">
-              {CODE_LANGUAGES.map((language, index) => (
-                <div
-                  className="command-item"
-                  data-selected={index === selected}
-                  id={`${PALETTE_ID}-language-${language.id || "plain"}`}
-                  key={language.id || "plain"}
-                  role="option"
-                  aria-selected={index === selected}
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    chooseCodeLanguage(language.id);
-                  }}
-                  onMouseEnter={() => setSelected(index)}
-                >
-                  <span>{language.label}</span>
-                  <small>{language.id ? `\`\`\`${language.id}` : "No fence identifier"}</small>
-                </div>
-              ))}
-            </div>
-          ) : palette.mode === "theme" ? (
-            <div className="theme-panel" data-testid="theme-panel">
-              <div className="search-field">
-                <span className="search-field-prefix" aria-hidden="true">◐</span>
-                <input
-                  ref={themeSearchInputRef}
-                  type="search"
-                  role="combobox"
-                  aria-label="Search themes"
-                  aria-expanded="true"
-                  aria-controls={`${PALETTE_ID}-theme-results`}
-                  aria-activedescendant={filteredThemes[selected]
-                    ? `${PALETTE_ID}-theme-${filteredThemes[selected].id}`
-                    : undefined}
-                  aria-autocomplete="list"
-                  aria-haspopup="listbox"
-                  autoComplete="off"
-                  placeholder="Search themes"
-                  value={palette.query}
-                  onCompositionStart={() => { themeComposingRef.current = true; }}
-                  onCompositionEnd={() => { themeComposingRef.current = false; }}
-                  onChange={(event) => {
-                    setSelected(0);
-                    setPalette({ ...palette, query: event.target.value });
-                  }}
-                />
-                <kbd>Esc</kbd>
-              </div>
-              <div
-                id={`${PALETTE_ID}-theme-results`}
-                className="command-list theme-list"
-                data-testid="theme-list"
-                role="listbox"
-                aria-label="Theme results"
-                tabIndex={-1}
-              >
-                {filteredThemes.length > 0 ? filteredThemes.map((theme, index) => (
-                  <div
-                    className="command-item theme-item"
-                    data-selected={index === selected}
-                    data-current={theme.id === activeTheme}
-                    id={`${PALETTE_ID}-theme-${theme.id}`}
-                    key={theme.id}
-                    role="option"
-                    aria-selected={index === selected}
-                    aria-current={theme.id === activeTheme ? "true" : undefined}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      chooseTheme(theme.id);
-                    }}
-                    onMouseEnter={() => setSelected(index)}
-                  >
-                    <span className="theme-label">
-                      <span className="theme-swatches" aria-hidden="true">
-                        {theme.swatches.map((color) => (
-                          <span key={color} style={{ backgroundColor: color }} />
-                        ))}
-                      </span>
-                      {theme.label}
-                    </span>
-                    <small>{theme.id === activeTheme ? "Current" : theme.detail}</small>
-                  </div>
-                )) : (
-                  <div className="search-empty">No themes match “{palette.query.trim()}”.</div>
-                )}
-              </div>
-              <div className="search-footer theme-footer">
-                <span>{filteredThemes.length} {filteredThemes.length === 1 ? "theme" : "themes"} · ↑↓ move · Enter select</span>
-                <a href="./third-party-notices/" target="_blank" rel="noreferrer">Licenses</a>
-              </div>
-            </div>
-          ) : palette.mode === "backlinks" ? (
-            <div className="feature-list-panel" data-testid="backlinks-panel">
-              <div className="feature-list-header">
-                <span>Backlinks</span>
-                <small>{backlinksLoading ? "Reading local notes…" : `${backlinks.length} incoming ${backlinks.length === 1 ? "link" : "links"}`}</small>
-              </div>
-              <div className="command-list feature-result-list">
-                {backlinksLoading ? (
-                  <div className="palette-message"><span>Finding links…</span><small>Verified local copies only</small></div>
-                ) : backlinks.length > 0 ? backlinks.map((backlink, index) => (
-                  <div
-                    className="command-item feature-result-item"
-                    data-selected={index === selected}
-                    id={`${PALETTE_ID}-backlink-${backlink.documentId}`}
-                    key={backlink.documentId}
-                    role="option"
-                    aria-selected={index === selected}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      openBacklink(backlink);
-                    }}
-                    onMouseEnter={() => setSelected(index)}
-                  >
-                    <span>{backlink.name}</span>
-                    <small>{backlink.excerpt}</small>
-                  </div>
-                )) : (
-                  <div className="palette-message"><span>No backlinks yet</span><small>Use /link-note in another session to create one</small></div>
-                )}
-              </div>
-            </div>
-          ) : palette.mode === "history" ? (
-            <div className="feature-list-panel" data-testid="version-history-panel">
-              <div className="feature-list-header">
-                <span>Version history</span>
-                <small>{versions.length} local {versions.length === 1 ? "version" : "versions"}</small>
-              </div>
-              <div className="command-list feature-result-list">
-                {versions.length > 0 ? versions.map((version, index) => {
-                  const versionStats = calculateDocumentStats(version.markdown);
-                  return (
-                    <div
-                      className="command-item feature-result-item"
-                      data-selected={index === selected}
-                      id={`${PALETTE_ID}-version-${version.id}`}
-                      key={version.id}
-                      role="option"
-                      aria-selected={index === selected}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        restoreHistoryVersion(version);
-                      }}
-                      onMouseEnter={() => setSelected(index)}
-                    >
-                      <span>{new Date(version.createdAt).toLocaleString()}</span>
-                      <small>{versionStats.words} {versionStats.words === 1 ? "word" : "words"} · Enter to restore</small>
-                    </div>
-                  );
-                }) : (
-                  <div className="palette-message"><span>No saved versions yet</span><small>Versions appear after durable local saves</small></div>
-                )}
-              </div>
-            </div>
-          ) : palette.mode === "link-editor" && linkEditorState ? (
-            <LinkEditorPanel
-              label={linkEditorState.label}
-              href={linkEditorState.href}
-              onLabelChange={(label) => setLinkEditorState((current) => current ? { ...current, label } : current)}
-              onHrefChange={(href) => setLinkEditorState((current) => current ? { ...current, href } : current)}
-              onSave={() => saveEditedLink(linkEditorState.label, linkEditorState.href)}
-              onRemove={removeEditedLink}
-              onCancel={() => {
-                setLinkEditorState(null);
-                setPalette(null);
-                editor?.commands.focus();
-              }}
-              saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
-            />
-          ) : palette.mode === "confirm-import" ? (
-            <div className="palette-message palette-confirm" data-testid="confirm-import">
-              <span>Replace this note with “{pendingMarkdownImport?.fileName || "the selected Markdown file"}”?</span>
-              <small>The current note will be kept in version history.</small>
-              <div className="feature-form-actions">
-                <button
-                  ref={importConfirmButtonRef}
-                  type="button"
-                  className="feature-button feature-button-primary"
-                  disabled={importConfirming}
-                  onClick={() => { void confirmMarkdownImport(); }}
-                >
-                  Import file
-                </button>
-                <button
-                  type="button"
-                  className="feature-button"
-                  disabled={importConfirming}
-                  onClick={() => cancelMarkdownImport()}
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          ) : palette.mode === "confirm-clear" ? (
-            <div className="palette-message palette-confirm">
-              <span>Clear the note?</span>
-              <small>Press Enter to confirm · Esc to keep it</small>
-            </div>
-          ) : palette.mode === "confirm-delete" ? (
-            <div className="palette-message palette-confirm" data-testid="confirm-delete">
-              <span>Delete this session permanently?</span>
-              <small>Press Enter to confirm · Esc to keep it</small>
-            </div>
-          ) : (
-            <div className="palette-message storage-message" data-testid="storage-status">
-              <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>
-              <small>{health.labels.join(" · ") || "Storage is unavailable"}</small>
-              {health.conflicts > 0 ? <small>{health.conflicts} recoverable {health.conflicts === 1 ? "draft" : "drafts"} · /recover to export</small> : null}
-              {formattedStorageEstimate ? <small>Approximate browser storage: {formattedStorageEstimate}</small> : null}
-              <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"} · no network access</small>
-            </div>
-          )}
-          </div>
-          </BorderBeam>
-          </motion.div>
-        </div>
-      ) : null}
+      <CommandPalette
+        palette={palette}
+        paletteElementRef={paletteElementRef}
+        selected={selected}
+        commandContext={commandContext}
+        sessionPinned={sessionPinned}
+        sessionArchived={sessionArchived}
+        activeTheme={activeTheme}
+        prefersReducedMotion={prefersReducedMotion}
+        sessions={sessions}
+        documentId={documentId}
+        searchResults={searchResults}
+        searchLoading={searchLoading}
+        stats={stats}
+        backlinks={backlinks}
+        backlinksLoading={backlinksLoading}
+        versions={versions}
+        health={health}
+        sessionName={sessionName}
+        linkEditorState={linkEditorState}
+        pendingMarkdownImport={pendingMarkdownImport}
+        importConfirming={importConfirming}
+        setPalette={setPalette}
+        setSelected={setSelected}
+        setSessionName={setSessionName}
+        updateSearchQuery={updateSearchQuery}
+        submitSessionName={submitSessionName}
+        runCommand={runCommand}
+        openSearchResult={openSearchResult}
+        onSessionSelect={(session, mode) => {
+          if (mode === "link-session") {
+            insertSessionLink(session);
+          } else if (session.id === documentId) {
+            setPalette(null);
+            editor?.commands.focus();
+          } else {
+            void resumeSession(session);
+          }
+        }}
+        chooseCodeLanguage={chooseCodeLanguage}
+        chooseTheme={chooseTheme}
+        openBacklink={openBacklink}
+        restoreHistoryVersion={restoreHistoryVersion}
+        onLinkLabelChange={(label) => setLinkEditorState((current) => current ? { ...current, label } : current)}
+        onLinkHrefChange={(href) => setLinkEditorState((current) => current ? { ...current, href } : current)}
+        saveEditedLink={() => {
+          if (linkEditorState) saveEditedLink(linkEditorState.label, linkEditorState.href);
+        }}
+        removeEditedLink={removeEditedLink}
+        cancelLinkEditor={() => {
+          setLinkEditorState(null);
+          setPalette(null);
+          editor?.commands.focus();
+        }}
+        confirmMarkdownImport={confirmMarkdownImport}
+        cancelMarkdownImport={cancelMarkdownImport}
+        onSearchCompositionStart={() => { searchComposingRef.current = true; }}
+        onSearchCompositionEnd={() => { searchComposingRef.current = false; }}
+        onThemeCompositionStart={() => { themeComposingRef.current = true; }}
+        onThemeCompositionEnd={() => { themeComposingRef.current = false; }}
+      />
       {notice ? (
         <div
           className="editor-notice"
