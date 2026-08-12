@@ -19,6 +19,7 @@
     "test:perf": "npm run test:perf:unit && npm run test:perf:e2e",
     "test:perf:all": "npm run test:perf && npm run test:perf:extended",
     "perf:score": "node scripts/perf/run-browser-suite.mjs score",
+    "test:static-export": "node scripts/static-export-smoke.mjs",
     "test:model": "node --experimental-strip-types --test lib/local-vault.model.test.ts",
     "test": "npm run test:fast",
     "test:e2e": "playwright test --grep-invert \"@stress|@perf\"",
