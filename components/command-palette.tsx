@@ -11,19 +11,22 @@ import {
   PALETTE_ID,
   paletteLabel,
   paletteRole,
+  rankCommandOptions,
   type Command,
   type PaletteMode,
   type PaletteState,
 } from "@/lib/command-palette";
+import type { CommandContext } from "@/lib/command-availability";
 import { StatsPanel, ShortcutsPanel, LinkEditorPanel } from "@/components/editor-feature-panels";
 import { calculateDocumentStats, type DocumentStats } from "@/lib/document-stats";
 import type { DocumentSession } from "@/lib/document-sessions";
 import type { LocalSearchResult } from "@/lib/local-search";
-import { normalizeSearchQuery } from "@/lib/local-search";
+import { searchMatchRanges } from "@/lib/local-search";
 import type { Backlink } from "@/lib/note-links";
 import type { VersionHistoryEntry } from "@/lib/version-history";
 import { THEMES, type ThemeId } from "@/lib/theme";
 import type { StorageHealth } from "@/lib/local-vault";
+import { formatStorageEstimate } from "@/lib/storage-estimate";
 
 export type LinkEditorState = {
   from: number;
@@ -55,6 +58,7 @@ export type CommandPaletteProps = {
   palette: PaletteState | null;
   paletteElementRef: RefObject<HTMLDivElement | null>;
   selected: number;
+  commandContext: CommandContext;
   sessionPinned: boolean;
   sessionArchived: boolean;
   activeTheme: ThemeId;
@@ -70,6 +74,8 @@ export type CommandPaletteProps = {
   health: StorageHealth;
   sessionName: string;
   linkEditorState: LinkEditorState | null;
+  pendingMarkdownImport: { fileName: string } | null;
+  importConfirming: boolean;
   setPalette: (value: PaletteState | null) => void;
   setSelected: (value: number) => void;
   setSessionName: (value: string) => void;
@@ -87,32 +93,33 @@ export type CommandPaletteProps = {
   saveEditedLink: () => void;
   removeEditedLink: () => void;
   cancelLinkEditor: () => void;
+  confirmMarkdownImport: () => Promise<void>;
+  cancelMarkdownImport: () => void;
   onSearchCompositionStart: () => void;
   onSearchCompositionEnd: () => void;
   onThemeCompositionStart: () => void;
   onThemeCompositionEnd: () => void;
 };
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function highlightSearchText(value: string, query: string): ReactNode {
-  const terms = [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))]
-    .sort((left, right) => right.length - left.length);
-  if (terms.length === 0) return value;
-  const matcher = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
-  return value.split(matcher).map((part, index) => (
-    terms.includes(part.toLowerCase())
-      ? <mark key={`${part}-${index}`}>{part}</mark>
-      : <span key={`${part}-${index}`}>{part}</span>
-  ));
+  const ranges = searchMatchRanges(value, query);
+  if (ranges.length === 0) return value;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  ranges.forEach((range, index) => {
+    if (range.start > cursor) parts.push(<span key={`text-${index}`}>{value.slice(cursor, range.start)}</span>);
+    parts.push(<mark key={`match-${index}`}>{value.slice(range.start, range.end)}</mark>);
+    cursor = Math.max(cursor, range.end);
+  });
+  if (cursor < value.length) parts.push(<span key="text-tail">{value.slice(cursor)}</span>);
+  return parts;
 }
 
 export function CommandPalette({
   palette,
   paletteElementRef,
   selected,
+  commandContext,
   sessionPinned,
   sessionArchived,
   activeTheme,
@@ -128,6 +135,8 @@ export function CommandPalette({
   health,
   sessionName,
   linkEditorState,
+  pendingMarkdownImport,
+  importConfirming,
   setPalette,
   setSelected,
   setSessionName,
@@ -145,6 +154,8 @@ export function CommandPalette({
   saveEditedLink,
   removeEditedLink,
   cancelLinkEditor,
+  confirmMarkdownImport,
+  cancelMarkdownImport,
   onSearchCompositionStart,
   onSearchCompositionEnd,
   onThemeCompositionStart,
@@ -153,9 +164,12 @@ export function CommandPalette({
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
+  const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
-  const filtered = filterCommands(palette, sessionPinned, sessionArchived);
+  const rankedCommands = rankCommandOptions(palette, sessionPinned, sessionArchived, commandContext);
+  const filtered = filterCommands(palette, sessionPinned, sessionArchived, commandContext);
   const filteredThemes = filterThemes(palette);
+  const formattedStorageEstimate = formatStorageEstimate(health.storageEstimate);
 
   useEffect(() => {
     if (palette?.mode !== "name" && palette?.mode !== "search" && palette?.mode !== "theme") return;
@@ -170,6 +184,14 @@ export function CommandPalette({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "confirm-import" || importConfirming) return;
+    const frame = window.requestAnimationFrame(() => {
+      importConfirmButtonRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [importConfirming, palette?.mode]);
 
   useEffect(() => {
     if (palette?.mode !== "theme") return;
@@ -234,25 +256,35 @@ export function CommandPalette({
             aria-label={paletteLabel(palette.mode)}
           >
             {palette.mode === "commands" ? (
-              filtered.length > 0 ? (
+              rankedCommands.length > 0 ? (
                 <LayoutGroup id="slash-command-selection">
                   <div className="command-list">
-                    {filtered.map((command, index) => (
-                      <div
+                    {rankedCommands.map(({ command, availability }) => {
+                      const selectableIndex = availability.available
+                        ? filtered.findIndex((candidate) => candidate.id === command.id)
+                        : -1;
+                      const isSelected = selectableIndex >= 0 && selectableIndex === selected;
+                      const reasonId = `${PALETTE_ID}-${command.id}-reason`;
+                      return <div
                         className="command-item"
-                        data-motion-selection="true"
-                        data-selected={index === selected}
+                        data-motion-selection={isSelected}
+                        data-selected={isSelected}
+                        data-disabled={!availability.available}
                         id={`${PALETTE_ID}-${command.id}`}
                         key={command.id}
                         role="option"
-                        aria-selected={index === selected}
+                        aria-selected={isSelected}
+                        aria-disabled={!availability.available}
+                        aria-describedby={availability.reason ? reasonId : undefined}
                         onMouseDown={(event) => {
                           event.preventDefault();
-                          runCommand(command);
+                          if (availability.available) runCommand(command);
                         }}
-                        onMouseEnter={() => setSelected(index)}
+                        onMouseEnter={() => {
+                          if (selectableIndex >= 0) setSelected(selectableIndex);
+                        }}
                       >
-                        {index === selected ? (
+                        {isSelected ? (
                           <motion.div
                             className="command-selection-motion"
                             layoutId="slash-command-selection"
@@ -261,9 +293,9 @@ export function CommandPalette({
                           />
                         ) : null}
                         <span>{command.label}</span>
-                        <small>{command.detail}</small>
+                        <small id={reasonId}>{availability.reason ?? command.detail}</small>
                       </div>
-                    ))}
+                    })}
                   </div>
                 </LayoutGroup>
               ) : (
@@ -572,6 +604,30 @@ export function CommandPalette({
                 onCancel={cancelLinkEditor}
                 saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
               />
+            ) : palette.mode === "confirm-import" ? (
+              <div className="palette-message palette-confirm" data-testid="confirm-import">
+                <span>Replace this note with “{pendingMarkdownImport?.fileName || "the selected Markdown file"}”?</span>
+                <small>The current note will be kept in version history.</small>
+                <div className="feature-form-actions">
+                  <button
+                    ref={importConfirmButtonRef}
+                    type="button"
+                    className="feature-button feature-button-primary"
+                    disabled={importConfirming}
+                    onClick={() => { void confirmMarkdownImport(); }}
+                  >
+                    Import file
+                  </button>
+                  <button
+                    type="button"
+                    className="feature-button"
+                    disabled={importConfirming}
+                    onClick={cancelMarkdownImport}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
             ) : palette.mode === "confirm-clear" ? (
               <div className="palette-message palette-confirm">
                 <span>Clear the note?</span>
@@ -587,6 +643,7 @@ export function CommandPalette({
                 <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>
                 <small>{health.labels.join(" · ") || "Storage is unavailable"}</small>
                 {health.conflicts > 0 ? <small>{health.conflicts} recoverable {health.conflicts === 1 ? "draft" : "drafts"} · /recover to export</small> : null}
+                {formattedStorageEstimate ? <small>Approximate browser storage: {formattedStorageEstimate}</small> : null}
                 <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"} · no network access</small>
               </div>
             )}

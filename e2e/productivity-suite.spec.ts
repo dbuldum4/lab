@@ -1,14 +1,15 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { openEditor, waitForAuthority } from "./helpers";
+import { confirmMarkdownImport, openEditor, waitForAuthority } from "./helpers";
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-async function importMarkdown(page: Page, markdown: string) {
+async function importMarkdown(page: Page, markdown: string, confirm = false) {
   await page.locator('input[type="file"][accept*="markdown"]').setInputFiles({
     name: "productivity-suite.md",
     mimeType: "text/markdown",
     buffer: Buffer.from(markdown),
   });
+  if (confirm) await confirmMarkdownImport(page);
 }
 
 async function runSlash(page: Page, query: string) {
@@ -201,7 +202,7 @@ test("table row and column commands work in place and code language round-trips"
   await runSlash(page, "table-column-after");
   await expect(table.locator("tr").first().locator("th, td")).toHaveCount(4);
 
-  await importMarkdown(page, "```\nconst answer = 42;\n```");
+  await importMarkdown(page, "```\nconst answer = 42;\n```", true);
   const code = editor.locator("pre code");
   await expect(code).toHaveText("const answer = 42;");
   await code.click();
@@ -215,6 +216,32 @@ test("table row and column commands work in place and code language round-trips"
   await page.reload();
   const restored = await openEditor(page);
   await expect(restored.locator("pre code")).toHaveClass(/language-typescript/);
+});
+
+test("code language creates a code block from a paragraph", async ({ page }) => {
+  const editor = await openEditor(page);
+  await runSlash(page, "language");
+
+  const code = editor.locator("pre code");
+  await expect(code).toHaveCount(1);
+  await expect(page.getByRole("listbox", { name: "Code block language" })).toBeVisible();
+});
+
+test("contextual slash commands explain when the selection is unavailable", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.focus();
+  await page.keyboard.type("/table-row-after");
+
+  const palette = page.getByRole("listbox", { name: "Slash commands" });
+  const option = palette.getByRole("option", { name: /Table row below/ });
+  await expect(option).toBeVisible();
+  await expect(option).toHaveAttribute("aria-disabled", "true");
+  await expect(option).toHaveAccessibleDescription("Place the caret inside a table first.");
+  await expect(option).not.toHaveAttribute("aria-selected", "true");
+
+  await page.keyboard.press("Enter");
+  await expect(palette).toBeVisible();
+  await expect(editor.locator("table")).toHaveCount(0);
 });
 
 test("local session links expose backlinks and navigate in both directions", async ({ page }) => {

@@ -1,0 +1,46 @@
+version: 2
+
+updates:
+  # Keep the exact-version Tiptap set in lockstep. Patch/minor updates land
+  # in one PR so extensions cannot drift onto incompatible releases.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: monthly
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    groups:
+      tiptap:
+        patterns:
+          - "@tiptap/*"
+        update-types:
+          - patch
+          - minor
+    # Major releases require an intentional maintenance decision instead of
+    # arriving as unattended dependency churn.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+
+  # Keep action maintenance low-noise while retaining the same major-version
+  # gate as npm. No auto-merge policy is configured here.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+      time: "09:30"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 3
+    groups:
+      github-actions-patch-minor:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"

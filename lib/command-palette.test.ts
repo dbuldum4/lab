@@ -33,7 +33,12 @@ test("command filtering ranks exact ids before label prefixes and terms", () => 
   const commands = filterCommands(palette("commands", "history"), false, false);
   assert.equal(commands[0]?.id, "history");
 
-  const list = filterCommands(palette("commands", "table row"), false, false);
+  const list = filterCommands(palette("commands", "table row"), false, false, {
+    inTable: true,
+    inCodeBlock: false,
+    inLink: false,
+    selectedImage: false,
+  });
   assert.deepEqual(list.slice(0, 2).map((command) => command.id), [
     "table-row-before",
     "table-row-after",

@@ -369,6 +369,7 @@ test("pasted structure survives persistence, reload, and Markdown export", async
   const downloadPromise = page.waitForEvent("download");
   await page.keyboard.press("Enter");
   const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("persisted-heading.md");
   const downloadPath = await download.path();
   expect(downloadPath).not.toBeNull();
   const exported = await readFile(downloadPath as string, "utf8");
