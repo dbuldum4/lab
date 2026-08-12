@@ -1735,16 +1735,16 @@ function LabEditorSession() {
       set: (next: EditorNotice | null) => { value = next; },
     };
   });
+  const publishNotice = useCallback((nextNotice: EditorNotice | null) => {
+    latestNotice.set(nextNotice);
+    setNoticeState(nextNotice);
+  }, [latestNotice]);
   const [noticeController] = useState<EditorNoticeController>(() => (
-    createEditorNoticeController({ onChange: setNoticeState })
+    createEditorNoticeController({ onChange: publishNotice })
   ));
   const setNotice = useCallback((message: string | null, kind?: EditorNoticeKind) => {
-    latestNotice.set(noticeController.set(message, kind));
-  }, [latestNotice, noticeController]);
-
-  useEffect(() => {
-    latestNotice.set(notice);
-  }, [latestNotice, notice]);
+    noticeController.set(message, kind);
+  }, [noticeController]);
 
   useEffect(() => {
     noticeController.activate();
