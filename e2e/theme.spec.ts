@@ -46,7 +46,7 @@ test("delayed persistence permission does not clear a newer theme notice", async
   await page.getByTestId("theme-list")
     .getByRole("option", { name: "Light Warm neutral light theme", exact: true })
     .click();
-  const notice = page.locator(".editor-notice");
+  const notice = page.locator(".editor-notice-message");
   await expect(notice).toHaveText("Changed the theme to Light.");
 
   await page.evaluate(() => {
