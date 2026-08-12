@@ -622,7 +622,7 @@ export function CommandPalette({
                     type="button"
                     className="feature-button"
                     disabled={importConfirming}
-                    onClick={cancelMarkdownImport}
+                    onClick={() => cancelMarkdownImport()}
                   >
                     Cancel
                   </button>
