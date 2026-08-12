@@ -30,6 +30,8 @@ import {
   LinkEditorPanel,
   ShortcutsPanel,
   StatsPanel,
+  trapTabWithin,
+  useModalFocusTrap,
 } from "@/components/editor-feature-panels";
 import {
   createEditorPersistenceController,
@@ -46,6 +48,7 @@ import {
   type LocalRecoveryDraft,
   type StorageHealth,
 } from "@/lib/local-vault";
+import { formatStorageEstimate } from "@/lib/storage-estimate";
 import {
   VAULT_BACKUP_FILENAME,
   MAX_VAULT_BACKUP_BYTES,
@@ -59,6 +62,17 @@ import {
   transactionContainsDollar,
   transactionTouchesHeading,
 } from "@/lib/editor-transactions";
+import {
+  commandAvailability,
+  rankCommands,
+  type CommandContext,
+} from "@/lib/command-availability";
+import {
+  COMMANDS,
+  KEYBOARD_SHORTCUTS,
+  isDynamicCommandVisible,
+  type Command,
+} from "@/lib/command-registry";
 import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
@@ -79,16 +93,12 @@ import {
   type DocumentSession,
 } from "@/lib/document-sessions";
 import { automaticTitleFromMarkdown } from "@/lib/automatic-title";
-import {
-  COMMANDS,
-  KEYBOARD_SHORTCUTS,
-  isDynamicCommandVisible,
-  type Command,
-} from "@/lib/command-registry";
 import { calculateDocumentStats, type DocumentStats } from "@/lib/document-stats";
 import { EditorBlockExtensions } from "@/lib/editor-blocks";
+import { markdownExportFilename } from "@/lib/export-filename";
 import {
   normalizeSearchQuery,
+  searchMatchRanges,
   searchableMarkdown,
   searchLocalDocuments,
   type LocalSearchDocument,
@@ -116,6 +126,12 @@ import {
   type VersionHistoryEntry,
 } from "@/lib/version-history";
 import {
+  createEditorNoticeController,
+  type EditorNotice,
+  type EditorNoticeController,
+  type EditorNoticeKind,
+} from "@/lib/editor-notice";
+import {
   THEMES,
   THEME_STORAGE_KEY,
   themeFromDocument,
@@ -128,6 +144,7 @@ type PaletteMode =
   | "status"
   | "confirm-clear"
   | "confirm-delete"
+  | "confirm-import"
   | "name"
   | "sessions"
   | "archives"
@@ -148,6 +165,13 @@ type PaletteState = {
   top: number;
   mode: PaletteMode;
   anchor: PaletteAnchor;
+};
+
+type PendingMarkdownImport = {
+  markdown: string;
+  fileName: string;
+  revision: number;
+  currentMarkdown: string;
 };
 
 type MathKind = "inline" | "block";
@@ -245,6 +269,24 @@ const CODE_LANGUAGES = [
   { id: "yaml", label: "YAML" },
   { id: "markdown", label: "Markdown" },
 ] as const;
+
+const EMPTY_COMMAND_CONTEXT: CommandContext = {
+  inTable: false,
+  inCodeBlock: false,
+  inLink: false,
+  selectedImage: false,
+};
+
+function commandContextFromEditor(instance: Editor): CommandContext {
+  const linkType = instance.schema.marks.link;
+  const selection = instance.state.selection;
+  return {
+    inTable: instance.isActive("table"),
+    inCodeBlock: instance.isActive("codeBlock"),
+    inLink: Boolean(linkType && getMarkRange(selection.$from, linkType)),
+    selectedImage: selection instanceof NodeSelection && selection.node.type.name === "image",
+  };
+}
 
 const MarkdownLinkInput = Extension.create({
   name: "markdownLinkInput",
@@ -460,7 +502,14 @@ const BlockMathMarkdown = BlockMath.extend({
   },
 });
 
-const EMPTY_HEALTH: StorageHealth = { copies: 0, labels: [], persistent: false, errors: [], conflicts: 0 };
+const EMPTY_HEALTH: StorageHealth = {
+  copies: 0,
+  labels: [],
+  persistent: false,
+  errors: [],
+  conflicts: 0,
+  storageEstimate: null,
+};
 const PALETTE_ID = "slash-command-palette";
 const MATH_EDITOR_ID = "math-editor-popover";
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
@@ -695,20 +744,18 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
 }
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function highlightSearchText(value: string, query: string): ReactNode {
-  const terms = [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))]
-    .sort((left, right) => right.length - left.length);
-  if (terms.length === 0) return value;
-  const matcher = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
-  return value.split(matcher).map((part, index) => (
-    terms.includes(part.toLowerCase())
-      ? <mark key={`${part}-${index}`}>{part}</mark>
-      : <span key={`${part}-${index}`}>{part}</span>
-  ));
+  const ranges = searchMatchRanges(value, query);
+  if (ranges.length === 0) return value;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  ranges.forEach((range, index) => {
+    if (range.start > cursor) parts.push(<span key={`text-${index}`}>{value.slice(cursor, range.start)}</span>);
+    parts.push(<mark key={`match-${index}`}>{value.slice(range.start, range.end)}</mark>);
+    cursor = Math.max(cursor, range.end);
+  });
+  if (cursor < value.length) parts.push(<span key="text-tail">{value.slice(cursor)}</span>);
+  return parts;
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -1230,6 +1277,7 @@ const LabImage = Image.extend({
           button.addEventListener("pointerdown", (event) => {
             event.preventDefault();
             event.stopPropagation();
+            button.focus({ preventScroll: true });
           });
           button.addEventListener("click", (event) => {
             event.preventDefault();
@@ -1411,6 +1459,7 @@ function resizeCropRect(initial: CropRect, handle: CropHandle, delta: CropPoint)
 
 function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) {
   const dialogRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const interactionRef = useRef<CropInteraction | null>(null);
@@ -1420,9 +1469,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    dialogRef.current?.focus();
-  }, []);
+  useModalFocusTrap(dialogRef, closeButtonRef, onCancel);
 
   const updateRect = useCallback((next: CropRect) => {
     rectRef.current = next;
@@ -1542,34 +1589,7 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
             onCancel();
             return;
           }
-          if (event.key !== "Tab") return;
-
-          const dialog = dialogRef.current;
-          if (!dialog) return;
-          const focusable = Array.from(
-            dialog.querySelectorAll<HTMLElement>(
-              "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]",
-            ),
-          ).filter((element) => element.tabIndex >= 0 && !element.hasAttribute("aria-hidden"));
-          if (focusable.length === 0) {
-            event.preventDefault();
-            dialog.focus();
-            return;
-          }
-
-          const first = focusable[0];
-          const last = focusable[focusable.length - 1];
-          const active = document.activeElement;
-          const movingBackward = event.shiftKey;
-          if (
-            active === dialog
-            || !dialog.contains(active)
-            || (movingBackward && active === first)
-            || (!movingBackward && active === last)
-          ) {
-            event.preventDefault();
-            (movingBackward ? last : first).focus();
-          }
+          trapTabWithin(event, dialogRef.current);
         }}
       >
         <div className="image-crop-header">
@@ -1577,7 +1597,15 @@ function ImageCropDialog({ src, alt, onCancel, onApply }: ImageCropDialogProps) 
             <h2 id="image-crop-title">Crop image</h2>
             <p>Drag to choose the visible area.</p>
           </div>
-          <button type="button" className="image-crop-close" aria-label="Close crop editor" onClick={onCancel}>×</button>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            className="image-crop-close"
+            aria-label="Close crop editor"
+            onClick={onCancel}
+          >
+            ×
+          </button>
         </div>
         <div
           ref={stageRef}
@@ -1663,7 +1691,7 @@ const SlashCommandInput = Extension.create({
     return [
       new InputRule({
         find: (text) => {
-          const match = text.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
+          const match = text.match(/(?:^|\s)\/([\p{L}\p{M}\p{N}_-]*)$/u);
           if (!match || match.index === undefined) return null;
           return { index: match.index, text: match[0] };
         },
@@ -1712,6 +1740,7 @@ function LabEditorSession() {
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
+  const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1733,6 +1762,9 @@ function LabEditorSession() {
   const themeComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const pendingMarkdownImportRef = useRef<PendingMarkdownImport | null>(null);
+  const importRequestRef = useRef(0);
+  const importConfirmingRef = useRef(false);
   const outlineOpenRef = useRef(false);
   const outlineItemsRef = useRef<OutlineItem[]>([]);
   const largeExecCommandRef = useRef<{
@@ -1741,6 +1773,8 @@ function LabEditorSession() {
   } | null>(null);
   const inlineMathMigrationPendingRef = useRef(true);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
+  const [pendingMarkdownImport, setPendingMarkdownImport] = useState<PendingMarkdownImport | null>(null);
+  const [importConfirming, setImportConfirming] = useState(false);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [imageMetadataTarget, setImageMetadataTarget] = useState<ImageMetadataTarget | null>(null);
@@ -1749,10 +1783,12 @@ function LabEditorSession() {
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
+  const [commandContext, setCommandContext] = useState<CommandContext>(EMPTY_COMMAND_CONTEXT);
   const [outlineOpen, setOutlineOpenState] = useState(false);
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
   const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
   const [health, setHealth] = useState<StorageHealth>(EMPTY_HEALTH);
+  const formattedStorageEstimate = formatStorageEstimate(health.storageEstimate);
   const [latestMarkdown] = useState(() => {
     let value = "";
     return {
@@ -1765,7 +1801,20 @@ function LabEditorSession() {
   // /restore awaiting the render-time (stale) chain instead of that new touch.
   const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
   const [hydrating, setHydrating] = useState(true);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNoticeState] = useState<EditorNotice | null>(null);
+  const [noticeController] = useState<EditorNoticeController>(() => (
+    createEditorNoticeController({ onChange: setNoticeState })
+  ));
+  const setNotice = useCallback((message: string | null, kind?: EditorNoticeKind) => {
+    noticeController.set(message, kind);
+  }, [noticeController]);
+
+  useEffect(() => {
+    noticeController.activate();
+    return () => {
+      noticeController.dispose();
+    };
+  }, [noticeController]);
   // Only constructed after LabEditor mounts on the client, so the hash is real.
   // Invalid ids still map to the default document; the hash is rewritten in
   // useLayoutEffect below so React StrictMode double init stays correct.
@@ -2191,7 +2240,7 @@ function LabEditorSession() {
     const { $from } = instance.state.selection;
     if (!instance.state.selection.empty || !$from.parent.isTextblock || isCodeBlock($from.parent)) return null;
     const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
-    const match = before.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
+    const match = before.match(/(?:^|\s)\/([\p{L}\p{M}\p{N}_-]*)$/u);
     if (!match) return null;
     const token = `/${match[1]}`;
     const from = instance.state.selection.from - token.length;
@@ -2269,6 +2318,15 @@ function LabEditorSession() {
       if (outlineOpenRef.current) {
         syncOutlineActive(instance);
       }
+      const nextCommandContext = commandContextFromEditor(instance);
+      setCommandContext((current) => (
+        current.inTable === nextCommandContext.inTable
+        && current.inCodeBlock === nextCommandContext.inCodeBlock
+        && current.inLink === nextCommandContext.inLink
+        && current.selectedImage === nextCommandContext.selectedImage
+          ? current
+          : nextCommandContext
+      ));
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
@@ -2742,32 +2800,28 @@ function LabEditorSession() {
     onBlur: hideCaret,
   });
 
-  const filtered = useMemo(() => {
+  const rankedCommands = useMemo(() => {
     if (!palette || palette.mode !== "commands") return [];
-    const query = palette.query.toLowerCase();
-    return COMMANDS
-      .filter((command) => isDynamicCommandVisible(command.id, { pinned: sessionPinned, archived: sessionArchived }))
-      .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
-      .sort((left, right) => {
-        const score = (command: Command) => command.id === query
-          ? 0
-          : command.label.toLowerCase().startsWith(query)
-            ? 1
-            : 2;
-        return score(left) - score(right);
-      });
-  }, [palette, sessionArchived, sessionPinned]);
+    const commands = COMMANDS
+      .filter((command) => isDynamicCommandVisible(command.id, {
+        pinned: sessionPinned,
+        archived: sessionArchived,
+      }));
+    return rankCommands(commands, palette.query, commandContext);
+  }, [commandContext, palette, sessionArchived, sessionPinned]);
+
+  const filtered = useMemo(() => {
+    return rankedCommands
+      .filter(({ availability }) => availability.available)
+      .map(({ command }) => command);
+  }, [rankedCommands]);
 
   const filteredThemes = useMemo(() => {
     if (!palette || palette.mode !== "theme") return [];
-    const normalize = (value: string) => value
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase();
-    const query = normalize(palette.query.trim());
+    const query = normalizeSearchQuery(palette.query);
     if (!query) return [...THEMES];
     return THEMES.filter((theme) => (
-      normalize(`${theme.label} ${theme.detail}`).includes(query)
+      normalizeSearchQuery(`${theme.label} ${theme.detail}`).includes(query)
     ));
   }, [palette]);
 
@@ -2826,6 +2880,14 @@ function LabEditorSession() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "confirm-import" || importConfirming) return;
+    const frame = window.requestAnimationFrame(() => {
+      importConfirmButtonRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [importConfirming, palette?.mode]);
 
   useEffect(() => {
     if (palette?.mode !== "search") return;
@@ -2957,7 +3019,7 @@ function LabEditorSession() {
     if (switchAnyway) return "dirty";
     setNotice("This note could not be saved before switching sessions.");
     return "cancel";
-  }, [persistence]);
+  }, [persistence, setNotice]);
 
   /**
    * Stop accepting edits so the async gap before navigation cannot stage/save more text.
@@ -2983,7 +3045,7 @@ function LabEditorSession() {
     // dispose() is irreversible; reload restores a live persistence controller.
     window.location.reload();
     return false;
-  }, [editor, persistence]);
+  }, [editor, persistence, setNotice]);
 
   const navigateToSession = useCallback((session: DocumentSession, hashOverride?: string) => {
     // Preserve an explicit local-link hash, including the legacy
@@ -3151,7 +3213,7 @@ function LabEditorSession() {
       range: { from: editor.state.selection.from, to: editor.state.selection.from },
     });
     return true;
-  }, [editor, paletteAtSelection, setPalette]);
+  }, [editor, paletteAtSelection, setNotice, setPalette]);
 
   const saveEditedLink = useCallback((label: string, href: string) => {
     const state = linkEditorState;
@@ -3183,7 +3245,7 @@ function LabEditorSession() {
     setLinkEditorState(null);
     setPalette(null);
     editor.commands.focus();
-  }, [editor, linkEditorState, setPalette]);
+  }, [editor, linkEditorState, setNotice, setPalette]);
 
   const removeEditedLink = useCallback(() => {
     const state = linkEditorState;
@@ -3204,7 +3266,7 @@ function LabEditorSession() {
     setPalette(null);
     editor.commands.focus();
     setNotice(`Linked to “${session.name}”.`);
-  }, [editor, setPalette]);
+  }, [editor, setNotice, setPalette]);
 
   const chooseCodeLanguage = useCallback((language: string) => {
     if (!editor || !editor.isActive("codeBlock")) {
@@ -3215,7 +3277,7 @@ function LabEditorSession() {
     editor.chain().focus().updateAttributes("codeBlock", { language: language || null }).run();
     setPalette(null);
     setNotice(language ? `Set code language to ${language}.` : "Cleared the code language.");
-  }, [editor, setPalette]);
+  }, [editor, setNotice, setPalette]);
 
   const restoreHistoryVersion = useCallback((version: VersionHistoryEntry) => {
     if (!editor) return;
@@ -3228,7 +3290,82 @@ function LabEditorSession() {
     setPalette(null);
     editor.commands.focus("start");
     setNotice("Restored an earlier local version.");
-  }, [documentId, editor, serializeMarkdown, setPalette]);
+  }, [documentId, editor, serializeMarkdown, setNotice, setPalette]);
+
+  const applyMarkdownImport = useCallback((markdown: string, fileName: string) => {
+    if (!editor) return false;
+    try {
+      editor.commands.setContent(markdown, { contentType: "markdown" });
+    } catch {
+      editor.commands.focus();
+      setNotice("The selected file could not be imported as Markdown.");
+      return false;
+    }
+    editor.commands.focus("start");
+    setNotice(`Imported “${fileName || "the selected Markdown file"}”.`);
+    return true;
+  }, [editor]);
+
+  const cancelMarkdownImport = useCallback((message = "Markdown import cancelled.") => {
+    pendingMarkdownImportRef.current = null;
+    setPendingMarkdownImport(null);
+    importConfirmingRef.current = false;
+    setImportConfirming(false);
+    setPalette(null);
+    editor?.commands.focus();
+    setNotice(message);
+  }, [editor, setPalette]);
+
+  const confirmMarkdownImport = useCallback(async () => {
+    const pending = pendingMarkdownImportRef.current;
+    if (!pending || !editor || importConfirmingRef.current) return;
+
+    const changedBeforeConfirmation = pending.revision !== persistence.getState().editRevision
+      || serializeMarkdown(editor) !== pending.currentMarkdown;
+    if (changedBeforeConfirmation) {
+      cancelMarkdownImport("The note changed while the import was waiting. Import was cancelled.");
+      return;
+    }
+
+    importConfirmingRef.current = true;
+    setImportConfirming(true);
+    let flushed = false;
+    try {
+      flushed = await persistence.flush();
+    } catch {
+      flushed = false;
+    }
+    if (pendingMarkdownImportRef.current !== pending) return;
+
+    const changedWhileSaving = pending.revision !== persistence.getState().editRevision
+      || serializeMarkdown(editor) !== pending.currentMarkdown;
+    if (changedWhileSaving) {
+      cancelMarkdownImport("The note changed while it was being saved. Import was cancelled.");
+      return;
+    }
+    if (!flushed) {
+      cancelMarkdownImport("The current note could not be saved before import. Import was cancelled.");
+      return;
+    }
+
+    const preservedBeforeImport = listVersions(documentId)
+      .some((version) => version.markdown === pending.currentMarkdown);
+    if (!preservedBeforeImport) recordVersion(documentId, pending.currentMarkdown);
+    const preserved = listVersions(documentId)
+      .some((version) => version.markdown === pending.currentMarkdown);
+    if (!preserved) {
+      cancelMarkdownImport("The current note could not be preserved in version history. Import was cancelled.");
+      return;
+    }
+
+    const imported = applyMarkdownImport(pending.markdown, pending.fileName);
+    pendingMarkdownImportRef.current = null;
+    setPendingMarkdownImport(null);
+    importConfirmingRef.current = false;
+    setImportConfirming(false);
+    setPalette(null);
+    if (!imported) editor.commands.focus();
+  }, [applyMarkdownImport, cancelMarkdownImport, documentId, editor, persistence, serializeMarkdown, setPalette]);
 
   const openBacklink = useCallback((backlink: Backlink) => {
     const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
@@ -3237,7 +3374,7 @@ function LabEditorSession() {
       return;
     }
     void resumeSession(session);
-  }, [resumeSession]);
+  }, [resumeSession, setNotice]);
 
   const openSearchResult = useCallback((result: LocalSearchResult) => {
     const session = sessions.find((candidate) => candidate.id === result.documentId) ?? {
@@ -3283,7 +3420,7 @@ function LabEditorSession() {
     window.history.replaceState({ labDocumentId: DEFAULT_DOCUMENT_ID }, "", target);
     window.location.reload();
     return true;
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, setNotice]);
 
   const submitSessionName = useCallback(() => {
     const nextName = sessionName.trim();
@@ -3301,7 +3438,7 @@ function LabEditorSession() {
         editor?.commands.focus();
       })
       .catch(() => setNotice("This session name could not be saved locally."));
-  }, [documentId, editor, sessionName, setPalette]);
+  }, [documentId, editor, sessionName, setNotice, setPalette]);
 
   const chooseTheme = useCallback((themeId: ThemeId) => {
     document.documentElement.dataset.theme = themeId;
@@ -3314,11 +3451,17 @@ function LabEditorSession() {
     }
     setPalette(null);
     window.requestAnimationFrame(() => editorRef.current?.commands.focus());
-  }, [setPalette]);
+  }, [setNotice, setPalette]);
 
   const runCommand = useCallback(
     (command: Command) => {
       if (!editor || !paletteRef.current) return;
+      const availability = commandAvailability(command.id, commandContextFromEditor(editor));
+      if (!availability.available) {
+        setNotice(availability.reason ?? "This command is not available here.");
+        setPalette(null);
+        return;
+      }
       const current = paletteRef.current;
       const anchor = { ...current };
       // Slash text is UI chrome, not an edit the user should have to undo. In particular,
@@ -3611,12 +3754,12 @@ function LabEditorSession() {
         case "image": imageInputRef.current?.click(); break;
         case "import": fileInputRef.current?.click(); break;
         case "export": {
-          downloadMarkdown("lab.md", serializeMarkdown(editor));
+          downloadMarkdown(markdownExportFilename(savedSessionName), serializeMarkdown(editor));
           break;
         }
       }
     },
-    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setNotice, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3696,7 +3839,7 @@ function LabEditorSession() {
       window.removeEventListener("hashchange", rebindIfSessionChanged);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [documentId, editor, persistence]);
+  }, [documentId, editor, persistence, setNotice]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3804,7 +3947,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, syncInterface]);
+  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
@@ -3827,7 +3970,7 @@ function LabEditorSession() {
 
   useLayoutEffect(() => {
     repositionPalette();
-  }, [backlinks.length, filtered.length, filteredThemes.length, palette, repositionPalette, sessions.length, versions.length]);
+  }, [backlinks.length, filtered.length, filteredThemes.length, palette, rankedCommands.length, repositionPalette, sessions.length, versions.length]);
 
   useEffect(() => {
     const flush = () => {
@@ -3881,6 +4024,10 @@ function LabEditorSession() {
       event.preventDefault();
       if (current.mode === "name") setSessionName(savedSessionName);
       if (current.mode === "link-editor") setLinkEditorState(null);
+      if (current.mode === "confirm-import") {
+        cancelMarkdownImport();
+        return;
+      }
       setPalette(null);
       editor?.commands.focus();
       return;
@@ -3995,6 +4142,14 @@ function LabEditorSession() {
       return;
     }
 
+    if (current.mode === "confirm-import") {
+      if (event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
+        event.preventDefault();
+        void confirmMarkdownImport();
+      }
+      return;
+    }
+
     if (current.mode === "confirm-clear") {
       if (event.key === "Enter") {
         event.preventDefault();
@@ -4033,28 +4188,61 @@ function LabEditorSession() {
       return;
     }
 
-    if ((event.key === "Enter" || event.key === "Tab") && filtered.length > 0) {
-      event.preventDefault();
-      runCommand(filtered[selectedRef.current] ?? filtered[0]);
+    if (event.key === "Enter" || event.key === "Tab") {
+      if (rankedCommands.length > 0) event.preventDefault();
+      if (filtered.length > 0) {
+        runCommand(filtered[selectedRef.current] ?? filtered[0]);
+      }
     }
   };
 
   const onImport = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+    event.target.value = "";
     if (!file || !editor) return;
+    if (pendingMarkdownImportRef.current) {
+      pendingMarkdownImportRef.current = null;
+      setPendingMarkdownImport(null);
+      importConfirmingRef.current = false;
+      setImportConfirming(false);
+      if (paletteRef.current?.mode === "confirm-import") setPalette(null);
+    }
+    const requestId = importRequestRef.current + 1;
+    importRequestRef.current = requestId;
     const revisionAtSelection = persistence.getState().editRevision;
+    const currentMarkdown = serializeMarkdown(editor);
     void file.text()
       .then((markdown) => {
-        if (revisionAtSelection !== persistence.getState().editRevision) {
+        if (requestId !== importRequestRef.current) return;
+        if (
+          revisionAtSelection !== persistence.getState().editRevision
+          || serializeMarkdown(editor) !== currentMarkdown
+        ) {
           setNotice("The note changed while the file was loading. Import was cancelled.");
           return;
         }
-        editor.commands.setContent(markdown, { contentType: "markdown" });
-        editor.commands.focus("start");
+        if (!currentMarkdown.trim()) {
+          applyMarkdownImport(markdown, file.name);
+          return;
+        }
+        const pending = {
+          markdown,
+          fileName: file.name,
+          revision: revisionAtSelection,
+          currentMarkdown,
+        };
+        pendingMarkdownImportRef.current = pending;
+        setPendingMarkdownImport(pending);
+        importConfirmingRef.current = false;
+        setImportConfirming(false);
         setNotice(null);
+        setPalette(paletteAtSelection(editor, "confirm-import"));
       })
-      .catch(() => setNotice("The selected file could not be read as Markdown."));
-    event.target.value = "";
+      .catch(() => {
+        if (requestId === importRequestRef.current) {
+          setNotice("The selected file could not be read as Markdown.");
+        }
+      });
   };
 
   const onVaultRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -4142,13 +4330,11 @@ function LabEditorSession() {
     }
     instance.commands.setNodeSelection(target.pos);
     instance.commands.updateAttributes("image", { src: dataUrl, width: null, height: null });
-    instance.commands.focus();
     setImageCropTarget(null);
   }, [imageCropTarget]);
 
   const cancelImageCrop = useCallback(() => {
     setImageCropTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const applyImageMetadata = useCallback((metadata: { alt: string; title: string }) => {
@@ -4166,13 +4352,11 @@ function LabEditorSession() {
       title: metadata.title.trim() || null,
     });
     setImageMetadataTarget(null);
-    instance.commands.focus();
     setNotice("Updated image alt text and title.");
-  }, [imageMetadataTarget]);
+  }, [imageMetadataTarget, setNotice]);
 
   const cancelImageMetadata = useCallback(() => {
     setImageMetadataTarget(null);
-    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
   }, []);
 
   const onMathEditorKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -4402,40 +4586,52 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" || palette.mode === "confirm-import" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : palette.mode === "confirm-import" ? "Confirm Markdown import" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
-            filtered.length > 0 ? (
+            rankedCommands.length > 0 ? (
               <LayoutGroup id="slash-command-selection">
                 <div className="command-list">
-                  {filtered.map((command, index) => (
-                    <div
-                      className="command-item"
-                      data-motion-selection="true"
-                      data-selected={index === selected}
-                      id={`${PALETTE_ID}-${command.id}`}
-                      key={command.id}
-                      role="option"
-                      aria-selected={index === selected}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        runCommand(command);
-                      }}
-                      onMouseEnter={() => setSelected(index)}
-                    >
-                      {index === selected ? (
-                        <motion.div
-                          className="command-selection-motion"
-                          layoutId="slash-command-selection"
-                          transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
-                          aria-hidden="true"
-                        />
-                      ) : null}
-                      <span>{command.label}</span>
-                      <small>{command.detail}</small>
-                    </div>
-                  ))}
+                  {rankedCommands.map(({ command, availability }) => {
+                    const selectableIndex = availability.available
+                      ? filtered.findIndex((candidate) => candidate.id === command.id)
+                      : -1;
+                    const isSelected = selectableIndex >= 0 && selectableIndex === selected;
+                    const reasonId = `${PALETTE_ID}-${command.id}-reason`;
+                    return (
+                      <div
+                        className="command-item"
+                        data-motion-selection={isSelected}
+                        data-selected={isSelected}
+                        data-disabled={!availability.available}
+                        id={`${PALETTE_ID}-${command.id}`}
+                        key={command.id}
+                        role="option"
+                        aria-selected={isSelected}
+                        aria-disabled={!availability.available}
+                        aria-describedby={reasonId}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          if (availability.available) runCommand(command);
+                        }}
+                        onMouseEnter={() => {
+                          if (selectableIndex >= 0) setSelected(selectableIndex);
+                        }}
+                      >
+                        {isSelected ? (
+                          <motion.div
+                            className="command-selection-motion"
+                            layoutId="slash-command-selection"
+                            transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
+                            aria-hidden="true"
+                          />
+                        ) : null}
+                        <span>{command.label}</span>
+                        <small id={reasonId}>{availability.reason ?? command.detail}</small>
+                      </div>
+                    );
+                  })}
                 </div>
               </LayoutGroup>
             ) : (
@@ -4755,6 +4951,30 @@ function LabEditorSession() {
               }}
               saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
             />
+          ) : palette.mode === "confirm-import" ? (
+            <div className="palette-message palette-confirm" data-testid="confirm-import">
+              <span>Replace this note with “{pendingMarkdownImport?.fileName || "the selected Markdown file"}”?</span>
+              <small>The current note will be kept in version history.</small>
+              <div className="feature-form-actions">
+                <button
+                  ref={importConfirmButtonRef}
+                  type="button"
+                  className="feature-button feature-button-primary"
+                  disabled={importConfirming}
+                  onClick={() => { void confirmMarkdownImport(); }}
+                >
+                  Import file
+                </button>
+                <button
+                  type="button"
+                  className="feature-button"
+                  disabled={importConfirming}
+                  onClick={() => cancelMarkdownImport()}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
               <span>Clear the note?</span>
@@ -4770,6 +4990,7 @@ function LabEditorSession() {
               <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>
               <small>{health.labels.join(" · ") || "Storage is unavailable"}</small>
               {health.conflicts > 0 ? <small>{health.conflicts} recoverable {health.conflicts === 1 ? "draft" : "drafts"} · /recover to export</small> : null}
+              {formattedStorageEstimate ? <small>Approximate browser storage: {formattedStorageEstimate}</small> : null}
               <small>{health.persistent ? "Persistent storage granted" : "Browser-managed persistence"} · no network access</small>
             </div>
           )}
@@ -4778,7 +4999,26 @@ function LabEditorSession() {
           </motion.div>
         </div>
       ) : null}
-      {notice ? <p className="editor-notice" role="status">{notice}</p> : null}
+      {notice ? (
+        <div
+          className="editor-notice"
+          data-kind={notice.kind}
+          data-testid="editor-notice"
+          role={notice.kind === "info" ? "status" : "alert"}
+          aria-live={notice.kind === "info" ? "polite" : "assertive"}
+          aria-atomic="true"
+        >
+          <span className="editor-notice-message">{notice.message}</span>
+          <button
+            className="feature-button editor-notice-dismiss"
+            type="button"
+            aria-label="Dismiss notification"
+            onClick={() => { noticeController.dismiss(notice.id); }}
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
