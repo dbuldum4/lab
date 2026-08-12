@@ -217,6 +217,23 @@ test("table row and column commands work in place and code language round-trips"
   await expect(restored.locator("pre code")).toHaveClass(/language-typescript/);
 });
 
+test("contextual slash commands explain when the selection is unavailable", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.focus();
+  await page.keyboard.type("/table-row-after");
+
+  const palette = page.getByRole("listbox", { name: "Slash commands" });
+  const option = palette.getByRole("option", { name: /Table row below/ });
+  await expect(option).toBeVisible();
+  await expect(option).toHaveAttribute("aria-disabled", "true");
+  await expect(option).toHaveAccessibleDescription("Place the caret inside a table first.");
+  await expect(option).not.toHaveAttribute("aria-selected", "true");
+
+  await page.keyboard.press("Enter");
+  await expect(palette).toBeVisible();
+  await expect(editor.locator("table")).toHaveCount(0);
+});
+
 test("local session links expose backlinks and navigate in both directions", async ({ page }) => {
   const targetEditor = await openEditor(page);
   const targetMarkdown = "# Target Note\n\nThis is the link destination.";

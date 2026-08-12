@@ -59,6 +59,11 @@ import {
   transactionContainsDollar,
   transactionTouchesHeading,
 } from "@/lib/editor-transactions";
+import {
+  commandAvailability,
+  rankCommands,
+  type CommandContext,
+} from "@/lib/command-availability";
 import { SessionTouchBarrier } from "@/lib/session-touch-barrier";
 import {
   activeDocumentIdFromLocation,
@@ -325,6 +330,24 @@ const COMMANDS: Command[] = [
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
 ];
+
+const EMPTY_COMMAND_CONTEXT: CommandContext = {
+  inTable: false,
+  inCodeBlock: false,
+  inLink: false,
+  selectedImage: false,
+};
+
+function commandContextFromEditor(instance: Editor): CommandContext {
+  const linkType = instance.schema.marks.link;
+  const selection = instance.state.selection;
+  return {
+    inTable: instance.isActive("table"),
+    inCodeBlock: instance.isActive("codeBlock"),
+    inLink: Boolean(linkType && getMarkRange(selection.$from, linkType)),
+    selectedImage: selection instanceof NodeSelection && selection.node.type.name === "image",
+  };
+}
 
 const MarkdownLinkInput = Extension.create({
   name: "markdownLinkInput",
@@ -1829,6 +1852,7 @@ function LabEditorSession() {
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
+  const [commandContext, setCommandContext] = useState<CommandContext>(EMPTY_COMMAND_CONTEXT);
   const [outlineOpen, setOutlineOpenState] = useState(false);
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
   const [activeOutlineId, setActiveOutlineIdState] = useState<string | null>(null);
@@ -2349,6 +2373,15 @@ function LabEditorSession() {
       if (outlineOpenRef.current) {
         syncOutlineActive(instance);
       }
+      const nextCommandContext = commandContextFromEditor(instance);
+      setCommandContext((current) => (
+        current.inTable === nextCommandContext.inTable
+        && current.inCodeBlock === nextCommandContext.inCodeBlock
+        && current.inLink === nextCommandContext.inLink
+        && current.selectedImage === nextCommandContext.selectedImage
+          ? current
+          : nextCommandContext
+      ));
       if (paletteRef.current && paletteRef.current.mode !== "commands") return;
       const next = findSlash(instance);
       setPalette(next);
@@ -2822,22 +2855,19 @@ function LabEditorSession() {
     onBlur: hideCaret,
   });
 
-  const filtered = useMemo(() => {
+  const rankedCommands = useMemo(() => {
     if (!palette || palette.mode !== "commands") return [];
-    const query = palette.query.toLowerCase();
-    return COMMANDS
+    const commands = COMMANDS
       .filter((command) => command.id !== (sessionPinned ? "pin" : "unpin"))
-      .filter((command) => command.id !== (sessionArchived ? "archive" : "unarchive"))
-      .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
-      .sort((left, right) => {
-        const score = (command: Command) => command.id === query
-          ? 0
-          : command.label.toLowerCase().startsWith(query)
-            ? 1
-            : 2;
-        return score(left) - score(right);
-      });
-  }, [palette, sessionArchived, sessionPinned]);
+      .filter((command) => command.id !== (sessionArchived ? "archive" : "unarchive"));
+    return rankCommands(commands, palette.query, commandContext);
+  }, [commandContext, palette, sessionArchived, sessionPinned]);
+
+  const filtered = useMemo(() => {
+    return rankedCommands
+      .filter(({ availability }) => availability.available)
+      .map(({ command }) => command);
+  }, [rankedCommands]);
 
   const filteredThemes = useMemo(() => {
     if (!palette || palette.mode !== "theme") return [];
@@ -3400,6 +3430,12 @@ function LabEditorSession() {
   const runCommand = useCallback(
     (command: Command) => {
       if (!editor || !paletteRef.current) return;
+      const availability = commandAvailability(command.id, commandContextFromEditor(editor));
+      if (!availability.available) {
+        setNotice(availability.reason ?? "This command is not available here.");
+        setPalette(null);
+        return;
+      }
       const current = paletteRef.current;
       const anchor = { ...current };
       // Slash text is UI chrome, not an edit the user should have to undo. In particular,
@@ -3481,7 +3517,8 @@ function LabEditorSession() {
       }
       if (command.id === "language") {
         if (!editor.isActive("codeBlock")) {
-          editor.chain().focus().setCodeBlock().run();
+          setNotice("Place the caret inside a code block first.");
+          return;
         }
         const currentLanguage = String(editor.getAttributes("codeBlock").language ?? "");
         setSelected(Math.max(0, CODE_LANGUAGES.findIndex((language) => language.id === currentLanguage)));
@@ -3908,7 +3945,7 @@ function LabEditorSession() {
 
   useLayoutEffect(() => {
     repositionPalette();
-  }, [backlinks.length, filtered.length, filteredThemes.length, palette, repositionPalette, sessions.length, versions.length]);
+  }, [backlinks.length, filtered.length, filteredThemes.length, palette, rankedCommands.length, repositionPalette, sessions.length, versions.length]);
 
   useEffect(() => {
     const flush = () => {
@@ -4114,9 +4151,11 @@ function LabEditorSession() {
       return;
     }
 
-    if ((event.key === "Enter" || event.key === "Tab") && filtered.length > 0) {
-      event.preventDefault();
-      runCommand(filtered[selectedRef.current] ?? filtered[0]);
+    if (event.key === "Enter" || event.key === "Tab") {
+      if (rankedCommands.length > 0) event.preventDefault();
+      if (filtered.length > 0) {
+        runCommand(filtered[selectedRef.current] ?? filtered[0]);
+      }
     }
   };
 
@@ -4487,36 +4526,48 @@ function LabEditorSession() {
             aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
-            filtered.length > 0 ? (
+            rankedCommands.length > 0 ? (
               <LayoutGroup id="slash-command-selection">
                 <div className="command-list">
-                  {filtered.map((command, index) => (
-                    <div
-                      className="command-item"
-                      data-motion-selection="true"
-                      data-selected={index === selected}
-                      id={`${PALETTE_ID}-${command.id}`}
-                      key={command.id}
-                      role="option"
-                      aria-selected={index === selected}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        runCommand(command);
-                      }}
-                      onMouseEnter={() => setSelected(index)}
-                    >
-                      {index === selected ? (
-                        <motion.div
-                          className="command-selection-motion"
-                          layoutId="slash-command-selection"
-                          transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
-                          aria-hidden="true"
-                        />
-                      ) : null}
-                      <span>{command.label}</span>
-                      <small>{command.detail}</small>
-                    </div>
-                  ))}
+                  {rankedCommands.map(({ command, availability }) => {
+                    const selectableIndex = availability.available
+                      ? filtered.findIndex((candidate) => candidate.id === command.id)
+                      : -1;
+                    const isSelected = selectableIndex >= 0 && selectableIndex === selected;
+                    const reasonId = `${PALETTE_ID}-${command.id}-reason`;
+                    return (
+                      <div
+                        className="command-item"
+                        data-motion-selection={isSelected}
+                        data-selected={isSelected}
+                        data-disabled={!availability.available}
+                        id={`${PALETTE_ID}-${command.id}`}
+                        key={command.id}
+                        role="option"
+                        aria-selected={isSelected}
+                        aria-disabled={!availability.available}
+                        aria-describedby={reasonId}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          if (availability.available) runCommand(command);
+                        }}
+                        onMouseEnter={() => {
+                          if (selectableIndex >= 0) setSelected(selectableIndex);
+                        }}
+                      >
+                        {isSelected ? (
+                          <motion.div
+                            className="command-selection-motion"
+                            layoutId="slash-command-selection"
+                            transition={prefersReducedMotion ? { duration: 0 } : SLASH_SELECTION_TRANSITION}
+                            aria-hidden="true"
+                          />
+                        ) : null}
+                        <span>{command.label}</span>
+                        <small id={reasonId}>{availability.reason ?? command.detail}</small>
+                      </div>
+                    );
+                  })}
                 </div>
               </LayoutGroup>
             ) : (
