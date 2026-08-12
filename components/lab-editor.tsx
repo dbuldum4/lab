@@ -109,6 +109,12 @@ import {
   recordVersion,
   type VersionHistoryEntry,
 } from "@/lib/version-history";
+import {
+  THEMES,
+  THEME_STORAGE_KEY,
+  themeFromDocument,
+  type ThemeId,
+} from "@/lib/theme";
 
 type SlashRange = { from: number; to: number };
 type PaletteMode =
@@ -124,6 +130,7 @@ type PaletteMode =
   | "stats"
   | "shortcuts"
   | "language"
+  | "theme"
   | "backlinks"
   | "history"
   | "link-editor";
@@ -313,6 +320,7 @@ const COMMANDS: Command[] = [
   { id: "stats", label: "Document stats", detail: "Words, characters, blocks, and reading time", terms: "count reading time metrics" },
   { id: "history", label: "Version history", detail: "Restore an earlier local version", terms: "revisions snapshots time machine" },
   { id: "shortcuts", label: "Keyboard shortcuts", detail: "Show every app shortcut", terms: "keys hotkeys help" },
+  { id: "theme", label: "Theme", detail: "Choose the app colors", terms: "appearance light dark dracula nord solarized catppuccin" },
   { id: "delete", label: "Delete session", detail: "Remove this document permanently", terms: "remove destroy discard session document" },
   { id: "status", label: "Storage status", detail: "Inspect local redundancy", terms: "local-only copies offline" },
   { id: "clear", label: "Clear note", detail: "Requires a second Enter", terms: "delete erase reset" },
@@ -1783,6 +1791,7 @@ function LabEditorSession() {
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const themeSearchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1801,6 +1810,7 @@ function LabEditorSession() {
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const searchIndexVersionRef = useRef(0);
   const searchComposingRef = useRef(false);
+  const themeComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const outlineOpenRef = useRef(false);
@@ -1853,6 +1863,7 @@ function LabEditorSession() {
   const [backlinks, setBacklinks] = useState<Backlink[]>([]);
   const [backlinksLoading, setBacklinksLoading] = useState(false);
   const [versions, setVersions] = useState<VersionHistoryEntry[]>([]);
+  const [activeTheme, setActiveTheme] = useState<ThemeId>(() => themeFromDocument(document.documentElement));
   const prefersReducedMotion = usePrefersReducedMotion();
   const mobileOutline = useMobileOutline();
 
@@ -1898,6 +1909,9 @@ function LabEditorSession() {
       searchResultRefs.current.clear();
       setSearchResults([]);
       setSearchLoading(false);
+    }
+    if (previous?.mode === "theme" && value?.mode !== "theme") {
+      themeComposingRef.current = false;
     }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
@@ -2825,6 +2839,19 @@ function LabEditorSession() {
       });
   }, [palette, sessionArchived, sessionPinned]);
 
+  const filteredThemes = useMemo(() => {
+    if (!palette || palette.mode !== "theme") return [];
+    const normalize = (value: string) => value
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase();
+    const query = normalize(palette.query.trim());
+    if (!query) return [...THEMES];
+    return THEMES.filter((theme) => (
+      normalize(`${theme.label} ${theme.detail}`).includes(query)
+    ));
+  }, [palette]);
+
   const mathError = useMemo(() => {
     if (!mathEditorState) return null;
     if (!mathEditorState.latex.trim()) return "Enter a LaTeX expression.";
@@ -2889,6 +2916,27 @@ function LabEditorSession() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "theme") return;
+    const frame = window.requestAnimationFrame(() => {
+      themeSearchInputRef.current?.focus();
+      themeSearchInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "theme") return;
+    const activeThemeOption = filteredThemes[selected];
+    if (!activeThemeOption) return;
+    const frame = window.requestAnimationFrame(() => {
+      document
+        .getElementById(`${PALETTE_ID}-theme-${activeThemeOption.id}`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [filteredThemes, palette?.mode, selected]);
 
   useEffect(() => {
     if (palette?.mode !== "search" || searchLoading) return;
@@ -2960,9 +3008,9 @@ function LabEditorSession() {
       else documentElement.removeAttribute("aria-activedescendant");
       return;
     }
-    if (palette?.mode === "search") {
-      // The searchbox owns the result list. The editor is only the command
-      // launcher and must not claim the search list as its active descendant.
+    if (palette?.mode === "search" || palette?.mode === "theme") {
+      // The focused searchbox owns its result list. The editor is only the
+      // command launcher and must not claim that list as its active descendant.
       documentElement.setAttribute("aria-expanded", "false");
       documentElement.removeAttribute("aria-controls");
       documentElement.removeAttribute("aria-activedescendant");
@@ -3336,6 +3384,19 @@ function LabEditorSession() {
       .catch(() => setNotice("This session name could not be saved locally."));
   }, [documentId, editor, sessionName, setPalette]);
 
+  const chooseTheme = useCallback((themeId: ThemeId) => {
+    document.documentElement.dataset.theme = themeId;
+    setActiveTheme(themeId);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeId);
+      setNotice(`Changed the theme to ${THEMES.find((theme) => theme.id === themeId)?.label ?? themeId}.`);
+    } catch {
+      setNotice("Changed the theme for this page. The browser could not save the choice.");
+    }
+    setPalette(null);
+    window.requestAnimationFrame(() => editorRef.current?.commands.focus());
+  }, [setPalette]);
+
   const runCommand = useCallback(
     (command: Command) => {
       if (!editor || !paletteRef.current) return;
@@ -3386,6 +3447,11 @@ function LabEditorSession() {
       }
       if (command.id === "shortcuts") {
         setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "shortcuts" });
+        return;
+      }
+      if (command.id === "theme") {
+        setSelected(Math.max(0, THEMES.findIndex((theme) => theme.id === activeTheme)));
+        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "theme" });
         return;
       }
       if (command.id === "history") {
@@ -3631,7 +3697,7 @@ function LabEditorSession() {
         }
       }
     },
-    [documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3842,7 +3908,7 @@ function LabEditorSession() {
 
   useLayoutEffect(() => {
     repositionPalette();
-  }, [backlinks.length, filtered.length, palette, repositionPalette, sessions.length, versions.length]);
+  }, [backlinks.length, filtered.length, filteredThemes.length, palette, repositionPalette, sessions.length, versions.length]);
 
   useEffect(() => {
     const flush = () => {
@@ -3955,6 +4021,31 @@ function LabEditorSession() {
       } else if (event.key === "Enter" || event.key === "Tab") {
         event.preventDefault();
         chooseCodeLanguage(CODE_LANGUAGES[selectedRef.current]?.id ?? "");
+      }
+      return;
+    }
+
+    if (current.mode === "theme") {
+      if (event.target instanceof HTMLAnchorElement) return;
+
+      const isComposing = themeComposingRef.current || event.nativeEvent.isComposing;
+      if (isComposing && (
+        event.key === "ArrowDown"
+        || event.key === "ArrowUp"
+        || event.key === "Enter"
+        || event.key === "Tab"
+      )) return;
+
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, filteredThemes.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if (event.key === "Enter" && filteredThemes.length > 0) {
+        event.preventDefault();
+        chooseTheme(filteredThemes[selectedRef.current]?.id ?? filteredThemes[0].id);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
       }
       return;
     }
@@ -4380,7 +4471,7 @@ function LabEditorSession() {
             className="command-palette-frame"
             size="line"
             colorVariant="mono"
-            theme="dark"
+            theme={THEMES.find((theme) => theme.id === activeTheme)?.colorScheme ?? "dark"}
             staticColors
             duration={3.2}
             active={(palette.mode === "commands" || palette.mode === "search") && !prefersReducedMotion}
@@ -4392,8 +4483,8 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "link-editor" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
@@ -4595,6 +4686,77 @@ function LabEditorSession() {
                   <small>{language.id ? `\`\`\`${language.id}` : "No fence identifier"}</small>
                 </div>
               ))}
+            </div>
+          ) : palette.mode === "theme" ? (
+            <div className="theme-panel" data-testid="theme-panel">
+              <div className="search-field">
+                <span className="search-field-prefix" aria-hidden="true">◐</span>
+                <input
+                  ref={themeSearchInputRef}
+                  type="search"
+                  role="combobox"
+                  aria-label="Search themes"
+                  aria-expanded="true"
+                  aria-controls={`${PALETTE_ID}-theme-results`}
+                  aria-activedescendant={filteredThemes[selected]
+                    ? `${PALETTE_ID}-theme-${filteredThemes[selected].id}`
+                    : undefined}
+                  aria-autocomplete="list"
+                  aria-haspopup="listbox"
+                  autoComplete="off"
+                  placeholder="Search themes"
+                  value={palette.query}
+                  onCompositionStart={() => { themeComposingRef.current = true; }}
+                  onCompositionEnd={() => { themeComposingRef.current = false; }}
+                  onChange={(event) => {
+                    setSelected(0);
+                    setPalette({ ...palette, query: event.target.value });
+                  }}
+                />
+                <kbd>Esc</kbd>
+              </div>
+              <div
+                id={`${PALETTE_ID}-theme-results`}
+                className="command-list theme-list"
+                data-testid="theme-list"
+                role="listbox"
+                aria-label="Theme results"
+                tabIndex={-1}
+              >
+                {filteredThemes.length > 0 ? filteredThemes.map((theme, index) => (
+                  <div
+                    className="command-item theme-item"
+                    data-selected={index === selected}
+                    data-current={theme.id === activeTheme}
+                    id={`${PALETTE_ID}-theme-${theme.id}`}
+                    key={theme.id}
+                    role="option"
+                    aria-selected={index === selected}
+                    aria-current={theme.id === activeTheme ? "true" : undefined}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      chooseTheme(theme.id);
+                    }}
+                    onMouseEnter={() => setSelected(index)}
+                  >
+                    <span className="theme-label">
+                      <span className="theme-swatches" aria-hidden="true">
+                        {theme.swatches.map((color) => (
+                          <span key={color} style={{ backgroundColor: color }} />
+                        ))}
+                      </span>
+                      {theme.label}
+                    </span>
+                    <small>{theme.id === activeTheme ? "Current" : theme.detail}</small>
+                  </div>
+                )) : (
+                  <div className="search-empty">No themes match “{palette.query.trim()}”.</div>
+                )}
+              </div>
+              <div className="search-footer theme-footer">
+                <span>{filteredThemes.length} {filteredThemes.length === 1 ? "theme" : "themes"} · ↑↓ move · Enter select</span>
+                <a href="./third-party-notices/" target="_blank" rel="noreferrer">Licenses</a>
+              </div>
             </div>
           ) : palette.mode === "backlinks" ? (
             <div className="feature-list-panel" data-testid="backlinks-panel">

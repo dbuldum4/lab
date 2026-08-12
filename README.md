@@ -22,6 +22,17 @@ when selected. The outline is keyboard accessible: use `Tab` to reach it,
 opens as a local overlay and closes after navigation. Its open/closed state is
 UI-only and is not saved with the document.
 
+## Themes
+
+Use `/theme` to open the searchable theme submenu. Dark is the default theme.
+The browser stores your selection on this device. The submenu also includes
+Light, Dracula, Nord, Solarized Dark, Catppuccin Mocha, Gruvbox Dark, Gruvbox
+Light, Rosé Pine Dawn, Tokyo Night Moon, Everforest Medium, Kanagawa Wave,
+Flexoki Light, Ayu Light, GitHub Light Default, Light Owl, Catppuccin Latte,
+Solarized Light, Everforest Light Medium, Kanagawa Lotus, and Tokyo Night Day.
+The deployed theme picker links to the license notices. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the source copy.
+
 ## Run locally
 
 Requires Node.js 22.6 or newer.
