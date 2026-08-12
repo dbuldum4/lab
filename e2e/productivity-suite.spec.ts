@@ -217,6 +217,15 @@ test("table row and column commands work in place and code language round-trips"
   await expect(restored.locator("pre code")).toHaveClass(/language-typescript/);
 });
 
+test("code language creates a code block from a paragraph", async ({ page }) => {
+  const editor = await openEditor(page);
+  await runSlash(page, "language");
+
+  const code = editor.locator("pre code");
+  await expect(code).toHaveCount(1);
+  await expect(page.getByRole("listbox", { name: "Code block language" })).toBeVisible();
+});
+
 test("contextual slash commands explain when the selection is unavailable", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.focus();
