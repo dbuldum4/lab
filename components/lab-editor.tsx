@@ -3517,8 +3517,7 @@ function LabEditorSession() {
       }
       if (command.id === "language") {
         if (!editor.isActive("codeBlock")) {
-          setNotice("Place the caret inside a code block first.");
-          return;
+          editor.chain().focus().setCodeBlock().run();
         }
         const currentLanguage = String(editor.getAttributes("codeBlock").language ?? "");
         setSelected(Math.max(0, CODE_LANGUAGES.findIndex((language) => language.id === currentLanguage)));
