@@ -66,6 +66,7 @@ test("storage status reports the real redundant copies", async ({ page }) => {
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("storage-status")).toContainText("local");
   await expect(page.getByTestId("storage-status")).toContainText("IndexedDB");
+  await expect(page.getByTestId("storage-status")).toContainText("Approximate browser storage:");
 });
 
 test("a staged draft survives abrupt page termination and a new session owner", async ({ context, page }) => {
@@ -294,6 +295,36 @@ test("search finds session names and verified note excerpts, then opens the resu
   await searchInput.press("Enter");
   await expect(page).not.toHaveURL(/#session=/);
   await expect(page.getByRole("textbox", { name: "lab local-only Markdown note" })).toContainText(originalNote);
+});
+
+test("search ignores accents in names and note content while highlighting the originals", async ({ page }) => {
+  const editor = await openEditor(page);
+  const note = "Meet for crème brûlée at the café.";
+  await editor.fill(note);
+  await waitForAuthority(page, note);
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/name");
+  await page.keyboard.press("Enter");
+  const nameInput = page.getByLabel("Session name");
+  await nameInput.fill("Café plans");
+  await nameInput.press("Enter");
+  await expect(nameInput).toBeHidden();
+
+  await editor.press("End");
+  await editor.press("Enter");
+  await editor.type("/search");
+  await page.keyboard.press("Enter");
+  const searchInput = page.getByRole("combobox", { name: "Search local notes" });
+  await searchInput.fill("  CAFE   CREME ");
+
+  const result = page.getByTestId("search-result").filter({ hasText: "Café plans" });
+  await expect(result).toContainText("crème brûlée");
+  await expect(result.locator("mark")).toHaveCount(3);
+  await expect(result.locator("mark").nth(0)).toHaveText("Café");
+  await expect(result.locator("mark").nth(1)).toHaveText("crème");
+  await expect(result.locator("mark").nth(2)).toHaveText("café");
 });
 
 test("keyboard search selection scrolls the active result into view", async ({ page }) => {
@@ -789,10 +820,13 @@ test("Chromium quota override fails closed or degrades safely, then self-heals a
 
     const markdown = "quota recovery draft";
     await editor.fill(markdown);
-    await expect(page.getByRole("status")).toContainText(
+    const saveNotice = page.getByTestId("editor-notice");
+    await expect(saveNotice).toContainText(
       /could not be saved locally|one or more local copies could not be updated/,
       { timeout: 15000 },
     );
+    await expect(saveNotice).toHaveAttribute("role", "alert");
+    await expect(saveNotice).toHaveAttribute("aria-live", "assertive");
 
     const constrained = await backendState(page);
     if (constrained.authority) {
@@ -806,6 +840,19 @@ test("Chromium quota override fails closed or degrades safely, then self-heals a
         () => page.evaluate((prefix) => Object.keys(localStorage).some((key) => key.startsWith(prefix)), PENDING_PREFIX),
         { timeout: 5000 },
       ).toBe(true);
+    }
+
+    if (!constrained.authority) {
+      await editor.press("End");
+      await editor.press("Enter");
+      await editor.type("/new");
+      await page.keyboard.press("Enter");
+      const dirtySwitch = page.getByTestId("confirm-dirty-switch");
+      await expect(dirtySwitch).toBeVisible();
+      await expect(dirtySwitch).toContainText("/recover");
+      await page.keyboard.press("Escape");
+      await expect(dirtySwitch).toBeHidden();
+      await expect(editor).toContainText(markdown);
     }
 
     await cdp.send("Storage.overrideQuotaForOrigin", { origin });
