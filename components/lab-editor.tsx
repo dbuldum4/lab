@@ -122,6 +122,7 @@ type PaletteMode =
   | "status"
   | "confirm-clear"
   | "confirm-delete"
+  | "confirm-import"
   | "name"
   | "sessions"
   | "archives"
@@ -142,6 +143,13 @@ type PaletteState = {
   top: number;
   mode: PaletteMode;
   anchor: PaletteAnchor;
+};
+
+type PendingMarkdownImport = {
+  markdown: string;
+  fileName: string;
+  revision: number;
+  currentMarkdown: string;
 };
 
 type Command = {
@@ -1792,6 +1800,7 @@ function LabEditorSession() {
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
+  const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1813,6 +1822,9 @@ function LabEditorSession() {
   const themeComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const pendingMarkdownImportRef = useRef<PendingMarkdownImport | null>(null);
+  const importRequestRef = useRef(0);
+  const importConfirmingRef = useRef(false);
   const outlineOpenRef = useRef(false);
   const outlineItemsRef = useRef<OutlineItem[]>([]);
   const largeExecCommandRef = useRef<{
@@ -1821,6 +1833,8 @@ function LabEditorSession() {
   } | null>(null);
   const inlineMathMigrationPendingRef = useRef(true);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
+  const [pendingMarkdownImport, setPendingMarkdownImport] = useState<PendingMarkdownImport | null>(null);
+  const [importConfirming, setImportConfirming] = useState(false);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [imageMetadataTarget, setImageMetadataTarget] = useState<ImageMetadataTarget | null>(null);
@@ -2909,6 +2923,14 @@ function LabEditorSession() {
   }, [palette?.mode]);
 
   useEffect(() => {
+    if (palette?.mode !== "confirm-import" || importConfirming) return;
+    const frame = window.requestAnimationFrame(() => {
+      importConfirmButtonRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [importConfirming, palette?.mode]);
+
+  useEffect(() => {
     if (palette?.mode !== "search") return;
     const frame = window.requestAnimationFrame(() => {
       searchInputRef.current?.focus();
@@ -3310,6 +3332,81 @@ function LabEditorSession() {
     editor.commands.focus("start");
     setNotice("Restored an earlier local version.");
   }, [documentId, editor, serializeMarkdown, setPalette]);
+
+  const applyMarkdownImport = useCallback((markdown: string, fileName: string) => {
+    if (!editor) return false;
+    try {
+      editor.commands.setContent(markdown, { contentType: "markdown" });
+    } catch {
+      editor.commands.focus();
+      setNotice("The selected file could not be imported as Markdown.");
+      return false;
+    }
+    editor.commands.focus("start");
+    setNotice(`Imported “${fileName || "the selected Markdown file"}”.`);
+    return true;
+  }, [editor]);
+
+  const cancelMarkdownImport = useCallback((message = "Markdown import cancelled.") => {
+    pendingMarkdownImportRef.current = null;
+    setPendingMarkdownImport(null);
+    importConfirmingRef.current = false;
+    setImportConfirming(false);
+    setPalette(null);
+    editor?.commands.focus();
+    setNotice(message);
+  }, [editor, setPalette]);
+
+  const confirmMarkdownImport = useCallback(async () => {
+    const pending = pendingMarkdownImportRef.current;
+    if (!pending || !editor || importConfirmingRef.current) return;
+
+    const changedBeforeConfirmation = pending.revision !== persistence.getState().editRevision
+      || serializeMarkdown(editor) !== pending.currentMarkdown;
+    if (changedBeforeConfirmation) {
+      cancelMarkdownImport("The note changed while the import was waiting. Import was cancelled.");
+      return;
+    }
+
+    importConfirmingRef.current = true;
+    setImportConfirming(true);
+    let flushed = false;
+    try {
+      flushed = await persistence.flush();
+    } catch {
+      flushed = false;
+    }
+    if (pendingMarkdownImportRef.current !== pending) return;
+
+    const changedWhileSaving = pending.revision !== persistence.getState().editRevision
+      || serializeMarkdown(editor) !== pending.currentMarkdown;
+    if (changedWhileSaving) {
+      cancelMarkdownImport("The note changed while it was being saved. Import was cancelled.");
+      return;
+    }
+    if (!flushed) {
+      cancelMarkdownImport("The current note could not be saved before import. Import was cancelled.");
+      return;
+    }
+
+    const preservedBeforeImport = listVersions(documentId)
+      .some((version) => version.markdown === pending.currentMarkdown);
+    if (!preservedBeforeImport) recordVersion(documentId, pending.currentMarkdown);
+    const preserved = listVersions(documentId)
+      .some((version) => version.markdown === pending.currentMarkdown);
+    if (!preserved) {
+      cancelMarkdownImport("The current note could not be preserved in version history. Import was cancelled.");
+      return;
+    }
+
+    const imported = applyMarkdownImport(pending.markdown, pending.fileName);
+    pendingMarkdownImportRef.current = null;
+    setPendingMarkdownImport(null);
+    importConfirmingRef.current = false;
+    setImportConfirming(false);
+    setPalette(null);
+    if (!imported) editor.commands.focus();
+  }, [applyMarkdownImport, cancelMarkdownImport, documentId, editor, persistence, serializeMarkdown, setPalette]);
 
   const openBacklink = useCallback((backlink: Backlink) => {
     const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
@@ -3962,6 +4059,10 @@ function LabEditorSession() {
       event.preventDefault();
       if (current.mode === "name") setSessionName(savedSessionName);
       if (current.mode === "link-editor") setLinkEditorState(null);
+      if (current.mode === "confirm-import") {
+        cancelMarkdownImport();
+        return;
+      }
       setPalette(null);
       editor?.commands.focus();
       return;
@@ -4076,6 +4177,14 @@ function LabEditorSession() {
       return;
     }
 
+    if (current.mode === "confirm-import") {
+      if (event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
+        event.preventDefault();
+        void confirmMarkdownImport();
+      }
+      return;
+    }
+
     if (current.mode === "confirm-clear") {
       if (event.key === "Enter") {
         event.preventDefault();
@@ -4122,20 +4231,51 @@ function LabEditorSession() {
 
   const onImport = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+    event.target.value = "";
     if (!file || !editor) return;
+    if (pendingMarkdownImportRef.current) {
+      pendingMarkdownImportRef.current = null;
+      setPendingMarkdownImport(null);
+      importConfirmingRef.current = false;
+      setImportConfirming(false);
+      if (paletteRef.current?.mode === "confirm-import") setPalette(null);
+    }
+    const requestId = importRequestRef.current + 1;
+    importRequestRef.current = requestId;
     const revisionAtSelection = persistence.getState().editRevision;
+    const currentMarkdown = serializeMarkdown(editor);
     void file.text()
       .then((markdown) => {
-        if (revisionAtSelection !== persistence.getState().editRevision) {
+        if (requestId !== importRequestRef.current) return;
+        if (
+          revisionAtSelection !== persistence.getState().editRevision
+          || serializeMarkdown(editor) !== currentMarkdown
+        ) {
           setNotice("The note changed while the file was loading. Import was cancelled.");
           return;
         }
-        editor.commands.setContent(markdown, { contentType: "markdown" });
-        editor.commands.focus("start");
+        if (!currentMarkdown.trim()) {
+          applyMarkdownImport(markdown, file.name);
+          return;
+        }
+        const pending = {
+          markdown,
+          fileName: file.name,
+          revision: revisionAtSelection,
+          currentMarkdown,
+        };
+        pendingMarkdownImportRef.current = pending;
+        setPendingMarkdownImport(pending);
+        importConfirmingRef.current = false;
+        setImportConfirming(false);
         setNotice(null);
+        setPalette(paletteAtSelection(editor, "confirm-import"));
       })
-      .catch(() => setNotice("The selected file could not be read as Markdown."));
-    event.target.value = "";
+      .catch(() => {
+        if (requestId === importRequestRef.current) {
+          setNotice("The selected file could not be read as Markdown.");
+        }
+      });
   };
 
   const onVaultRestore = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -4483,8 +4623,8 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" || palette.mode === "confirm-import" ? "dialog" : "status"}
+            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : palette.mode === "confirm-import" ? "Confirm Markdown import" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
@@ -4836,6 +4976,30 @@ function LabEditorSession() {
               }}
               saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
             />
+          ) : palette.mode === "confirm-import" ? (
+            <div className="palette-message palette-confirm" data-testid="confirm-import">
+              <span>Replace this note with “{pendingMarkdownImport?.fileName || "the selected Markdown file"}”?</span>
+              <small>The current note will be kept in version history.</small>
+              <div className="feature-form-actions">
+                <button
+                  ref={importConfirmButtonRef}
+                  type="button"
+                  className="feature-button feature-button-primary"
+                  disabled={importConfirming}
+                  onClick={() => { void confirmMarkdownImport(); }}
+                >
+                  Import file
+                </button>
+                <button
+                  type="button"
+                  className="feature-button"
+                  disabled={importConfirming}
+                  onClick={() => cancelMarkdownImport()}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
           ) : palette.mode === "confirm-clear" ? (
             <div className="palette-message palette-confirm">
               <span>Clear the note?</span>
