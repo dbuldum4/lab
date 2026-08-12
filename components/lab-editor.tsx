@@ -3813,7 +3813,12 @@ function LabEditorSession() {
         window.location.reload();
       };
       try {
-        await requestPersistentStorage();
+        // Persistent-storage permission is an optional durability upgrade. Some
+        // browsers can leave the request pending while waiting for a permission
+        // decision, so it must never block note hydration or editor startup.
+        void requestPersistentStorage().then(() => {
+          if (active) void refreshHealth();
+        });
         if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
           if (!active) return;
           redirectToOriginalAfterDelete();

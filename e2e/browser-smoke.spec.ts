@@ -23,6 +23,19 @@ test(`${BROWSER_SMOKE_TAG} starts and accepts editor typing`, async ({ page }) =
   await expect(editor).toHaveText("Cross-browser typing smoke");
 });
 
+test(`${BROWSER_SMOKE_TAG} hydrates while persistent-storage permission is pending`, async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator.storage, "persist", {
+      configurable: true,
+      value: () => new Promise<boolean>(() => undefined),
+    });
+  });
+
+  const editor = await openEditor(page);
+  await editor.fill("Permission-independent hydration");
+  await expect(editor).toHaveText("Permission-independent hydration");
+});
+
 test(`${BROWSER_SMOKE_TAG} keeps a note after a durable reload`, async ({ page }) => {
   const editor = await openEditor(page);
   const markdown = "Cross-browser persistence smoke";
