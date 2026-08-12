@@ -3832,7 +3832,10 @@ function LabEditorSession() {
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);
-        if (!updateNotice) return;
+        // Health inspection can finish after a command, import, or save has
+        // published a more relevant notice. Never replace an active user
+        // notice; a later health refresh can report storage state once clear.
+        if (!updateNotice || noticeController.get()) return;
         const loadNotice = nextHealth.errors.length > 0
           ? "Some local storage locations are unavailable."
           : nextHealth.conflicts > 0
@@ -3938,7 +3941,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
+  }, [documentId, editor, latestMarkdown, noticeController, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;
