@@ -43,6 +43,48 @@ export const THEMES = [
     colorScheme: "dark",
     swatches: ["#1e1e2e", "#cba6f7", "#cdd6f4"],
   },
+  {
+    id: "gruvbox-dark",
+    label: "Gruvbox Dark",
+    detail: "Warm retro dark theme",
+    colorScheme: "dark",
+    swatches: ["#282828", "#d79921", "#ebdbb2"],
+  },
+  {
+    id: "gruvbox-light",
+    label: "Gruvbox Light",
+    detail: "Warm retro light theme",
+    colorScheme: "light",
+    swatches: ["#fbf1c7", "#b57614", "#3c3836"],
+  },
+  {
+    id: "rose-pine-dawn",
+    label: "Rosé Pine Dawn",
+    detail: "Soft rose light theme",
+    colorScheme: "light",
+    swatches: ["#faf4ed", "#d7827e", "#575279"],
+  },
+  {
+    id: "tokyo-night-moon",
+    label: "Tokyo Night Moon",
+    detail: "Modern blue moon theme",
+    colorScheme: "dark",
+    swatches: ["#222436", "#82aaff", "#c8d3f5"],
+  },
+  {
+    id: "everforest-medium",
+    label: "Everforest Medium",
+    detail: "Warm forest dark theme",
+    colorScheme: "dark",
+    swatches: ["#2d353b", "#a7c080", "#d3c6aa"],
+  },
+  {
+    id: "kanagawa-wave",
+    label: "Kanagawa Wave",
+    detail: "Muted blue and amber theme",
+    colorScheme: "dark",
+    swatches: ["#1f1f28", "#e6c384", "#dcd7ba"],
+  },
 ] as const;
 
 export type ThemeId = (typeof THEMES)[number]["id"];

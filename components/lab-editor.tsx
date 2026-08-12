@@ -1791,6 +1791,7 @@ function LabEditorSession() {
   const mathInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const themeSearchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -2834,6 +2835,19 @@ function LabEditorSession() {
       });
   }, [palette, sessionArchived, sessionPinned]);
 
+  const filteredThemes = useMemo(() => {
+    if (!palette || palette.mode !== "theme") return [];
+    const normalize = (value: string) => value
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase();
+    const query = normalize(palette.query.trim());
+    if (!query) return [...THEMES];
+    return THEMES.filter((theme) => (
+      normalize(`${theme.label} ${theme.detail}`).includes(query)
+    ));
+  }, [palette]);
+
   const mathError = useMemo(() => {
     if (!mathEditorState) return null;
     if (!mathEditorState.latex.trim()) return "Enter a LaTeX expression.";
@@ -2900,6 +2914,27 @@ function LabEditorSession() {
   }, [palette?.mode]);
 
   useEffect(() => {
+    if (palette?.mode !== "theme") return;
+    const frame = window.requestAnimationFrame(() => {
+      themeSearchInputRef.current?.focus();
+      themeSearchInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [palette?.mode]);
+
+  useEffect(() => {
+    if (palette?.mode !== "theme") return;
+    const activeThemeOption = filteredThemes[selected];
+    if (!activeThemeOption) return;
+    const frame = window.requestAnimationFrame(() => {
+      document
+        .getElementById(`${PALETTE_ID}-theme-${activeThemeOption.id}`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [filteredThemes, palette?.mode, selected]);
+
+  useEffect(() => {
     if (palette?.mode !== "search" || searchLoading) return;
     const activeResult = searchResults[selected];
     if (!activeResult) return;
@@ -2953,14 +2988,6 @@ function LabEditorSession() {
       else documentElement.removeAttribute("aria-activedescendant");
       return;
     }
-    if (palette?.mode === "theme") {
-      const activeOption = THEMES[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeOption) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-theme-${activeOption.id}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
     if (palette?.mode === "backlinks") {
       const activeBacklink = backlinks[selected];
       documentElement.setAttribute("aria-expanded", "true");
@@ -2977,9 +3004,9 @@ function LabEditorSession() {
       else documentElement.removeAttribute("aria-activedescendant");
       return;
     }
-    if (palette?.mode === "search") {
-      // The searchbox owns the result list. The editor is only the command
-      // launcher and must not claim the search list as its active descendant.
+    if (palette?.mode === "search" || palette?.mode === "theme") {
+      // The focused searchbox owns its result list. The editor is only the
+      // command launcher and must not claim that list as its active descendant.
       documentElement.setAttribute("aria-expanded", "false");
       documentElement.removeAttribute("aria-controls");
       documentElement.removeAttribute("aria-activedescendant");
@@ -3877,7 +3904,7 @@ function LabEditorSession() {
 
   useLayoutEffect(() => {
     repositionPalette();
-  }, [backlinks.length, filtered.length, palette, repositionPalette, sessions.length, versions.length]);
+  }, [backlinks.length, filtered.length, filteredThemes.length, palette, repositionPalette, sessions.length, versions.length]);
 
   useEffect(() => {
     const flush = () => {
@@ -3998,10 +4025,13 @@ function LabEditorSession() {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        setSelected((selectedRef.current + direction + THEMES.length) % THEMES.length);
-      } else if (event.key === "Enter" || event.key === "Tab") {
+        const count = Math.max(1, filteredThemes.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && filteredThemes.length > 0) {
         event.preventDefault();
-        chooseTheme(THEMES[selectedRef.current]?.id ?? "dark");
+        chooseTheme(filteredThemes[selectedRef.current]?.id ?? filteredThemes[0].id);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
       }
       return;
     }
@@ -4439,7 +4469,7 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "theme" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "link-editor" ? "dialog" : "status"}
+            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
             aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
           >
           {palette.mode === "commands" ? (
@@ -4644,34 +4674,71 @@ function LabEditorSession() {
               ))}
             </div>
           ) : palette.mode === "theme" ? (
-            <div className="command-list theme-list" data-testid="theme-list">
-              {THEMES.map((theme, index) => (
-                <div
-                  className="command-item theme-item"
-                  data-selected={index === selected}
-                  data-current={theme.id === activeTheme}
-                  id={`${PALETTE_ID}-theme-${theme.id}`}
-                  key={theme.id}
-                  role="option"
-                  aria-selected={index === selected}
-                  aria-current={theme.id === activeTheme ? "true" : undefined}
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    chooseTheme(theme.id);
+            <div className="theme-panel" data-testid="theme-panel">
+              <div className="search-field">
+                <span className="search-field-prefix" aria-hidden="true">◐</span>
+                <input
+                  ref={themeSearchInputRef}
+                  type="search"
+                  role="combobox"
+                  aria-label="Search themes"
+                  aria-expanded="true"
+                  aria-controls={`${PALETTE_ID}-theme-results`}
+                  aria-activedescendant={filteredThemes[selected]
+                    ? `${PALETTE_ID}-theme-${filteredThemes[selected].id}`
+                    : undefined}
+                  aria-autocomplete="list"
+                  aria-haspopup="listbox"
+                  autoComplete="off"
+                  placeholder="Search themes"
+                  value={palette.query}
+                  onChange={(event) => {
+                    setSelected(0);
+                    setPalette({ ...palette, query: event.target.value });
                   }}
-                  onMouseEnter={() => setSelected(index)}
-                >
-                  <span className="theme-label">
-                    <span className="theme-swatches" aria-hidden="true">
-                      {theme.swatches.map((color) => (
-                        <span key={color} style={{ backgroundColor: color }} />
-                      ))}
+                />
+                <kbd>Esc</kbd>
+              </div>
+              <div
+                id={`${PALETTE_ID}-theme-results`}
+                className="command-list theme-list"
+                data-testid="theme-list"
+                role="listbox"
+                aria-label="Theme results"
+              >
+                {filteredThemes.length > 0 ? filteredThemes.map((theme, index) => (
+                  <div
+                    className="command-item theme-item"
+                    data-selected={index === selected}
+                    data-current={theme.id === activeTheme}
+                    id={`${PALETTE_ID}-theme-${theme.id}`}
+                    key={theme.id}
+                    role="option"
+                    aria-selected={index === selected}
+                    aria-current={theme.id === activeTheme ? "true" : undefined}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      chooseTheme(theme.id);
+                    }}
+                    onMouseEnter={() => setSelected(index)}
+                  >
+                    <span className="theme-label">
+                      <span className="theme-swatches" aria-hidden="true">
+                        {theme.swatches.map((color) => (
+                          <span key={color} style={{ backgroundColor: color }} />
+                        ))}
+                      </span>
+                      {theme.label}
                     </span>
-                    {theme.label}
-                  </span>
-                  <small>{theme.id === activeTheme ? "Current" : theme.detail}</small>
-                </div>
-              ))}
+                    <small>{theme.id === activeTheme ? "Current" : theme.detail}</small>
+                  </div>
+                )) : (
+                  <div className="search-empty">No themes match “{palette.query.trim()}”.</div>
+                )}
+              </div>
+              <div className="search-footer">
+                {filteredThemes.length} {filteredThemes.length === 1 ? "theme" : "themes"} · ↑↓ move · Enter select
+              </div>
             </div>
           ) : palette.mode === "backlinks" ? (
             <div className="feature-list-panel" data-testid="backlinks-panel">

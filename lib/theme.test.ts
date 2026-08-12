@@ -14,6 +14,12 @@ test("theme ids include the default and licensed palettes", () => {
   assert.equal(isThemeId("nord"), true);
   assert.equal(isThemeId("solarized-dark"), true);
   assert.equal(isThemeId("catppuccin-mocha"), true);
+  assert.equal(isThemeId("gruvbox-dark"), true);
+  assert.equal(isThemeId("gruvbox-light"), true);
+  assert.equal(isThemeId("rose-pine-dawn"), true);
+  assert.equal(isThemeId("tokyo-night-moon"), true);
+  assert.equal(isThemeId("everforest-medium"), true);
+  assert.equal(isThemeId("kanagawa-wave"), true);
   assert.equal(isThemeId("unknown"), false);
 });
 
