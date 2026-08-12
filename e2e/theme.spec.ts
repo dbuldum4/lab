@@ -23,7 +23,7 @@ test("the theme submenu keeps dark as the default and saves a new choice", async
   await expect(page.locator("body")).toHaveCSS("background-color", "rgb(251, 251, 250)");
 });
 
-test("delayed persistence permission does not clear a newer theme notice", async ({ page }) => {
+test("delayed persistence permission preserves a newer theme selection", async ({ page }) => {
   await page.addInitScript(() => {
     const state = window as typeof window & {
       resolvePersistencePermission?: () => void;
@@ -53,10 +53,12 @@ test("delayed persistence permission does not clear a newer theme notice", async
     (window as typeof window & { resolvePersistencePermission?: () => void })
       .resolvePersistencePermission?.();
   });
-  // Let the permission continuation run, then assert before the routine notice's
-  // intentional auto-dismiss window. The health refresh must not clear it.
+  // Let the permission continuation run. Routine notices may auto-dismiss, but
+  // the selection must remain applied and no storage warning may replace it.
   await page.waitForTimeout(50);
-  await expect(notice).toHaveText("Changed the theme to Light.", { timeout: 1_000 });
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(page.getByText("Some local storage locations are unavailable.")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("lab.theme.v1"))).toBe("light");
 });
 
 test("the theme submenu filters themes while keeping keyboard selection", async ({ page }) => {
