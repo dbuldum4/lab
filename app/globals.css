@@ -2323,6 +2323,16 @@ img.ProseMirror-separator {
   background: var(--surface-selected);
 }
 
+.command-item[data-disabled="true"] {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.command-item[data-disabled="true"] small {
+  color: var(--quiet);
+}
+
 .command-item[data-motion-selection="true"][data-selected="true"] {
   background: transparent;
 }

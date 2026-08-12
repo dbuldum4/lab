@@ -52,7 +52,7 @@ test("nonempty Markdown import uses an accessible confirmation and cancel preser
   await page.keyboard.press("Enter");
   await expect(dialog).toBeHidden();
   await expect(editor).toHaveText("Original note");
-  await expect(page.locator(".editor-notice")).toHaveText("Markdown import cancelled.");
+  await expect(page.locator(".editor-notice-message")).toHaveText("Markdown import cancelled.");
   await expect.poll(() => historyMarkdown(page)).toEqual(before);
 
   // The input value is reset immediately after each selection, so selecting
@@ -79,7 +79,7 @@ test("confirming import keeps the current note in history and focuses the editor
 
   await expect(editor).toBeFocused();
   await expect(editor).toHaveText("Imported note");
-  await expect(page.locator(".editor-notice")).toHaveText("Imported “new-note.md”.");
+  await expect(page.locator(".editor-notice-message")).toHaveText("Imported “new-note.md”.");
   await waitForAuthority(page, "Imported note");
   await expect.poll(async () => (await historyMarkdown(page))
     .some((markdown) => markdown.includes("Unsaved note before import"))).toBe(true);
@@ -111,6 +111,6 @@ test("Markdown import is cancelled when the note changes while the file loads", 
   await page.evaluate(() => (window as Window & { __releaseLabImport?: () => void }).__releaseLabImport?.());
 
   await expect(editor).toHaveText("Changed while loading");
-  await expect(page.locator(".editor-notice")).toHaveText("The note changed while the file was loading. Import was cancelled.");
+  await expect(page.locator(".editor-notice-message")).toHaveText("The note changed while the file was loading. Import was cancelled.");
   await expect(page.getByRole("dialog", { name: "Confirm Markdown import" })).toBeHidden();
 });
