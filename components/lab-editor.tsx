@@ -32,6 +32,10 @@ import {
   StatsPanel,
 } from "@/components/editor-feature-panels";
 import {
+  ConfirmationPanel,
+  type ConfirmationModel,
+} from "@/components/confirmation-panel";
+import {
   createEditorPersistenceController,
   type EditorPersistenceController,
 } from "@/lib/editor-persistence";
@@ -120,8 +124,7 @@ type SlashRange = { from: number; to: number };
 type PaletteMode =
   | "commands"
   | "status"
-  | "confirm-clear"
-  | "confirm-delete"
+  | "confirm"
   | "name"
   | "sessions"
   | "archives"
@@ -142,6 +145,13 @@ type PaletteState = {
   top: number;
   mode: PaletteMode;
   anchor: PaletteAnchor;
+};
+
+type PendingConfirmation = {
+  model: ConfirmationModel;
+  resolve: (confirmed: boolean) => void;
+  previousFocus: HTMLElement | null;
+  previousPalette: PaletteState | null;
 };
 
 type Command = {
@@ -229,6 +239,16 @@ const SLASH_SELECTION_TRANSITION: Transition = {
   stiffness: 480,
   damping: 35,
   mass: 0.58,
+};
+
+const DIRTY_SWITCH_CONFIRMATION: ConfirmationModel = {
+  id: "dirty-switch",
+  title: "Switch sessions despite the save failure?",
+  description: "This note could not be fully saved (another tab may have a newer copy, or storage failed). Local recovery drafts remain available via /recover.",
+  confirmLabel: "Switch anyway",
+  cancelLabel: "Keep editing",
+  tone: "danger",
+  testId: "confirm-dirty-switch",
 };
 
 const CODE_LANGUAGES = [
@@ -1792,6 +1812,7 @@ function LabEditorSession() {
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
+  const confirmationButtonRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const vaultBackupInputRef = useRef<HTMLInputElement>(null);
@@ -1813,6 +1834,7 @@ function LabEditorSession() {
   const themeComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
+  const pendingConfirmationRef = useRef<PendingConfirmation | null>(null);
   const outlineOpenRef = useRef(false);
   const outlineItemsRef = useRef<OutlineItem[]>([]);
   const largeExecCommandRef = useRef<{
@@ -1821,6 +1843,7 @@ function LabEditorSession() {
   } | null>(null);
   const inlineMathMigrationPendingRef = useRef(true);
   const [palette, setPaletteState] = useState<PaletteState | null>(null);
+  const [confirmation, setConfirmation] = useState<ConfirmationModel | null>(null);
   const [mathEditorState, setMathEditorState] = useState<MathEditorState | null>(null);
   const [imageCropTarget, setImageCropTarget] = useState<ImageCropTarget | null>(null);
   const [imageMetadataTarget, setImageMetadataTarget] = useState<ImageMetadataTarget | null>(null);
@@ -2308,6 +2331,72 @@ function LabEditorSession() {
       mode,
       anchor: { left: point.left, top: point.top, bottom: point.bottom },
     };
+  }, []);
+
+  const requestConfirmation = useCallback((model: ConfirmationModel, anchor?: PaletteState | null) => {
+    const previous = pendingConfirmationRef.current;
+    if (previous) previous.resolve(false);
+
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const previousPalette = paletteRef.current;
+    const promise = new Promise<boolean>((resolve) => {
+      pendingConfirmationRef.current = { model, resolve, previousFocus, previousPalette };
+      setConfirmation(model);
+      const instance = editorRef.current;
+      if (!instance || instance.isDestroyed) {
+        pendingConfirmationRef.current = null;
+        setConfirmation(null);
+        resolve(false);
+        return;
+      }
+      const current = anchor ?? paletteAtSelection(instance, "confirm");
+      setPalette({
+        ...current,
+        query: "",
+        mode: "confirm",
+        range: { from: instance.state.selection.from, to: instance.state.selection.from },
+      });
+    });
+    return promise;
+  }, [paletteAtSelection, setPalette]);
+
+  const settleConfirmation = useCallback((confirmed: boolean) => {
+    const pending = pendingConfirmationRef.current;
+    if (!pending) return;
+    pendingConfirmationRef.current = null;
+    setConfirmation(null);
+    setPalette(confirmed ? null : pending.previousPalette);
+    pending.resolve(confirmed);
+    window.requestAnimationFrame(() => {
+      const target = pending.previousFocus;
+      if (target?.isConnected && !target.hasAttribute("aria-hidden")) {
+        target.focus();
+        return;
+      }
+      editorRef.current?.commands.focus();
+    });
+  }, [setPalette]);
+
+  useEffect(() => {
+    if (!confirmation) return;
+    const instance = editorRef.current;
+    const wasEditable = instance?.isEditable ?? false;
+    instance?.setEditable(false, false);
+    const frame = window.requestAnimationFrame(() => {
+      confirmationButtonRef.current?.focus();
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (instance && !instance.isDestroyed) instance.setEditable(wasEditable, false);
+    };
+  }, [confirmation]);
+
+  useEffect(() => () => {
+    const pending = pendingConfirmationRef.current;
+    pendingConfirmationRef.current = null;
+    pending?.resolve(false);
   }, []);
 
   const repositionPalette = useCallback(() => {
@@ -3032,13 +3121,16 @@ function LabEditorSession() {
     }
     // Authority conflicts and replica failures both yield false. Staged recovery
     // drafts remain available via /recover, so offer an explicit escape hatch.
-    const switchAnyway = window.confirm(
-      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
-    );
-    if (switchAnyway) return "dirty";
+    const revisionAtConfirmation = persistence.getState().editRevision;
+    const switchAnyway = await requestConfirmation(DIRTY_SWITCH_CONFIRMATION);
+    if (switchAnyway && revisionAtConfirmation === persistence.getState().editRevision) return "dirty";
+    if (switchAnyway) {
+      setNotice("The note changed while the save confirmation was waiting. Switch cancelled.");
+      return "cancel";
+    }
     setNotice("This note could not be saved before switching sessions.");
     return "cancel";
-  }, [persistence]);
+  }, [persistence, requestConfirmation]);
 
   /**
    * Stop accepting edits so the async gap before navigation cannot stage/save more text.
@@ -3056,15 +3148,18 @@ function LabEditorSession() {
       flushed = false;
     }
     if (flushed || allowDirtySwitch) return true;
-    const switchAnyway = window.confirm(
-      "This note could not be fully saved (another tab may have a newer copy, or storage failed). Switch sessions anyway? Local recovery drafts remain available via /recover.",
-    );
-    if (switchAnyway) return true;
-    setNotice("This note could not be saved before switching sessions.");
+    const revisionAtConfirmation = persistence.getState().editRevision;
+    const switchAnyway = await requestConfirmation(DIRTY_SWITCH_CONFIRMATION);
+    if (switchAnyway && revisionAtConfirmation === persistence.getState().editRevision) return true;
+    if (switchAnyway) {
+      setNotice("The note changed while the save confirmation was waiting. Switch cancelled.");
+    } else {
+      setNotice("This note could not be saved before switching sessions.");
+    }
     // dispose() is irreversible; reload restores a live persistence controller.
     window.location.reload();
     return false;
-  }, [editor, persistence]);
+  }, [editor, persistence, requestConfirmation]);
 
   const navigateToSession = useCallback((session: DocumentSession, hashOverride?: string) => {
     // Preserve an explicit local-link hash, including the legacy
@@ -3300,16 +3395,32 @@ function LabEditorSession() {
 
   const restoreHistoryVersion = useCallback((version: VersionHistoryEntry) => {
     if (!editor) return;
-    const confirmed = window.confirm(
-      `Restore the version from ${new Date(version.createdAt).toLocaleString()}? The current note will be kept in version history.`,
-    );
-    if (!confirmed) return;
-    recordVersion(documentId, serializeMarkdown(editor));
-    editor.commands.setContent(version.markdown, { contentType: "markdown" });
-    setPalette(null);
-    editor.commands.focus("start");
-    setNotice("Restored an earlier local version.");
-  }, [documentId, editor, serializeMarkdown, setPalette]);
+    const currentMarkdown = serializeMarkdown(editor);
+    const revisionAtConfirmation = persistence.getState().editRevision;
+    const model: ConfirmationModel = {
+      id: "restore-history",
+      title: "Restore this version?",
+      description: `Restore the version from ${new Date(version.createdAt).toLocaleString()}? The current note will be kept in version history.`,
+      confirmLabel: "Restore version",
+      cancelLabel: "Cancel",
+      testId: "confirm-restore-history",
+    };
+    void requestConfirmation(model, paletteRef.current).then((confirmed) => {
+      if (!confirmed) return;
+      if (
+        revisionAtConfirmation !== persistence.getState().editRevision
+        || currentMarkdown !== serializeMarkdown(editor)
+      ) {
+        setNotice("The note changed while restore was waiting. Restore was cancelled.");
+        return;
+      }
+      recordVersion(documentId, currentMarkdown);
+      editor.commands.setContent(version.markdown, { contentType: "markdown" });
+      setPalette(null);
+      editor.commands.focus("start");
+      setNotice("Restored an earlier local version.");
+    });
+  }, [documentId, editor, persistence, requestConfirmation, serializeMarkdown, setPalette]);
 
   const openBacklink = useCallback((backlink: Backlink) => {
     const session = listDocumentSessions({ archived: "all" }).find((candidate) => candidate.id === backlink.documentId);
@@ -3530,7 +3641,31 @@ function LabEditorSession() {
         return;
       }
       if (command.id === "clear") {
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-clear" });
+        const model: ConfirmationModel = {
+          id: "clear",
+          title: "Clear the note?",
+          description: "The current note will be kept in version history.",
+          confirmLabel: "Clear note",
+          cancelLabel: "Keep note",
+          tone: "danger",
+          testId: "confirm-clear",
+        };
+        const currentMarkdown = serializeMarkdown(editor);
+        const revisionAtConfirmation = persistence.getState().editRevision;
+        void requestConfirmation(model, anchor).then((confirmed) => {
+          if (!confirmed) return;
+          if (
+            revisionAtConfirmation !== persistence.getState().editRevision
+            || currentMarkdown !== serializeMarkdown(editor)
+          ) {
+            setNotice("The note changed while clear was waiting. Clear was cancelled.");
+            return;
+          }
+          recordVersion(documentId, currentMarkdown);
+          editor.commands.clearContent(true);
+          setPalette(null);
+          editor.commands.focus("start");
+        });
         return;
       }
       if (command.id === "delete") {
@@ -3538,7 +3673,18 @@ function LabEditorSession() {
           setNotice("The original session cannot be deleted. Use /clear to empty it.");
           return;
         }
-        setPalette({ ...anchor, query: "", range: { from: editor.state.selection.from, to: editor.state.selection.from }, mode: "confirm-delete" });
+        const model: ConfirmationModel = {
+          id: "delete",
+          title: "Delete this session permanently?",
+          description: "This session and its local copies will be removed.",
+          confirmLabel: "Delete session",
+          cancelLabel: "Keep session",
+          tone: "danger",
+          testId: "confirm-delete",
+        };
+        void requestConfirmation(model, anchor).then((confirmed) => {
+          if (confirmed) void deleteActiveSession();
+        });
         return;
       }
       if (command.id === "recover") {
@@ -3697,7 +3843,7 @@ function LabEditorSession() {
         }
       }
     },
-    [activeTheme, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
+    [activeTheme, deleteActiveSession, documentId, editor, flushBeforeSessionSwitch, freezePersistenceForNavigation, navigateToSession, openCurrentLinkEditor, openImageMetadata, openMathEditor, persistence, refreshBacklinks, refreshSearchIndex, requestConfirmation, savedSessionName, serializeMarkdown, sessionTouchBarrier, setPalette, setSelected, toggleOutline],
   );
 
   const navigateToOutlineHeading = useCallback((itemId: string) => {
@@ -3962,12 +4108,24 @@ function LabEditorSession() {
       event.preventDefault();
       if (current.mode === "name") setSessionName(savedSessionName);
       if (current.mode === "link-editor") setLinkEditorState(null);
+      if (current.mode === "confirm") {
+        settleConfirmation(false);
+        return;
+      }
       setPalette(null);
       editor?.commands.focus();
       return;
     }
 
     if (current.mode === "name" || current.mode === "link-editor") return;
+
+    if (current.mode === "confirm") {
+      if (event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
+        event.preventDefault();
+        settleConfirmation(true);
+      }
+      return;
+    }
 
     if (current.mode === "search") {
       const isComposing = searchComposingRef.current || event.nativeEvent.isComposing;
@@ -4076,30 +4234,6 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "confirm-clear") {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        if (editor) recordVersion(documentId, serializeMarkdown(editor));
-        editor?.commands.clearContent(true);
-        setPalette(null);
-        editor?.commands.focus("start");
-      } else if (event.key.length === 1) {
-        setPalette(null);
-      }
-      return;
-    }
-
-    if (current.mode === "confirm-delete") {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        setPalette(null);
-        void deleteActiveSession();
-      } else if (event.key.length === 1) {
-        setPalette(null);
-      }
-      return;
-    }
-
     if (current.mode === "status" || current.mode === "stats" || current.mode === "shortcuts") {
       if (event.key === "Enter") event.preventDefault();
       if (event.key.length === 1 || event.key === "Enter") setPalette(null);
@@ -4172,11 +4306,25 @@ function LabEditorSession() {
           setNotice("The note changed while the vault backup was loading. Restore was cancelled.");
           return;
         }
-        const confirmed = window.confirm(
-          `Restore ${backup.sessions.length} ${backup.sessions.length === 1 ? "session" : "sessions"} from this backup? Existing sessions will never be replaced; conflicts will be restored as new sessions.`,
-        );
+        const currentMarkdown = serializeMarkdown(editor);
+        const revisionAtConfirmation = persistence.getState().editRevision;
+        const confirmed = await requestConfirmation({
+          id: "restore-vault",
+          title: "Restore this vault backup?",
+          description: `Restore ${backup.sessions.length} ${backup.sessions.length === 1 ? "session" : "sessions"} from this backup? Existing sessions will never be replaced; conflicts will be restored as new sessions.`,
+          confirmLabel: "Restore backup",
+          cancelLabel: "Cancel",
+          testId: "confirm-restore-vault",
+        });
         if (!confirmed) {
           setNotice("Vault restore cancelled.");
+          return;
+        }
+        if (
+          revisionAtConfirmation !== persistence.getState().editRevision
+          || currentMarkdown !== serializeMarkdown(editor)
+        ) {
+          setNotice("The note changed while vault restore was waiting. Restore was cancelled.");
           return;
         }
         try {
@@ -4483,8 +4631,11 @@ function LabEditorSession() {
           <div
             id={PALETTE_ID}
             className="command-palette"
-            role={palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
-            aria-label={palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
+            role={palette.mode === "confirm" ? "alertdialog" : palette.mode === "commands" || palette.mode === "sessions" || palette.mode === "archives" || palette.mode === "link-session" || palette.mode === "language" || palette.mode === "backlinks" || palette.mode === "history" ? "listbox" : palette.mode === "name" || palette.mode === "search" || palette.mode === "theme" || palette.mode === "link-editor" ? "dialog" : "status"}
+            aria-label={palette.mode === "confirm" ? "Confirm action" : palette.mode === "sessions" ? "Document sessions" : palette.mode === "archives" ? "Archived sessions" : palette.mode === "link-session" ? "Choose a session to link" : palette.mode === "search" ? "Search local notes" : palette.mode === "language" ? "Code block language" : palette.mode === "theme" ? "Choose a theme" : palette.mode === "backlinks" ? "Backlinks" : palette.mode === "history" ? "Version history" : palette.mode === "link-editor" ? "Edit link" : "Slash commands"}
+            aria-modal={palette.mode === "confirm" ? "true" : undefined}
+            aria-labelledby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-title` : undefined}
+            aria-describedby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-description` : undefined}
           >
           {palette.mode === "commands" ? (
             filtered.length > 0 ? (
@@ -4836,16 +4987,13 @@ function LabEditorSession() {
               }}
               saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
             />
-          ) : palette.mode === "confirm-clear" ? (
-            <div className="palette-message palette-confirm">
-              <span>Clear the note?</span>
-              <small>Press Enter to confirm · Esc to keep it</small>
-            </div>
-          ) : palette.mode === "confirm-delete" ? (
-            <div className="palette-message palette-confirm" data-testid="confirm-delete">
-              <span>Delete this session permanently?</span>
-              <small>Press Enter to confirm · Esc to keep it</small>
-            </div>
+          ) : palette.mode === "confirm" && confirmation ? (
+            <ConfirmationPanel
+              model={confirmation}
+              confirmButtonRef={confirmationButtonRef}
+              onConfirm={() => settleConfirmation(true)}
+              onCancel={() => settleConfirmation(false)}
+            />
           ) : (
             <div className="palette-message storage-message" data-testid="storage-status">
               <span>{health.copies} local {health.copies === 1 ? "copy" : "copies"}</span>

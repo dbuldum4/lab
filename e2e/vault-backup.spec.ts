@@ -82,6 +82,8 @@ test("backs up every session and restores Markdown plus embedded images", async 
       mimeType: "application/json",
       buffer: await readFile(downloadPath as string),
     });
+    await expect(restoredPage.getByTestId("confirm-restore-vault")).toBeVisible();
+    await restoredPage.getByTestId("confirm-restore-vault").getByRole("button", { name: "Restore backup" }).click();
 
     await expect.poll(() => restoredPage.getByRole("textbox", { name: "lab local-only Markdown note" }).textContent(), { timeout: 15000 }).toContain("Original vault note");
     await expect(restoredPage.locator("img.lab-image")).toBeVisible();
@@ -136,7 +138,6 @@ test("rejects malformed backups and keeps conflicting sessions untouched", async
     sessions: [{ id: "default", name: "Untitled", createdAt: 0, updatedAt: 0, markdown: "backup copy" }],
     assets: [],
   });
-  page.on("dialog", (dialog) => void dialog.accept());
   await editor.press("End");
   await editor.press("Enter");
   await editor.type("/restore");
@@ -146,6 +147,17 @@ test("rejects malformed backups and keeps conflicting sessions untouched", async
     mimeType: "application/json",
     buffer: Buffer.from(conflict),
   });
+  await expect(page.getByTestId("confirm-restore-vault")).toBeVisible();
+  await page.getByTestId("confirm-restore-vault").getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByTestId("confirm-restore-vault")).toBeHidden();
+  await expect(editor).toContainText("keep the current vault");
+  await page.locator('input[type="file"][accept*="application/json"]').setInputFiles({
+    name: "conflict.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(conflict),
+  });
+  await expect(page.getByTestId("confirm-restore-vault")).toBeVisible();
+  await page.getByTestId("confirm-restore-vault").getByRole("button", { name: "Restore backup" }).click();
   await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("lab.document.v1") ?? "null")?.markdown ?? null), { timeout: 15000 }).toContain("keep the current vault");
   await expect.poll(() => page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("lab.session.v1.")).length), { timeout: 15000 }).toBe(2);
 });

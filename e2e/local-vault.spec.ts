@@ -808,6 +808,19 @@ test("Chromium quota override fails closed or degrades safely, then self-heals a
       ).toBe(true);
     }
 
+    if (!constrained.authority) {
+      await editor.press("End");
+      await editor.press("Enter");
+      await editor.type("/new");
+      await page.keyboard.press("Enter");
+      const dirtySwitch = page.getByTestId("confirm-dirty-switch");
+      await expect(dirtySwitch).toBeVisible();
+      await expect(dirtySwitch).toContainText("/recover");
+      await page.keyboard.press("Escape");
+      await expect(dirtySwitch).toBeHidden();
+      await expect(editor).toContainText(markdown);
+    }
+
     await cdp.send("Storage.overrideQuotaForOrigin", { origin });
     await page.reload();
     await openEditor(page);
