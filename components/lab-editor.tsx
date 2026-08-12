@@ -1728,8 +1728,19 @@ function LabEditorSession() {
   const [sessionTouchBarrier] = useState(() => new SessionTouchBarrier());
   const [hydrating, setHydrating] = useState(true);
   const [notice, setNoticeState] = useState<EditorNotice | null>(null);
+  const [latestNotice] = useState(() => {
+    let value: EditorNotice | null = null;
+    return {
+      get: () => value,
+      set: (next: EditorNotice | null) => { value = next; },
+    };
+  });
+  const publishNotice = useCallback((nextNotice: EditorNotice | null) => {
+    latestNotice.set(nextNotice);
+    setNoticeState(nextNotice);
+  }, [latestNotice]);
   const [noticeController] = useState<EditorNoticeController>(() => (
-    createEditorNoticeController({ onChange: setNoticeState })
+    createEditorNoticeController({ onChange: publishNotice })
   ));
   const setNotice = useCallback((message: string | null, kind?: EditorNoticeKind) => {
     noticeController.set(message, kind);
@@ -3827,11 +3838,15 @@ function LabEditorSession() {
   useEffect(() => {
     if (!editor) return;
     let active = true;
-    const refreshHealth = async () => {
+    const refreshHealth = async (updateNotice = true) => {
       try {
         const nextHealth = await inspectLocalStorage();
         if (!active) return;
         setHealth(nextHealth);
+        // Health inspection can finish after a command, import, or save has
+        // published a more relevant notice. Never replace an active user
+        // notice; a later health refresh can report storage state once clear.
+        if (!updateNotice || latestNotice.get()) return;
         const loadNotice = nextHealth.errors.length > 0
           ? "Some local storage locations are unavailable."
           : nextHealth.conflicts > 0
@@ -3839,7 +3854,9 @@ function LabEditorSession() {
             : openedWithInvalidSessionHash
               ? "That session link was invalid. Opened the original note."
               : null;
-        setNotice(loadNotice);
+        // A healthy inspection has no message to publish. Avoid turning that
+        // absence into a destructive `setNotice(null)` that can race a command.
+        if (loadNotice) setNotice(loadNotice);
       } catch {
         if (active) setNotice("Could not load the saved note. A new local note is ready instead.");
       }
@@ -3858,7 +3875,14 @@ function LabEditorSession() {
         window.location.reload();
       };
       try {
-        await requestPersistentStorage();
+        // Persistent-storage permission is an optional durability upgrade. Some
+        // browsers can leave the request pending while waiting for a permission
+        // decision, so it must never block note hydration or editor startup.
+        void requestPersistentStorage().then(() => {
+          // A delayed permission result must not overwrite a newer notice from
+          // an edit, import, or save failure. Only refresh the health model.
+          if (active) void refreshHealth(false);
+        });
         if (isLocalDocumentDeleted(documentId) && documentId !== DEFAULT_DOCUMENT_ID) {
           if (!active) return;
           redirectToOriginalAfterDelete();
@@ -3930,7 +3954,7 @@ function LabEditorSession() {
     return () => {
       active = false;
     };
-  }, [documentId, editor, latestMarkdown, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
+  }, [documentId, editor, latestMarkdown, latestNotice, openedWithInvalidSessionHash, persistence, serializeMarkdown, setNotice, syncInterface]);
 
   useEffect(() => {
     if (!editor) return;

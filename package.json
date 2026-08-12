@@ -24,6 +24,7 @@
     "test": "npm run test:fast",
     "test:e2e": "playwright test --project=chromium --grep-invert \"@stress|@perf\"",
     "test:e2e:webkit": "playwright test --project=webkit-smoke",
+    "test:e2e:firefox": "playwright test --project=firefox-smoke",
     "test:stress": "playwright test e2e/local-vault.stress.spec.ts --grep @stress --workers=1",
     "test:all": "npm run test:fast && npm run test:perf && npm run test:e2e",
     "verify": "npm run test:all && npm run lint && npm run typecheck && npm run build"

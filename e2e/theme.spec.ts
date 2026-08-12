@@ -23,6 +23,42 @@ test("the theme submenu keeps dark as the default and saves a new choice", async
   await expect(page.locator("body")).toHaveCSS("background-color", "rgb(251, 251, 250)");
 });
 
+test("delayed persistence permission does not clear a newer theme notice", async ({ page }) => {
+  await page.addInitScript(() => {
+    const state = window as typeof window & {
+      resolvePersistencePermission?: () => void;
+    };
+    Object.defineProperty(Object.getPrototypeOf(navigator.storage), "persist", {
+      configurable: true,
+      value: () => new Promise<boolean>((resolve) => {
+        state.resolvePersistencePermission = () => resolve(true);
+      }),
+    });
+  });
+
+  const editor = await openEditor(page);
+  await expect.poll(() => page.evaluate(() => typeof (
+    window as typeof window & { resolvePersistencePermission?: () => void }
+  ).resolvePersistencePermission)).toBe("function");
+
+  await editor.type("/theme");
+  await page.keyboard.press("Enter");
+  await page.getByTestId("theme-list")
+    .getByRole("option", { name: "Light Warm neutral light theme", exact: true })
+    .click();
+  const notice = page.locator(".editor-notice-message");
+  await expect(notice).toHaveText("Changed the theme to Light.");
+
+  await page.evaluate(() => {
+    (window as typeof window & { resolvePersistencePermission?: () => void })
+      .resolvePersistencePermission?.();
+  });
+  // Let the permission continuation run, then assert before the routine notice's
+  // intentional auto-dismiss window. The health refresh must not clear it.
+  await page.waitForTimeout(50);
+  await expect(notice).toHaveText("Changed the theme to Light.", { timeout: 1_000 });
+});
+
 test("the theme submenu filters themes while keeping keyboard selection", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.type("/theme");

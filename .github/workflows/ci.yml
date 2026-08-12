@@ -49,6 +49,12 @@ jobs:
       - name: WebKit smoke tests
         run: npm run test:e2e:webkit
 
+      - name: Install Firefox
+        run: npx playwright install --with-deps firefox
+
+      - name: Firefox smoke tests
+        run: npm run test:e2e:firefox
+
       - name: Build
         run: npm run build
 
