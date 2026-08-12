@@ -84,6 +84,7 @@ import { EditorBlockExtensions } from "@/lib/editor-blocks";
 import { markdownExportFilename } from "@/lib/export-filename";
 import {
   normalizeSearchQuery,
+  searchMatchRanges,
   searchableMarkdown,
   searchLocalDocuments,
   type LocalSearchDocument,
@@ -782,20 +783,18 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
 }
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function highlightSearchText(value: string, query: string): ReactNode {
-  const terms = [...new Set(normalizeSearchQuery(query).toLowerCase().split(" ").filter(Boolean))]
-    .sort((left, right) => right.length - left.length);
-  if (terms.length === 0) return value;
-  const matcher = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
-  return value.split(matcher).map((part, index) => (
-    terms.includes(part.toLowerCase())
-      ? <mark key={`${part}-${index}`}>{part}</mark>
-      : <span key={`${part}-${index}`}>{part}</span>
-  ));
+  const ranges = searchMatchRanges(value, query);
+  if (ranges.length === 0) return value;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  ranges.forEach((range, index) => {
+    if (range.start > cursor) parts.push(<span key={`text-${index}`}>{value.slice(cursor, range.start)}</span>);
+    parts.push(<mark key={`match-${index}`}>{value.slice(range.start, range.end)}</mark>);
+    cursor = Math.max(cursor, range.end);
+  });
+  if (cursor < value.length) parts.push(<span key="text-tail">{value.slice(cursor)}</span>);
+  return parts;
 }
 
 function downloadMarkdown(filename: string, markdown: string) {
@@ -1750,7 +1749,7 @@ const SlashCommandInput = Extension.create({
     return [
       new InputRule({
         find: (text) => {
-          const match = text.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
+          const match = text.match(/(?:^|\s)\/([\p{L}\p{M}\p{N}_-]*)$/u);
           if (!match || match.index === undefined) return null;
           return { index: match.index, text: match[0] };
         },
@@ -2291,7 +2290,7 @@ function LabEditorSession() {
     const { $from } = instance.state.selection;
     if (!instance.state.selection.empty || !$from.parent.isTextblock || isCodeBlock($from.parent)) return null;
     const before = $from.parent.textBetween(0, $from.parentOffset, undefined, "\ufffc");
-    const match = before.match(/(?:^|\s)\/([a-z0-9-]*)$/i);
+    const match = before.match(/(?:^|\s)\/([\p{L}\p{M}\p{N}_-]*)$/u);
     if (!match) return null;
     const token = `/${match[1]}`;
     const from = instance.state.selection.from - token.length;
@@ -2844,15 +2843,15 @@ function LabEditorSession() {
 
   const filtered = useMemo(() => {
     if (!palette || palette.mode !== "commands") return [];
-    const query = palette.query.toLowerCase();
+    const query = normalizeSearchQuery(palette.query);
     return COMMANDS
       .filter((command) => command.id !== (sessionPinned ? "pin" : "unpin"))
       .filter((command) => command.id !== (sessionArchived ? "archive" : "unarchive"))
-      .filter((command) => `${command.id} ${command.label} ${command.terms}`.toLowerCase().includes(query))
+      .filter((command) => normalizeSearchQuery(`${command.id} ${command.label} ${command.terms}`).includes(query))
       .sort((left, right) => {
-        const score = (command: Command) => command.id === query
+        const score = (command: Command) => normalizeSearchQuery(command.id) === query
           ? 0
-          : command.label.toLowerCase().startsWith(query)
+          : normalizeSearchQuery(command.label).startsWith(query)
             ? 1
             : 2;
         return score(left) - score(right);
@@ -2861,14 +2860,10 @@ function LabEditorSession() {
 
   const filteredThemes = useMemo(() => {
     if (!palette || palette.mode !== "theme") return [];
-    const normalize = (value: string) => value
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase();
-    const query = normalize(palette.query.trim());
+    const query = normalizeSearchQuery(palette.query);
     if (!query) return [...THEMES];
     return THEMES.filter((theme) => (
-      normalize(`${theme.label} ${theme.detail}`).includes(query)
+      normalizeSearchQuery(`${theme.label} ${theme.detail}`).includes(query)
     ));
   }, [palette]);
 
