@@ -41,10 +41,12 @@ test("nonempty Markdown import uses an accessible confirmation and cancel preser
   await expect.poll(() => historyMarkdown(page)).toContain("Original note\n\n");
   const before = await historyMarkdown(page);
   await selectMarkdown(page, "replacement.md", "Replacement note");
-  const dialog = page.getByRole("dialog", { name: "Confirm Markdown import" });
+  const dialog = page.getByRole("alertdialog", { name: "Confirm Markdown import" });
   await expect(dialog).toBeVisible();
+  await expect(dialog).toHaveAttribute("aria-modal", "true");
   await expect(dialog).toContainText("replacement.md");
   await expect(dialog.getByRole("button", { name: "Import file" })).toBeFocused();
+  await expect(editor).toHaveAttribute("contenteditable", "false");
 
   const cancelButton = dialog.getByRole("button", { name: "Cancel" });
   await page.keyboard.press("Tab");
@@ -58,9 +60,9 @@ test("nonempty Markdown import uses an accessible confirmation and cancel preser
   // The input value is reset immediately after each selection, so selecting
   // the same path again still opens the confirmation flow.
   await selectMarkdown(page, "replacement.md", "Replacement note");
-  await expect(page.getByRole("dialog", { name: "Confirm Markdown import" })).toBeVisible();
+  await expect(page.getByRole("alertdialog", { name: "Confirm Markdown import" })).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog", { name: "Confirm Markdown import" })).toBeHidden();
+  await expect(page.getByRole("alertdialog", { name: "Confirm Markdown import" })).toBeHidden();
   await expect(editor).toHaveText("Original note");
   await expect.poll(() => historyMarkdown(page)).toEqual(before);
 });
@@ -73,7 +75,7 @@ test("confirming import keeps the current note in history and focuses the editor
 
   await openImport(page);
   await selectMarkdown(page, "new-note.md", "Imported note");
-  const dialog = page.getByRole("dialog", { name: "Confirm Markdown import" });
+  const dialog = page.getByRole("alertdialog", { name: "Confirm Markdown import" });
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Import file" }).click();
 
@@ -112,5 +114,5 @@ test("Markdown import is cancelled when the note changes while the file loads", 
 
   await expect(editor).toHaveText("Changed while loading");
   await expect(page.locator(".editor-notice-message")).toHaveText("The note changed while the file was loading. Import was cancelled.");
-  await expect(page.getByRole("dialog", { name: "Confirm Markdown import" })).toBeHidden();
+  await expect(page.getByRole("alertdialog", { name: "Confirm Markdown import" })).toBeHidden();
 });

@@ -307,7 +307,7 @@ function createDeferredMathRenderer(element: HTMLElement, render: () => void) {
 }
 
 const InlineMathMarkdown = InlineMath.extend({
-  renderMarkdown: (node) => `$$${String(node.attrs?.latex ?? "")}$$`,
+  renderMarkdown: (node) => `$$${escapeInlineMathLatex(String(node.attrs?.latex ?? ""))}$$`,
   markdownTokenizer: {
     name: "inlineMath",
     level: "inline",
@@ -315,7 +315,7 @@ const InlineMathMarkdown = InlineMath.extend({
     tokenize: (source: string) => {
       const match = source.match(/^\$\$((?:\\\$|[^$\n])+?)\$\$(?!\$)/);
       if (!match) return undefined;
-      return { type: "inlineMath", raw: match[0], latex: match[1].trim() };
+      return { type: "inlineMath", raw: match[0], latex: unescapeInlineMathLatex(match[1].trim()) };
     },
   },
   addInputRules() {
@@ -458,6 +458,14 @@ const MATH_EDITOR_ID = "math-editor-popover";
 const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
 const INLINE_MATH_PATTERN = /^\$\$((?:\\\$|[^$\n])+?)\$\$$/;
 const BLOCK_MATH_PATTERN = /^\$\$\n([\s\S]*?)\n\$\$(?:\n)?$/;
+
+function unescapeInlineMathLatex(value: string) {
+  return value.replace(/\\\$/g, "$");
+}
+
+function escapeInlineMathLatex(value: string) {
+  return value.replace(/\$/g, "\\$");
+}
 
 function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
@@ -638,7 +646,11 @@ function migrateInlineMath(instance: Editor) {
     const pattern = /\$\$((?:\\\$|[^$\n])+?)\$\$/g;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(node.text)) !== null) {
-      matches.push({ from: pos + match.index, to: pos + match.index + match[0].length, latex: match[1] });
+      matches.push({
+        from: pos + match.index,
+        to: pos + match.index + match[0].length,
+        latex: unescapeInlineMathLatex(match[1]),
+      });
     }
   });
   if (matches.length === 0) return false;
@@ -2110,7 +2122,7 @@ function LabEditorSession() {
     StarterKit.configure({
       heading: { levels: [1, 2, 3] },
       link: {
-        openOnClick: true,
+        openOnClick: false,
         linkOnPaste: true,
         // The built-in autolinker runs before MarkdownLinkInput and consumes URLs
         // inside `[label](https://...)`. Plain URLs are handled by PlainUrlInput below.
@@ -2229,7 +2241,7 @@ function LabEditorSession() {
     const previousFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
-    const previousPalette = paletteRef.current;
+    const previousPalette = previous?.previousPalette ?? paletteRef.current;
     const promise = new Promise<boolean>((resolve) => {
       pendingConfirmationRef.current = { model, resolve, previousFocus, previousPalette };
       setConfirmation(model);
@@ -2281,6 +2293,16 @@ function LabEditorSession() {
       if (instance && !instance.isDestroyed) instance.setEditable(wasEditable, false);
     };
   }, [confirmation]);
+
+  useEffect(() => {
+    if (palette?.mode !== "confirm-import") return;
+    const instance = editorRef.current;
+    const wasEditable = instance?.isEditable ?? false;
+    instance?.setEditable(false, false);
+    return () => {
+      if (instance && !instance.isDestroyed) instance.setEditable(wasEditable, false);
+    };
+  }, [palette?.mode]);
 
   useEffect(() => () => {
     const pending = pendingConfirmationRef.current;
@@ -2369,7 +2391,8 @@ function LabEditorSession() {
         if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
 
         const link = target?.closest<HTMLAnchorElement>("a[href]");
-        const linkedDocumentId = documentIdFromLocalHref(link?.getAttribute("href"));
+        const href = link?.getAttribute("href");
+        const linkedDocumentId = documentIdFromLocalHref(href);
         if (link && linkedDocumentId) {
           event.preventDefault();
           const session = listDocumentSessions({ archived: "all" })
@@ -2379,6 +2402,11 @@ function LabEditorSession() {
             return true;
           }
           void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
+          return true;
+        }
+        if (link && href && /^https?:/i.test(href)) {
+          event.preventDefault();
+          window.open(href, "_blank", "noopener,noreferrer");
           return true;
         }
 
@@ -2466,7 +2494,9 @@ function LabEditorSession() {
           if (inlineMatch) {
             view.dispatch(
               view.state.tr
-                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({ latex: inlineMatch[1] }))
+                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({
+                  latex: unescapeInlineMathLatex(inlineMatch[1]),
+                }))
                 .scrollIntoView(),
             );
             return true;
@@ -2887,20 +2917,6 @@ function LabEditorSession() {
       }
       return;
     }
-    if (palette?.mode === "sessions" || palette?.mode === "archives" || palette?.mode === "link-session") {
-      const activeSession = sessions[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeSession) {
-        documentElement.setAttribute(
-          "aria-activedescendant",
-          `${PALETTE_ID}-session-${activeSession.id}`,
-        );
-      } else {
-        documentElement.removeAttribute("aria-activedescendant");
-      }
-      return;
-    }
     if (palette?.mode === "language") {
       const activeLanguage = CODE_LANGUAGES[selected];
       documentElement.setAttribute("aria-expanded", "true");
@@ -2909,23 +2925,15 @@ function LabEditorSession() {
       else documentElement.removeAttribute("aria-activedescendant");
       return;
     }
-    if (palette?.mode === "backlinks") {
-      const activeBacklink = backlinks[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeBacklink) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-backlink-${activeBacklink.documentId}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    if (palette?.mode === "history") {
-      const activeVersion = versions[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeVersion) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-version-${activeVersion.id}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    if (palette?.mode === "search" || palette?.mode === "theme") {
+    if (
+      palette?.mode === "sessions"
+      || palette?.mode === "archives"
+      || palette?.mode === "link-session"
+      || palette?.mode === "backlinks"
+      || palette?.mode === "history"
+      || palette?.mode === "search"
+      || palette?.mode === "theme"
+    ) {
       // The focused searchbox owns its result list. The editor is only the
       // command launcher and must not claim that list as its active descendant.
       documentElement.setAttribute("aria-expanded", "false");
@@ -3140,8 +3148,16 @@ function LabEditorSession() {
       setNotice("Place the caret inside a link to edit it.");
       return false;
     }
-    const mark = editor.state.doc.resolve(range.from + 1).marks().find((candidate) => candidate.type === linkType)
-      ?? editor.state.selection.$from.marks().find((candidate) => candidate.type === linkType);
+    let mark = editor.state.doc.nodeAt(range.from)?.marks.find((candidate) => candidate.type === linkType) ?? null;
+    if (!mark) {
+      editor.state.doc.nodesBetween(range.from, range.to, (node) => {
+        const found = node.marks.find((candidate) => candidate.type === linkType);
+        if (found) {
+          mark = found;
+          return false;
+        }
+      });
+    }
     if (!mark) {
       setNotice("That link could not be read.");
       return false;
@@ -4082,24 +4098,13 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "sessions" || current.mode === "archives" || current.mode === "link-session") {
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, sessions.length);
-        setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && sessions.length > 0) {
-        event.preventDefault();
-        const session = sessions[selectedRef.current] ?? sessions[0];
-        if (current.mode === "link-session") {
-          insertSessionLink(session);
-        } else if (session.id === documentId) {
-          setPalette(null);
-          editor?.commands.focus();
-        } else {
-          void resumeSession(session);
-        }
-      }
+    if (
+      current.mode === "sessions"
+      || current.mode === "archives"
+      || current.mode === "link-session"
+      || current.mode === "backlinks"
+      || current.mode === "history"
+    ) {
       return;
     }
 
@@ -4140,37 +4145,7 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "backlinks") {
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, backlinks.length);
-        setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && backlinks.length > 0) {
-        event.preventDefault();
-        openBacklink(backlinks[selectedRef.current] ?? backlinks[0]);
-      }
-      return;
-    }
-
-    if (current.mode === "history") {
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, versions.length);
-        setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && versions.length > 0) {
-        event.preventDefault();
-        restoreHistoryVersion(versions[selectedRef.current] ?? versions[0]);
-      }
-      return;
-    }
-
     if (current.mode === "confirm-import") {
-      if (event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
-        event.preventDefault();
-        void confirmMarkdownImport();
-      }
       return;
     }
 

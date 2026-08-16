@@ -38,6 +38,10 @@ test("marks context-specific commands unavailable with an actionable reason", ()
 
 test("makes each contextual command available in its matching editor context", () => {
   assert.equal(commandAvailability("table-row-before", { ...plainContext, inTable: true }).available, true);
+  assert.deepEqual(commandAvailability("table", { ...plainContext, inTable: true }), {
+    available: false,
+    reason: "Nested tables are not portable.",
+  });
   assert.equal(commandAvailability("language", { ...plainContext, inCodeBlock: true }).available, true);
   assert.equal(commandAvailability("edit-link", { ...plainContext, inLink: true }).available, true);
   assert.equal(commandAvailability("image-metadata", { ...plainContext, selectedImage: true }).available, true);

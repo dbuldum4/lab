@@ -183,6 +183,28 @@ test("malformed or partial backups fail validation before storage changes", asyn
   badCounts.counts.sessions = 2;
   assert.throws(() => parseVaultBackup(badCounts), /manifest counts/);
   assert.equal(await loadLocalDocument(), "keep this note");
+
+  const unsupported = buildVaultBackup([{ ...session("default", "Untitled"), markdown: "keep this note" }], 100);
+  assert.throws(
+    () => parseVaultBackup({ ...unsupported, version: 2 }),
+    /version is not supported/,
+  );
+  const duplicateIds = {
+    ...unsupported,
+    counts: { sessions: 2, assets: unsupported.counts.assets },
+    sessions: [
+      unsupported.sessions[0],
+      { ...unsupported.sessions[0], name: "Copy" },
+    ],
+  };
+  assert.throws(() => parseVaultBackup(duplicateIds), /appears more than once/);
+  for (const exportedAt of [Number.NaN, -1]) {
+    assert.throws(
+      () => parseVaultBackup({ ...unsupported, exportedAt }),
+      /timestamp is invalid/,
+    );
+  }
+  assert.equal(await loadLocalDocument(), "keep this note");
 });
 
 test("legacy backups receive metadata defaults and invalid new metadata is rejected", () => {

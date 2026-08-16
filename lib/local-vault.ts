@@ -95,7 +95,7 @@ const VAULT_LOCK_PREFIX = "lab-private-vault";
 const DELETED_KEY_PREFIX = "lab.document.deleted.v1.";
 
 let vaultQueue: Promise<void> = Promise.resolve();
-let lastIssuedTimestamp = 0;
+const lastIssuedTimestamps = new Map<string, number>();
 let pendingOwner: string | null = null;
 let webLocksUnavailable = false;
 let activeDocumentId = DEFAULT_DOCUMENT_ID;
@@ -119,7 +119,6 @@ export function setLocalDocumentScope(documentId: string) {
   activeDocumentId = next;
   // Keep vaultQueue so in-flight work for the previous scope can finish under
   // its captured operationDocumentId instead of writing into the new namespace.
-  lastIssuedTimestamp = 0;
   pendingOwner = null;
 }
 
@@ -184,12 +183,14 @@ function localSnapshotKey() {
   return isDefaultDocument() ? LEGACY_LOCAL_KEY : `lab.document.v2.${currentDocumentId()}`;
 }
 
-function legacyPendingKey() {
-  return isDefaultDocument() ? LEGACY_PENDING_KEY : `lab.document.pending.v1.${currentDocumentId()}`;
+function legacyPendingKey(documentId: string = currentDocumentId()) {
+  return isDefaultDocument(documentId) ? LEGACY_PENDING_KEY : `lab.document.pending.v1.${normalizedDocumentId(documentId)}`;
 }
 
-function pendingKeyPrefix() {
-  return isDefaultDocument() ? LEGACY_PENDING_KEY_PREFIX : `lab.document.pending.scoped.v2.${currentDocumentId()}.`;
+function pendingKeyPrefix(documentId: string = currentDocumentId()) {
+  return isDefaultDocument(documentId)
+    ? LEGACY_PENDING_KEY_PREFIX
+    : `lab.document.pending.scoped.v2.${normalizedDocumentId(documentId)}.`;
 }
 
 /** IndexedDB authority key for an explicit document id (no ambient scope). */
@@ -226,14 +227,14 @@ function getLocalStorage(): Storage | null {
   }
 }
 
-function pendingStorageKey() {
+function pendingStorageKey(documentId: string = currentDocumentId()) {
   // A module-scoped owner is unique to this page realm. sessionStorage cannot
   // provide that guarantee because auxiliary and duplicated tabs can inherit a
   // copy of the opener's values. Reload recovery still works because load scans
   // every namespaced pending record before this page creates its next draft.
-  if (!isBrowserContext()) return legacyPendingKey();
+  if (!isBrowserContext()) return legacyPendingKey(documentId);
   pendingOwner ??= globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-  return `${pendingKeyPrefix()}${pendingOwner}`;
+  return `${pendingKeyPrefix(documentId)}${pendingOwner}`;
 }
 
 function hasIndexedDb() {
@@ -422,13 +423,16 @@ export function selectCurrentSnapshot(candidates: readonly LocalSnapshot[]): Loc
   return [...candidates].sort((left, right) => compareSnapshotOrder(right, left))[0] ?? null;
 }
 
-function rememberTimestamp(snapshot: LocalSnapshot | null) {
-  if (snapshot) lastIssuedTimestamp = Math.max(lastIssuedTimestamp, snapshot.updatedAt);
+function rememberTimestamp(snapshot: LocalSnapshot | null, documentId: string = currentDocumentId()) {
+  if (!snapshot) return;
+  const id = normalizedDocumentId(documentId);
+  lastIssuedTimestamps.set(id, Math.max(lastIssuedTimestamps.get(id) ?? 0, snapshot.updatedAt));
 }
 
-function issueTimestamp() {
-  const updatedAt = Math.max(Date.now(), lastIssuedTimestamp + 1);
-  lastIssuedTimestamp = updatedAt;
+function issueTimestamp(documentId: string = currentDocumentId()) {
+  const id = normalizedDocumentId(documentId);
+  const updatedAt = Math.max(Date.now(), (lastIssuedTimestamps.get(id) ?? 0) + 1);
+  lastIssuedTimestamps.set(id, updatedAt);
   return updatedAt;
 }
 
@@ -1029,11 +1033,15 @@ function clearPendingDocument(expected: PendingDocument | null = null) {
  * async vault operation; the subsequent save will then fail with saved:false
  * and surface the deleted-session notice.
  */
-export function stageLocalDocument(markdown: string) {
-  if (isLocalDocumentDeleted()) return false;
+export function stageLocalDocument(markdown: string, documentId: string = activeDocumentId) {
+  // Staging is synchronous editor recovery for the tab's active note. Never
+  // follow operationDocumentId — a queued backup/search/restore of another
+  // session must not redirect keystrokes into that session's pending slot.
+  const id = normalizedDocumentId(documentId);
+  if (isLocalDocumentDeleted(id)) return false;
   const storage = getLocalStorage();
   if (!storage) return false;
-  const updatedAt = issueTimestamp();
+  const updatedAt = issueTimestamp(id);
   const pending: PendingDocument = {
     markdown,
     updatedAt,
@@ -1041,7 +1049,7 @@ export function stageLocalDocument(markdown: string) {
     version: 2,
   };
   try {
-    storage.setItem(pendingStorageKey(), JSON.stringify(pending));
+    storage.setItem(pendingStorageKey(id), JSON.stringify(pending));
     return true;
   } catch {
     return false;
@@ -1834,7 +1842,7 @@ export async function deleteLocalDocumentIfMatches(documentId: string, expectedM
 /** Reset process-local sequencing state between isolated storage contract tests. */
 export function resetLocalVaultStateForTests() {
   vaultQueue = Promise.resolve();
-  lastIssuedTimestamp = 0;
+  lastIssuedTimestamps.clear();
   pendingOwner = null;
   webLocksUnavailable = false;
   activeDocumentId = DEFAULT_DOCUMENT_ID;

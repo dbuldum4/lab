@@ -59,11 +59,14 @@ test("theme filtering is accent-insensitive and ignores non-theme palettes", () 
 
 test("palette accessibility contracts cover every mode family", () => {
   assert.equal(paletteRole("commands"), "listbox");
-  assert.equal(paletteRole("history"), "listbox");
+  assert.equal(paletteRole("language"), "listbox");
+  assert.equal(paletteRole("history"), "dialog");
+  assert.equal(paletteRole("sessions"), "dialog");
   assert.equal(paletteRole("search"), "dialog");
   assert.equal(paletteRole("status"), "status");
   assert.equal(paletteLabel("link-session"), "Choose a session to link");
   assert.equal(paletteLabel("theme"), "Choose a theme");
   assert.equal(paletteRole("confirm"), "alertdialog");
+  assert.equal(paletteRole("confirm-import"), "alertdialog");
   assert.equal(paletteLabel("confirm"), "Confirm action");
 });

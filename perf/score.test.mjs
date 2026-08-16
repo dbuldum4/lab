@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   calculatePerformanceScore,
   latencyRatio,
+  scoreMeetsFloor,
 } from "../scripts/perf/score-calculation.mjs";
 
 const metrics = [
@@ -31,6 +32,8 @@ test("the aggregate score is bounded and missing metrics fail closed", () => {
     ["load", { valueMs: 100_000 }],
   ]);
   assert.equal(calculatePerformanceScore(metrics, verySlow).score, 1);
+  assert.equal(scoreMeetsFloor(50, 40), true);
+  assert.equal(scoreMeetsFloor(39.9, 40), false);
   assert.throws(
     () => calculatePerformanceScore(metrics, new Map([["typing", { valueMs: 20 }]])),
     /Missing score metrics: load/,

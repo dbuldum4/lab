@@ -174,6 +174,7 @@ export function CommandPalette({
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
   const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
   const pickerFilterInputRef = useRef<HTMLInputElement>(null);
+  const pickerComposingRef = useRef(false);
   const [pickerQuery, setPickerQuery] = useState("");
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const rankedCommands = rankCommandOptions(palette, sessionPinned, sessionArchived, commandContext);
@@ -188,24 +189,34 @@ export function CommandPalette({
     if (!["sessions", "archives", "link-session", "backlinks", "history"].includes(palette?.mode ?? "")) return;
     const frame = window.requestAnimationFrame(() => {
       setPickerQuery("");
-      setSelected(0);
       pickerFilterInputRef.current?.focus();
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [palette?.mode, setSelected]);
+  }, [palette?.mode]);
 
-  const pickerInput = (label: string, options: readonly unknown[], select: (index: number) => void) => (
+  const pickerInput = (
+    label: string,
+    options: readonly unknown[],
+    select: (index: number) => void,
+    activeOptionId: string | undefined,
+  ) => (
     <div className="search-field picker-filter-field">
       <input
         ref={pickerFilterInputRef}
         type="search"
         role="combobox"
         aria-expanded="true"
-        aria-controls={PALETTE_ID}
+        aria-controls={`${PALETTE_ID}-picker-results`}
+        aria-activedescendant={activeOptionId}
+        aria-autocomplete="list"
+        aria-haspopup="listbox"
         aria-label={label}
         value={pickerQuery}
         onChange={(event) => { setPickerQuery(event.target.value); setSelected(0); }}
+        onCompositionStart={() => { pickerComposingRef.current = true; }}
+        onCompositionEnd={() => { pickerComposingRef.current = false; }}
         onKeyDown={(event) => {
+          if (pickerComposingRef.current || event.nativeEvent.isComposing) return;
           if (event.key === "ArrowDown" || event.key === "ArrowUp") {
             event.preventDefault(); event.stopPropagation();
             const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -301,7 +312,7 @@ export function CommandPalette({
             className="command-palette"
             role={paletteRole(palette.mode)}
             aria-label={paletteLabel(palette.mode)}
-            aria-modal={palette.mode === "confirm" ? "true" : undefined}
+            aria-modal={palette.mode === "confirm" || palette.mode === "confirm-import" ? "true" : undefined}
             aria-labelledby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-title` : undefined}
             aria-describedby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-description` : undefined}
           >
@@ -456,7 +467,13 @@ export function CommandPalette({
                   palette.mode === "archives" ? "Search archived sessions" : palette.mode === "link-session" ? "Search sessions to link" : "Search sessions",
                   filteredSessions,
                   (index) => filteredSessions[index] && onSessionSelect(filteredSessions[index], palette.mode as PaletteSessionMode),
+                  filteredSessions[selected] ? `${PALETTE_ID}-session-${filteredSessions[selected].id}` : undefined,
                 )}
+                <div
+                  id={`${PALETTE_ID}-picker-results`}
+                  role="listbox"
+                  aria-label={paletteLabel(palette.mode)}
+                >
                 {filteredSessions.length > 0 ? filteredSessions.map((session, index) => (
                   <div
                     className="command-item"
@@ -488,6 +505,7 @@ export function CommandPalette({
                     <small>Esc to return to the editor</small>
                   </div>
                 )}
+                </div>
               </div>
             ) : palette.mode === "stats" ? (
               <StatsPanel stats={stats} />
@@ -591,8 +609,18 @@ export function CommandPalette({
                   <span>Backlinks</span>
                   <small>{backlinksLoading ? "Reading local notes…" : `${backlinks.length} incoming ${backlinks.length === 1 ? "link" : "links"}`}</small>
                 </div>
-                {pickerInput("Search backlinks", filteredBacklinks, (index) => filteredBacklinks[index] && openBacklink(filteredBacklinks[index]))}
-                <div className="command-list feature-result-list">
+                {pickerInput(
+                  "Search backlinks",
+                  filteredBacklinks,
+                  (index) => filteredBacklinks[index] && openBacklink(filteredBacklinks[index]),
+                  filteredBacklinks[selected] ? `${PALETTE_ID}-backlink-${filteredBacklinks[selected].documentId}` : undefined,
+                )}
+                <div
+                  id={`${PALETTE_ID}-picker-results`}
+                  className="command-list feature-result-list"
+                  role="listbox"
+                  aria-label={paletteLabel("backlinks")}
+                >
                   {backlinksLoading ? (
                     <div className="palette-message"><span>Finding links…</span><small>Verified local copies only</small></div>
                   ) : filteredBacklinks.length > 0 ? filteredBacklinks.map((backlink, index) => (
@@ -623,8 +651,18 @@ export function CommandPalette({
                   <span>Version history</span>
                   <small>{versions.length} local {versions.length === 1 ? "version" : "versions"}</small>
                 </div>
-                {pickerInput("Search version history", filteredVersions, (index) => filteredVersions[index] && restoreHistoryVersion(filteredVersions[index]))}
-                <div className="command-list feature-result-list">
+                {pickerInput(
+                  "Search version history",
+                  filteredVersions,
+                  (index) => filteredVersions[index] && restoreHistoryVersion(filteredVersions[index]),
+                  filteredVersions[selected] ? `${PALETTE_ID}-version-${filteredVersions[selected].id}` : undefined,
+                )}
+                <div
+                  id={`${PALETTE_ID}-picker-results`}
+                  className="command-list feature-result-list"
+                  role="listbox"
+                  aria-label={paletteLabel("history")}
+                >
                   {filteredVersions.length > 0 ? filteredVersions.map((version, index) => {
                     const versionStats = calculateDocumentStats(version.markdown);
                     return (
@@ -661,30 +699,21 @@ export function CommandPalette({
                 onCancel={cancelLinkEditor}
                 saveDisabled={!linkEditorState.label.trim() || !linkEditorState.href.trim()}
               />
-            ) : palette.mode === "confirm-import" ? (
-              <div className="palette-message palette-confirm" data-testid="confirm-import">
-                <span>Replace this note with “{pendingMarkdownImport?.fileName || "the selected Markdown file"}”?</span>
-                <small>The current note will be kept in version history.</small>
-                <div className="feature-form-actions">
-                  <button
-                    ref={importConfirmButtonRef}
-                    type="button"
-                    className="feature-button feature-button-primary"
-                    disabled={importConfirming}
-                    onClick={() => { void confirmMarkdownImport(); }}
-                  >
-                    Import file
-                  </button>
-                  <button
-                    type="button"
-                    className="feature-button"
-                    disabled={importConfirming}
-                    onClick={() => cancelMarkdownImport()}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
+            ) : palette.mode === "confirm-import" && pendingMarkdownImport ? (
+              <ConfirmationPanel
+                model={{
+                  id: "markdown-import",
+                  title: `Replace this note with “${pendingMarkdownImport.fileName || "the selected Markdown file"}”?`,
+                  description: "The current note will be kept in version history.",
+                  confirmLabel: "Import file",
+                  cancelLabel: "Cancel",
+                  testId: "confirm-import",
+                }}
+                confirmButtonRef={importConfirmButtonRef}
+                busy={importConfirming}
+                onConfirm={() => { void confirmMarkdownImport(); }}
+                onCancel={() => cancelMarkdownImport()}
+              />
             ) : palette.mode === "confirm" && confirmation ? (
               <ConfirmationPanel
                 model={confirmation}

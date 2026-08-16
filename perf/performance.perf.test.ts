@@ -17,6 +17,9 @@ import {
   parseVaultBackup,
   serializeVaultBackup,
 } from "../lib/vault-backup.ts";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { recordPerformanceMetric } from "./results.ts";
 import { summarizeSamples, type SampleSummary } from "./statistics.ts";
 
@@ -79,6 +82,20 @@ function benchmark<T>(
     details: { iterationsPerSample: iterations },
   });
   return result;
+}
+
+const SCORE_BASELINE = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "score-baseline.json"), "utf8"),
+) as { metrics: Array<{ id: string; baselineMs: number }> };
+
+function unitBudgetMs(metricId: string) {
+  const baselineMs = SCORE_BASELINE.metrics.find((metric) => metric.id === metricId)?.baselineMs;
+  if (!Number.isFinite(baselineMs) || (baselineMs ?? 0) <= 0) {
+    throw new Error(`Missing committed baseline for ${metricId}`);
+  }
+  // Score baselines are quiet-machine numbers; keep a large-regression gate
+  // that still fails before the old 400–650× ceilings.
+  return Math.max(50, Math.ceil((baselineMs as number) * 200));
 }
 
 function assertBudget(result: BenchmarkResult<unknown>, budgetMs: number) {
@@ -158,7 +175,7 @@ test("full-vault search remains responsive across the maximum session catalog", 
   assert.equal(result.value.sparse[0]?.documentId, `session-${SEARCH_SESSION_COUNT - 1}`);
   assert.equal(result.value.nameOnly.length, 1);
   assert.equal(result.value.nameOnly[0]?.match, "name-and-content");
-  assertBudget(result, 1_500);
+  assertBudget(result, unitBudgetMs("unit-search"));
 });
 
 test("full-vault search indexing normalizes every Markdown snapshot within budget", () => {
@@ -171,7 +188,7 @@ test("full-vault search indexing normalizes every Markdown snapshot within budge
 
   assert.equal(result.value.length, SEARCH_SESSION_COUNT);
   assert.ok(result.value.every((text) => text.length > 0));
-  assertBudget(result, 1_500);
+  assertBudget(result, unitBudgetMs("unit-search-index"));
 });
 
 test("outline rebuild and active-heading lookup handle a large document", () => {
@@ -186,7 +203,7 @@ test("outline rebuild and active-heading lookup handle a large document", () => 
   assert.equal(outline.length, OUTLINE_HEADING_COUNT);
   assert.equal(outline[0]?.title, "Section 0 with supporting detail");
   assert.equal(outline.at(-1)?.depth, (OUTLINE_HEADING_COUNT - 1) % 3);
-  assertBudget(buildResult, 1_000);
+  assertBudget(buildResult, unitBudgetMs("unit-outline-build"));
 
   const positions = Array.from({ length: 1_024 }, (_, index) => (
     (index * 47) % (OUTLINE_HEADING_COUNT * 4 + 1)
@@ -201,7 +218,7 @@ test("outline rebuild and active-heading lookup handle a large document", () => 
   assert.notEqual(activeResult.value, 0);
   assert.equal(activeOutlineIndex(outline, -1), -1);
   assert.equal(activeOutlineIndex(outline, (OUTLINE_HEADING_COUNT - 1) * 4), OUTLINE_HEADING_COUNT - 1);
-  assertBudget(activeResult, 1_000);
+  assertBudget(activeResult, unitBudgetMs("unit-outline-active"));
 
   const copiedOutline = outline.map((item) => ({ ...item }));
   const equalityResult = benchmark(
@@ -211,7 +228,7 @@ test("outline rebuild and active-heading lookup handle a large document", () => 
     { iterations: 300 },
   );
   assert.equal(equalityResult.value, true);
-  assertBudget(equalityResult, 500);
+  assertBudget(equalityResult, unitBudgetMs("unit-outline-compare"));
 });
 
 test("large vault backups build, serialize, and validate within budget", () => {
@@ -227,7 +244,7 @@ test("large vault backups build, serialize, and validate within budget", () => {
   assert.equal(backup.counts.assets, 1);
   assert.equal(backup.assets[0]?.dataUrl, PIXEL_IMAGE);
   assert.match(backup.sessions[0]?.markdown ?? "", /lab-asset:\/\/asset-1/);
-  assertBudget(buildResult, 3_000);
+  assertBudget(buildResult, unitBudgetMs("unit-backup-build"));
 
   const serialized = serializeVaultBackup(backup);
   const serializeResult = benchmark(
@@ -237,7 +254,7 @@ test("large vault backups build, serialize, and validate within budget", () => {
     { iterations: 5 },
   );
   assert.equal(serializeResult.value, serialized);
-  assertBudget(serializeResult, 4_000);
+  assertBudget(serializeResult, unitBudgetMs("unit-backup-serialize"));
 
   const parseResult = benchmark(
     "unit-backup-parse",
@@ -247,5 +264,5 @@ test("large vault backups build, serialize, and validate within budget", () => {
   );
   assert.equal(parseResult.value.counts.sessions, BACKUP_SESSION_COUNT);
   assert.equal(parseResult.value.counts.assets, 1);
-  assertBudget(parseResult, 4_000);
+  assertBudget(parseResult, unitBudgetMs("unit-backup-parse"));
 });

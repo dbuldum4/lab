@@ -1,3 +1,10 @@
+export function scoreMeetsFloor(score, floor) {
+  if (!Number.isFinite(score) || !Number.isFinite(floor)) {
+    throw new Error("A score floor comparison requires finite numbers.");
+  }
+  return score >= floor;
+}
+
 export function latencyRatio(valueMs, baselineMs) {
   if (!Number.isFinite(valueMs) || valueMs < 0) throw new Error("A score value must be finite and non-negative.");
   if (!Number.isFinite(baselineMs) || baselineMs <= 0) throw new Error("A score baseline must be positive.");

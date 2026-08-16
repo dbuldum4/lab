@@ -28,7 +28,7 @@ export async function openEditor(page: Page) {
 
 /** Confirm a destructive Markdown replacement in happy-path import helpers. */
 export async function confirmMarkdownImport(page: Page) {
-  const dialog = page.getByRole("dialog", { name: "Confirm Markdown import" });
+  const dialog = page.getByRole("alertdialog", { name: "Confirm Markdown import" });
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Import file" }).click();
   await expect(dialog).toBeHidden();
