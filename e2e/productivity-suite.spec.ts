@@ -125,6 +125,28 @@ test("automatic titles, pinning, and archive views stay in sync", async ({ page 
   await expect(archived).toHaveAttribute("data-current", "true");
 });
 
+test("session picker keyboard works after a cancelled IME composition", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.press("ControlOrMeta+End");
+  await editor.press("Enter");
+  await editor.type("/sessions");
+  await page.keyboard.press("Enter");
+  const filter = page.getByRole("combobox", { name: "Search sessions" });
+  await expect(filter).toBeFocused();
+  await filter.dispatchEvent("compositionstart");
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+
+  await editor.press("ControlOrMeta+End");
+  await editor.press("Enter");
+  await editor.type("/sessions");
+  await page.keyboard.press("Enter");
+  await expect(filter).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+  await expect(editor).toBeFocused();
+});
+
 test("hydration refreshes an existing automatic Untitled session title", async ({ page }) => {
   const markdown = "# Legacy hydration title\n\nText";
   await page.addInitScript(({ markdown: seededMarkdown, checksum }) => {

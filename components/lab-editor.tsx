@@ -2377,22 +2377,28 @@ function LabEditorSession() {
         const link = target?.closest<HTMLAnchorElement>("a[href]");
         const href = link?.getAttribute("href");
         const linkedDocumentId = documentIdFromLocalHref(href);
-        if (link && linkedDocumentId) {
-          event.preventDefault();
-          const session = listDocumentSessions({ archived: "all" })
-            .find((candidate) => candidate.id === linkedDocumentId);
-          if (!session) {
-            setNoticeRef.current("That session link is no longer available.");
+        if (link) {
+          // Import confirm and other freezes still deliver handleClick.
+          if (!view.editable) {
+            event.preventDefault();
             return true;
           }
-          void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
-          return true;
-        }
-        if (link && href && /^(https?:|mailto:)/i.test(href)) {
-          event.preventDefault();
-          if (!view.editable) return true;
-          window.open(href, "_blank", "noopener,noreferrer");
-          return true;
+          if (linkedDocumentId) {
+            event.preventDefault();
+            const session = listDocumentSessions({ archived: "all" })
+              .find((candidate) => candidate.id === linkedDocumentId);
+            if (!session) {
+              setNoticeRef.current("That session link is no longer available.");
+              return true;
+            }
+            void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
+            return true;
+          }
+          if (href && /^(https?:|mailto:)/i.test(href)) {
+            event.preventDefault();
+            window.open(href, "_blank", "noopener,noreferrer");
+            return true;
+          }
         }
 
         const candidates = [pos, pos - 1, pos + 1, pos - 2, pos + 2];

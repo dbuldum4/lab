@@ -189,12 +189,16 @@ export function CommandPalette({
   const filteredVersions = filterPickerOptions(versions, pickerQuery, (version) => version.markdown);
 
   useEffect(() => {
+    pickerComposingRef.current = false;
     if (!["sessions", "archives", "link-session", "backlinks", "history"].includes(palette?.mode ?? "")) return;
     const frame = window.requestAnimationFrame(() => {
       setPickerQuery("");
       pickerFilterInputRef.current?.focus();
     });
-    return () => window.cancelAnimationFrame(frame);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      pickerComposingRef.current = false;
+    };
   }, [palette?.mode]);
 
   const pickerInput = (

@@ -87,6 +87,34 @@ test("confirming import keeps the current note in history and focuses the editor
     .some((markdown) => markdown.includes("Unsaved note before import"))).toBe(true);
 });
 
+test("import confirm ignores local session link clicks", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.press("ControlOrMeta+Shift+n");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const extraId = new URL(page.url()).hash.replace("#session=", "");
+
+  await page.goto("/");
+  const defaultEditor = await openEditor(page);
+  await page.locator('input[type="file"][accept*="markdown"]').setInputFiles({
+    name: "with-link.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(`See [extra](#session=${extraId})`),
+  });
+  const localLink = defaultEditor.locator(`a[href="#session=${extraId}"]`);
+  await expect(localLink).toBeVisible();
+  await waitForAuthority(page, new RegExp(`#session=${extraId}`));
+
+  await openImport(page);
+  await selectMarkdown(page, "replacement.md", "Imported instead");
+  const dialog = page.getByRole("alertdialog", { name: "Confirm Markdown import" });
+  await expect(dialog).toBeVisible();
+  const urlBefore = page.url();
+  await localLink.click();
+  await expect(dialog).toBeVisible();
+  expect(page.url()).toBe(urlBefore);
+  await expect(defaultEditor).toHaveAttribute("contenteditable", "false");
+});
+
 test("Markdown import is cancelled when the note changes while the file loads", async ({ page }) => {
   const editor = await openEditor(page);
   await editor.fill("Before load");
