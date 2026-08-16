@@ -2,7 +2,7 @@
 
 import { BorderBeam } from "border-beam";
 import { LayoutGroup, motion, type Transition } from "motion/react";
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 import {
   CODE_LANGUAGES,
   filterCommands,
@@ -83,6 +83,8 @@ export type CommandPaletteProps = {
   settleConfirmation: (confirmed: boolean) => void;
   setPalette: (value: PaletteState | null) => void;
   setSelected: (value: number) => void;
+  pickerQuery: string;
+  setPickerQuery: (value: string) => void;
   setSessionName: (value: string) => void;
   updateSearchQuery: (query: string) => void;
   submitSessionName: () => void;
@@ -147,6 +149,8 @@ export function CommandPalette({
   settleConfirmation,
   setPalette,
   setSelected,
+  pickerQuery,
+  setPickerQuery,
   setSessionName,
   updateSearchQuery,
   submitSessionName,
@@ -175,7 +179,6 @@ export function CommandPalette({
   const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
   const pickerFilterInputRef = useRef<HTMLInputElement>(null);
   const pickerComposingRef = useRef(false);
-  const [pickerQuery, setPickerQuery] = useState("");
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const rankedCommands = rankCommandOptions(palette, sessionPinned, sessionArchived, commandContext);
   const filtered = filterCommands(palette, sessionPinned, sessionArchived, commandContext);

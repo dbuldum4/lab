@@ -686,12 +686,13 @@ test("escaped-dollar LaTeX survives persistence and reload", async ({ page }) =>
   await editor.type(markdown);
 
   const math = editor.locator('[data-type="inline-math"]');
-  await expect(math).toHaveAttribute("data-latex", "$5");
+  await expect(math).toHaveAttribute("data-latex", "\\$5");
   await waitForAuthority(page, markdown);
 
   await page.reload();
   await openEditor(page);
-  await expect(page.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "$5");
+  await expect(page.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "\\$5");
+  await expect(page.locator('[data-type="inline-math"]')).not.toHaveClass(/inline-math-error/);
 });
 
 test("Markdown import restores inline and block equations", async ({ page }) => {
@@ -703,7 +704,7 @@ test("Markdown import restores inline and block equations", async ({ page }) => 
     buffer: Buffer.from(markdown),
   });
 
-  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "$5");
+  await expect(editor.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "\\$5");
   await expect(editor.locator('[data-type="block-math"]')).toHaveAttribute("data-latex", "\\int_0^1 x\\,dx");
   await expect.poll(
     async () => (await backendState(page)).authority?.snapshot.markdown ?? "",

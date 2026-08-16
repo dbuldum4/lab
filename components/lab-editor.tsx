@@ -103,6 +103,7 @@ import {
   type BacklinkDocument,
 } from "@/lib/note-links";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import { filterPickerOptions } from "@/lib/picker-filter";
 import {
   activeOutlineIndex,
   areOutlineItemsEqual,
@@ -315,7 +316,7 @@ const InlineMathMarkdown = InlineMath.extend({
     tokenize: (source: string) => {
       const match = source.match(/^\$\$((?:\\\$|[^$\n])+?)\$\$(?!\$)/);
       if (!match) return undefined;
-      return { type: "inlineMath", raw: match[0], latex: unescapeInlineMathLatex(match[1].trim()) };
+      return { type: "inlineMath", raw: match[0], latex: match[1].trim() };
     },
   },
   addInputRules() {
@@ -459,12 +460,8 @@ const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
 const INLINE_MATH_PATTERN = /^\$\$((?:\\\$|[^$\n])+?)\$\$$/;
 const BLOCK_MATH_PATTERN = /^\$\$\n([\s\S]*?)\n\$\$(?:\n)?$/;
 
-function unescapeInlineMathLatex(value: string) {
-  return value.replace(/\\\$/g, "$");
-}
-
 function escapeInlineMathLatex(value: string) {
-  return value.replace(/\$/g, "\\$");
+  return value.replace(/(^|[^\\])\$/g, "$1\\$");
 }
 
 function isCodeBlock(parent: { type: { name: string } }) {
@@ -646,11 +643,7 @@ function migrateInlineMath(instance: Editor) {
     const pattern = /\$\$((?:\\\$|[^$\n])+?)\$\$/g;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(node.text)) !== null) {
-      matches.push({
-        from: pos + match.index,
-        to: pos + match.index + match[0].length,
-        latex: unescapeInlineMathLatex(match[1]),
-      });
+      matches.push({ from: pos + match.index, to: pos + match.index + match[0].length, latex: match[1] });
     }
   });
   if (matches.length === 0) return false;
@@ -1722,6 +1715,7 @@ function LabEditorSession() {
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
+  const [pickerQuery, setPickerQuery] = useState("");
   const [commandContext, setCommandContext] = useState<CommandContext>(EMPTY_COMMAND_CONTEXT);
   const [outlineOpen, setOutlineOpenState] = useState(false);
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
@@ -2294,16 +2288,6 @@ function LabEditorSession() {
     };
   }, [confirmation]);
 
-  useEffect(() => {
-    if (palette?.mode !== "confirm-import") return;
-    const instance = editorRef.current;
-    const wasEditable = instance?.isEditable ?? false;
-    instance?.setEditable(false, false);
-    return () => {
-      if (instance && !instance.isDestroyed) instance.setEditable(wasEditable, false);
-    };
-  }, [palette?.mode]);
-
   useEffect(() => () => {
     const pending = pendingConfirmationRef.current;
     pendingConfirmationRef.current = null;
@@ -2404,8 +2388,9 @@ function LabEditorSession() {
           void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
           return true;
         }
-        if (link && href && /^https?:/i.test(href)) {
+        if (link && href && /^(https?:|mailto:)/i.test(href)) {
           event.preventDefault();
+          if (!view.editable) return true;
           window.open(href, "_blank", "noopener,noreferrer");
           return true;
         }
@@ -2494,9 +2479,7 @@ function LabEditorSession() {
           if (inlineMatch) {
             view.dispatch(
               view.state.tr
-                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({
-                  latex: unescapeInlineMathLatex(inlineMatch[1]),
-                }))
+                .replaceSelectionWith(view.state.schema.nodes.inlineMath.create({ latex: inlineMatch[1] }))
                 .scrollIntoView(),
             );
             return true;
@@ -3290,6 +3273,23 @@ function LabEditorSession() {
     editor?.commands.focus();
     setNotice(message);
   }, [editor, setPalette]);
+
+  useEffect(() => {
+    if (palette?.mode !== "confirm-import") return;
+    const instance = editorRef.current;
+    const wasEditable = instance?.isEditable ?? false;
+    instance?.setEditable(false, false);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      cancelMarkdownImport();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      if (instance && !instance.isDestroyed) instance.setEditable(wasEditable, false);
+    };
+  }, [cancelMarkdownImport, palette?.mode]);
 
   const confirmMarkdownImport = useCallback(async () => {
     const pending = pendingMarkdownImportRef.current;
@@ -4098,13 +4098,56 @@ function LabEditorSession() {
       return;
     }
 
-    if (
-      current.mode === "sessions"
-      || current.mode === "archives"
-      || current.mode === "link-session"
-      || current.mode === "backlinks"
-      || current.mode === "history"
-    ) {
+    if (current.mode === "sessions" || current.mode === "archives" || current.mode === "link-session") {
+      if (event.target instanceof HTMLElement && event.target.closest(`#${PALETTE_ID} input`)) return;
+      const visible = filterPickerOptions(sessions, pickerQuery, (session) => session.name);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, visible.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && visible.length > 0) {
+        event.preventDefault();
+        const session = visible[selectedRef.current] ?? visible[0];
+        if (current.mode === "link-session") {
+          insertSessionLink(session);
+        } else if (session.id === documentId) {
+          setPalette(null);
+          editor?.commands.focus();
+        } else {
+          void resumeSession(session);
+        }
+      }
+      return;
+    }
+
+    if (current.mode === "backlinks") {
+      if (event.target instanceof HTMLElement && event.target.closest(`#${PALETTE_ID} input`)) return;
+      const visible = filterPickerOptions(backlinks, pickerQuery, (backlink) => `${backlink.name} ${backlink.excerpt}`);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, visible.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && visible.length > 0) {
+        event.preventDefault();
+        openBacklink(visible[selectedRef.current] ?? visible[0]);
+      }
+      return;
+    }
+
+    if (current.mode === "history") {
+      if (event.target instanceof HTMLElement && event.target.closest(`#${PALETTE_ID} input`)) return;
+      const visible = filterPickerOptions(versions, pickerQuery, (version) => version.markdown);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, visible.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && visible.length > 0) {
+        event.preventDefault();
+        restoreHistoryVersion(visible[selectedRef.current] ?? visible[0]);
+      }
       return;
     }
 
@@ -4574,6 +4617,8 @@ function LabEditorSession() {
         settleConfirmation={settleConfirmation}
         setPalette={setPalette}
         setSelected={setSelected}
+        pickerQuery={pickerQuery}
+        setPickerQuery={setPickerQuery}
         setSessionName={setSessionName}
         updateSearchQuery={updateSearchQuery}
         submitSessionName={submitSessionName}

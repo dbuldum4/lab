@@ -93,8 +93,7 @@ function unitBudgetMs(metricId: string) {
   if (!Number.isFinite(baselineMs) || (baselineMs ?? 0) <= 0) {
     throw new Error(`Missing committed baseline for ${metricId}`);
   }
-  // Score baselines are quiet-machine numbers; keep a large-regression gate
-  // that still fails before the old 400–650× ceilings.
+  // Loaded hosts can be ~100× the quiet-machine score baseline.
   return Math.max(50, Math.ceil((baselineMs as number) * 200));
 }
 
