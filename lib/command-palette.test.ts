@@ -4,6 +4,7 @@ import {
   COMMANDS,
   filterCommands,
   filterThemes,
+  isPickerMode,
   paletteLabel,
   paletteRole,
   type PaletteState,
@@ -69,4 +70,12 @@ test("palette accessibility contracts cover every mode family", () => {
   assert.equal(paletteRole("confirm"), "alertdialog");
   assert.equal(paletteRole("confirm-import"), "alertdialog");
   assert.equal(paletteLabel("confirm"), "Confirm action");
+  assert.equal(isPickerMode("sessions"), true);
+  assert.equal(isPickerMode("archives"), true);
+  assert.equal(isPickerMode("link-session"), true);
+  assert.equal(isPickerMode("backlinks"), true);
+  assert.equal(isPickerMode("history"), true);
+  assert.equal(isPickerMode("commands"), false);
+  assert.equal(isPickerMode("confirm"), false);
+  assert.equal(isPickerMode(null), false);
 });

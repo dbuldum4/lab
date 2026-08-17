@@ -695,6 +695,27 @@ test("escaped-dollar LaTeX survives persistence and reload", async ({ page }) =>
   await expect(page.locator('[data-type="inline-math"]')).not.toHaveClass(/inline-math-error/);
 });
 
+test("inline math with a raw dollar serializes escaped and reloads", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.type("/inline");
+  await expect(page.locator("#slash-command-palette")).toContainText("Inline equation");
+  await page.keyboard.press("Enter");
+
+  const input = page.locator("#math-editor-popover-input");
+  await expect(input).toBeVisible();
+  await input.fill("$5");
+  await input.press("Enter");
+
+  const math = editor.locator('[data-type="inline-math"]');
+  await expect(math).toHaveAttribute("data-latex", "$5");
+  await waitForAuthority(page, "$$\\$5$$");
+
+  await page.reload();
+  await openEditor(page);
+  await expect(page.locator('[data-type="inline-math"]')).toHaveAttribute("data-latex", "\\$5");
+  await expect(page.locator('[data-type="inline-math"]')).not.toHaveClass(/inline-math-error/);
+});
+
 test("Markdown import restores inline and block equations", async ({ page }) => {
   const editor = await openEditor(page);
   const markdown = "Price: $$\\$5$$\n\n$$\n\\int_0^1 x\\,dx\n$$";

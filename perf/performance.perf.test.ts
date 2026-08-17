@@ -88,13 +88,15 @@ const SCORE_BASELINE = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "score-baseline.json"), "utf8"),
 ) as { metrics: Array<{ id: string; baselineMs: number }> };
 
+const UNIT_BUDGET_MULTIPLIER = 200;
+const UNIT_BUDGET_FLOOR_MS = 50;
+
 function unitBudgetMs(metricId: string) {
   const baselineMs = SCORE_BASELINE.metrics.find((metric) => metric.id === metricId)?.baselineMs;
   if (!Number.isFinite(baselineMs) || (baselineMs ?? 0) <= 0) {
     throw new Error(`Missing committed baseline for ${metricId}`);
   }
-  // Loaded hosts can be ~100× the quiet-machine score baseline.
-  return Math.max(50, Math.ceil((baselineMs as number) * 200));
+  return Math.max(UNIT_BUDGET_FLOOR_MS, Math.ceil((baselineMs as number) * UNIT_BUDGET_MULTIPLIER));
 }
 
 function assertBudget(result: BenchmarkResult<unknown>, budgetMs: number) {

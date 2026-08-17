@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { calculatePerformanceScore, scoreMeetsFloor } from "./score-calculation.mjs";
+import { calculatePerformanceScore, resolveCommittedScoreFloor, scoreMeetsFloor } from "./score-calculation.mjs";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const resultsPath = resolve(projectRoot, process.argv[2] ?? ".perf-results/latest.ndjson");
@@ -58,10 +58,16 @@ for (const item of calculated.diagnostics) {
 console.log(`\nSaved score: ${outputPath}`);
 await writeFile(outputPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
 
-const scoreFloor = Number(baseline.scoreFloor);
-if (Number.isFinite(scoreFloor) && !scoreMeetsFloor(calculated.score, scoreFloor)) {
+let scoreFloor;
+try {
+  scoreFloor = resolveCommittedScoreFloor(baseline.scoreFloor);
+} catch (error) {
+  console.error(`Cannot enforce the performance score floor. ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
+if (!scoreMeetsFloor(calculated.score, scoreFloor)) {
   console.error(
-    `Performance score ${result.roundedScore.toFixed(1)} is below the committed floor of ${scoreFloor}.`,
+    `Performance score ${calculated.score} (rounded ${result.roundedScore.toFixed(1)}) is below the committed floor of ${scoreFloor}.`,
   );
   process.exit(1);
 }

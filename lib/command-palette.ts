@@ -105,6 +105,14 @@ export function paletteRole(mode: PaletteMode): "listbox" | "dialog" | "alertdia
   return "status";
 }
 
+export function isPickerMode(mode: PaletteMode | null | undefined): boolean {
+  return mode === "sessions"
+    || mode === "archives"
+    || mode === "link-session"
+    || mode === "backlinks"
+    || mode === "history";
+}
+
 export function paletteLabel(mode: PaletteMode) {
   switch (mode) {
     case "sessions": return "Document sessions";

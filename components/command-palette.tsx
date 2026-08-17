@@ -8,6 +8,7 @@ import {
   filterCommands,
   filterThemes,
   KEYBOARD_SHORTCUTS,
+  isPickerMode,
   PALETTE_ID,
   paletteLabel,
   paletteRole,
@@ -106,6 +107,9 @@ export type CommandPaletteProps = {
   onSearchCompositionEnd: () => void;
   onThemeCompositionStart: () => void;
   onThemeCompositionEnd: () => void;
+  onPickerCompositionStart: () => void;
+  onPickerCompositionEnd: () => void;
+  isPickerComposing: () => boolean;
 };
 
 function highlightSearchText(value: string, query: string): ReactNode {
@@ -172,13 +176,15 @@ export function CommandPalette({
   onSearchCompositionEnd,
   onThemeCompositionStart,
   onThemeCompositionEnd,
+  onPickerCompositionStart,
+  onPickerCompositionEnd,
+  isPickerComposing,
 }: CommandPaletteProps) {
   const sessionNameInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const themeSearchInputRef = useRef<HTMLInputElement>(null);
   const importConfirmButtonRef = useRef<HTMLButtonElement>(null);
   const pickerFilterInputRef = useRef<HTMLInputElement>(null);
-  const pickerComposingRef = useRef(false);
   const searchResultRefs = useRef(new Map<string, HTMLDivElement>());
   const rankedCommands = rankCommandOptions(palette, sessionPinned, sessionArchived, commandContext);
   const filtered = filterCommands(palette, sessionPinned, sessionArchived, commandContext);
@@ -189,16 +195,11 @@ export function CommandPalette({
   const filteredVersions = filterPickerOptions(versions, pickerQuery, (version) => version.markdown);
 
   useEffect(() => {
-    pickerComposingRef.current = false;
-    if (!["sessions", "archives", "link-session", "backlinks", "history"].includes(palette?.mode ?? "")) return;
+    if (!isPickerMode(palette?.mode)) return;
     const frame = window.requestAnimationFrame(() => {
-      setPickerQuery("");
       pickerFilterInputRef.current?.focus();
     });
-    return () => {
-      window.cancelAnimationFrame(frame);
-      pickerComposingRef.current = false;
-    };
+    return () => window.cancelAnimationFrame(frame);
   }, [palette?.mode]);
 
   const pickerInput = (
@@ -220,10 +221,10 @@ export function CommandPalette({
         aria-label={label}
         value={pickerQuery}
         onChange={(event) => { setPickerQuery(event.target.value); setSelected(0); }}
-        onCompositionStart={() => { pickerComposingRef.current = true; }}
-        onCompositionEnd={() => { pickerComposingRef.current = false; }}
+        onCompositionStart={onPickerCompositionStart}
+        onCompositionEnd={onPickerCompositionEnd}
         onKeyDown={(event) => {
-          if (pickerComposingRef.current || event.nativeEvent.isComposing) return;
+          if (isPickerComposing() || event.nativeEvent.isComposing) return;
           if (event.key === "ArrowDown" || event.key === "ArrowUp") {
             event.preventDefault(); event.stopPropagation();
             const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -320,8 +321,20 @@ export function CommandPalette({
             role={paletteRole(palette.mode)}
             aria-label={paletteLabel(palette.mode)}
             aria-modal={palette.mode === "confirm" || palette.mode === "confirm-import" ? "true" : undefined}
-            aria-labelledby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-title` : undefined}
-            aria-describedby={palette.mode === "confirm" && confirmation ? `${confirmation.id}-confirmation-description` : undefined}
+            aria-labelledby={
+              palette.mode === "confirm" && confirmation
+                ? `${confirmation.id}-confirmation-title`
+                : palette.mode === "confirm-import" && pendingMarkdownImport
+                  ? "markdown-import-confirmation-title"
+                  : undefined
+            }
+            aria-describedby={
+              palette.mode === "confirm" && confirmation
+                ? `${confirmation.id}-confirmation-description`
+                : palette.mode === "confirm-import" && pendingMarkdownImport
+                  ? "markdown-import-confirmation-description"
+                  : undefined
+            }
           >
             {palette.mode === "commands" ? (
               rankedCommands.length > 0 ? (

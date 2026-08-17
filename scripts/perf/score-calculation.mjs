@@ -1,3 +1,11 @@
+export function resolveCommittedScoreFloor(scoreFloor) {
+  const floor = Number(scoreFloor);
+  if (!Number.isFinite(floor)) {
+    throw new Error("A committed performance score floor is required.");
+  }
+  return floor;
+}
+
 export function scoreMeetsFloor(score, floor) {
   if (!Number.isFinite(score) || !Number.isFinite(floor)) {
     throw new Error("A score floor comparison requires finite numbers.");

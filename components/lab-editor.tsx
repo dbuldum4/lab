@@ -134,6 +134,7 @@ import {
   COMMANDS,
   filterCommands,
   filterThemes,
+  isPickerMode,
   PALETTE_ID,
   rankCommandOptions,
   type Command,
@@ -466,6 +467,17 @@ function escapeInlineMathLatex(value: string) {
 
 function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
+}
+
+function paletteInputOwnsNavigation(event: React.KeyboardEvent) {
+  return event.target instanceof HTMLElement
+    && Boolean(event.target.closest(`#${PALETTE_ID} input`))
+    && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter");
+}
+
+function pickerNavigationIsComposing(event: React.KeyboardEvent, composing: boolean) {
+  return (composing || event.nativeEvent.isComposing)
+    && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter" || event.key === "Tab");
 }
 
 function outlineFromEditor(instance: Editor): OutlineItem[] {
@@ -1689,6 +1701,7 @@ function LabEditorSession() {
   const searchIndexVersionRef = useRef(0);
   const searchComposingRef = useRef(false);
   const themeComposingRef = useRef(false);
+  const pickerComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const confirmationButtonRef = useRef<HTMLButtonElement>(null);
@@ -1715,7 +1728,12 @@ function LabEditorSession() {
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
-  const [pickerQuery, setPickerQuery] = useState("");
+  const [pickerQuery, setPickerQueryState] = useState("");
+  const pickerQueryRef = useRef("");
+  const setPickerQuery = useCallback((value: string) => {
+    pickerQueryRef.current = value;
+    setPickerQueryState(value);
+  }, []);
   const [commandContext, setCommandContext] = useState<CommandContext>(EMPTY_COMMAND_CONTEXT);
   const [outlineOpen, setOutlineOpenState] = useState(false);
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
@@ -1830,6 +1848,13 @@ function LabEditorSession() {
     }
     if (previous?.mode === "theme" && value?.mode !== "theme") {
       themeComposingRef.current = false;
+    }
+    if (isPickerMode(previous?.mode) && previous?.mode !== value?.mode) {
+      pickerComposingRef.current = false;
+    }
+    if (previous?.mode !== value?.mode && isPickerMode(value?.mode)) {
+      pickerQueryRef.current = "";
+      setPickerQueryState("");
     }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
@@ -2378,7 +2403,7 @@ function LabEditorSession() {
         const href = link?.getAttribute("href");
         const linkedDocumentId = documentIdFromLocalHref(href);
         if (link) {
-          // Import confirm and other freezes still deliver handleClick.
+          // Frozen views must not follow session or outbound links under a modal.
           if (!view.editable) {
             event.preventDefault();
             return true;
@@ -4105,8 +4130,12 @@ function LabEditorSession() {
     }
 
     if (current.mode === "sessions" || current.mode === "archives" || current.mode === "link-session") {
-      if (event.target instanceof HTMLElement && event.target.closest(`#${PALETTE_ID} input`)) return;
-      const visible = filterPickerOptions(sessions, pickerQuery, (session) => session.name);
+      if (pickerNavigationIsComposing(event, pickerComposingRef.current)) {
+        event.preventDefault();
+        return;
+      }
+      if (paletteInputOwnsNavigation(event)) return;
+      const visible = filterPickerOptions(sessions, pickerQueryRef.current, (session) => session.name);
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -4128,8 +4157,12 @@ function LabEditorSession() {
     }
 
     if (current.mode === "backlinks") {
-      if (event.target instanceof HTMLElement && event.target.closest(`#${PALETTE_ID} input`)) return;
-      const visible = filterPickerOptions(backlinks, pickerQuery, (backlink) => `${backlink.name} ${backlink.excerpt}`);
+      if (pickerNavigationIsComposing(event, pickerComposingRef.current)) {
+        event.preventDefault();
+        return;
+      }
+      if (paletteInputOwnsNavigation(event)) return;
+      const visible = filterPickerOptions(backlinks, pickerQueryRef.current, (backlink) => `${backlink.name} ${backlink.excerpt}`);
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -4143,8 +4176,12 @@ function LabEditorSession() {
     }
 
     if (current.mode === "history") {
-      if (event.target instanceof HTMLElement && event.target.closest(`#${PALETTE_ID} input`)) return;
-      const visible = filterPickerOptions(versions, pickerQuery, (version) => version.markdown);
+      if (pickerNavigationIsComposing(event, pickerComposingRef.current)) {
+        event.preventDefault();
+        return;
+      }
+      if (paletteInputOwnsNavigation(event)) return;
+      const visible = filterPickerOptions(versions, pickerQueryRef.current, (version) => version.markdown);
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
@@ -4661,6 +4698,9 @@ function LabEditorSession() {
         onSearchCompositionEnd={() => { searchComposingRef.current = false; }}
         onThemeCompositionStart={() => { themeComposingRef.current = true; }}
         onThemeCompositionEnd={() => { themeComposingRef.current = false; }}
+        onPickerCompositionStart={() => { pickerComposingRef.current = true; }}
+        onPickerCompositionEnd={() => { pickerComposingRef.current = false; }}
+        isPickerComposing={() => pickerComposingRef.current}
       />
       {notice ? (
         <div
