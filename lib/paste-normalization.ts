@@ -20,6 +20,7 @@ const INLINE_SCORE = 1;
 const MARKDOWN_THRESHOLD = BLOCK_SCORE;
 
 const WRAPPER_TAGS = new Set(["pre", "div", "span", "br", "p"]);
+const DOCUMENT_CHROME_TAGS = new Set(["html", "head", "body", "meta", "title", "link"]);
 const SEMANTIC_TAGS = new Set([
   "p",
   "h1", "h2", "h3", "h4", "h5", "h6",
@@ -169,7 +170,9 @@ export function htmlIsPlainMarkdownWrapper(html: string, plainText: string): boo
   const tags = htmlTags(html);
   const hasCodeWithPre = tags.includes("pre") && tags.includes("code");
   const meaningful = tags.some((tag) => (
-    !WRAPPER_TAGS.has(tag) && !(tag === "code" && hasCodeWithPre)
+    !WRAPPER_TAGS.has(tag)
+    && !DOCUMENT_CHROME_TAGS.has(tag)
+    && !(tag === "code" && hasCodeWithPre)
   ));
   if (meaningful) return false;
 

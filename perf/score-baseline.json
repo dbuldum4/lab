@@ -1,6 +1,7 @@
 {
   "version": 1,
   "baselineScore": 50,
+  "scoreFloor": 40,
   "goal": "100 approaches zero milliseconds for every weighted metric",
   "metrics": [
     { "id": "typing-closed", "label": "Typing through paint", "weight": 16, "baselineMs": 24.324999999999996 },

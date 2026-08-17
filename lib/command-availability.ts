@@ -33,10 +33,14 @@ const TABLE_COMMANDS = new Set([
 ]);
 
 const TABLE_REASON = "Place the caret inside a table first.";
+const NESTED_TABLE_REASON = "Nested tables are not portable.";
 
 export function commandAvailability(commandId: string, context: CommandContext): CommandAvailability {
   if (TABLE_COMMANDS.has(commandId) && !context.inTable) {
     return { available: false, reason: TABLE_REASON };
+  }
+  if (commandId === "table" && context.inTable) {
+    return { available: false, reason: NESTED_TABLE_REASON };
   }
   if (commandId === "edit-link" && !context.inLink) {
     return { available: false, reason: "Place the caret inside a link first." };

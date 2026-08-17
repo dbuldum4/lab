@@ -97,12 +97,20 @@ export function filterThemes(palette: PaletteState | null) {
 }
 
 export function paletteRole(mode: PaletteMode): "listbox" | "dialog" | "alertdialog" | "status" {
-  if (mode === "confirm") return "alertdialog";
-  if (["commands", "sessions", "archives", "link-session", "language", "backlinks", "history"].includes(mode)) {
-    return "listbox";
+  if (mode === "confirm" || mode === "confirm-import") return "alertdialog";
+  if (["commands", "language"].includes(mode)) return "listbox";
+  if (["name", "search", "theme", "link-editor", "sessions", "archives", "link-session", "backlinks", "history"].includes(mode)) {
+    return "dialog";
   }
-  if (["name", "search", "theme", "link-editor", "confirm-import"].includes(mode)) return "dialog";
   return "status";
+}
+
+export function isPickerMode(mode: PaletteMode | null | undefined): boolean {
+  return mode === "sessions"
+    || mode === "archives"
+    || mode === "link-session"
+    || mode === "backlinks"
+    || mode === "history";
 }
 
 export function paletteLabel(mode: PaletteMode) {

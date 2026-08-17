@@ -980,6 +980,46 @@ test("a newer staged edit cannot be cleared by an older save in flight", async (
   }
 });
 
+test("staging writes the active document while another session's vault work is in flight", async () => {
+  switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
+
+  setLocalDocumentScope("alpha");
+  assert.equal((await saveLocalDocument("alpha durable")).saved, true);
+  setLocalDocumentScope("beta");
+  assert.equal((await saveLocalDocument("beta durable")).saved, true);
+
+  let started = false;
+  let release: (() => void) | undefined;
+  const originalCrypto = globalThis.crypto;
+  const digest = async (...args: Parameters<SubtleCrypto["digest"]>) => {
+    if (!started) {
+      started = true;
+      await new Promise<void>((resolve) => { release = resolve; });
+    }
+    return webcrypto.subtle.digest(...args);
+  };
+  Object.defineProperty(globalThis, "crypto", { configurable: true, value: { subtle: { digest } } });
+  try {
+    setLocalDocumentScope("beta");
+    const foreignSave = saveLocalDocument("beta in flight");
+    while (!started) await new Promise<void>((resolve) => setImmediate(resolve));
+    setLocalDocumentScope("alpha");
+    assert.equal(stageLocalDocument("alpha keystroke"), true);
+    const keys = [...environment.local.values.keys()];
+    const alphaPending = keys.find((key) => key.startsWith("lab.document.pending.scoped.v2.alpha."));
+    const leakedBeta = keys.filter((key) => key.startsWith("lab.document.pending.scoped.v2.beta."))
+      .map((key) => JSON.parse(environment.local.getItem(key) ?? "null")?.markdown);
+    assert.ok(alphaPending);
+    assert.equal(JSON.parse(environment.local.getItem(alphaPending as string) ?? "null")?.markdown, "alpha keystroke");
+    assert.ok(!leakedBeta.includes("alpha keystroke"));
+    release?.();
+    assert.equal((await foreignSave).saved, true);
+    assert.equal(await loadLocalDocument(), "alpha keystroke");
+  } finally {
+    Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
+  }
+});
+
 test("document scopes isolate durable snapshots and pending recovery drafts", async () => {
   switchEnvironment({ browser: true, indexedDb: true, opfs: true, locks: "success" });
 

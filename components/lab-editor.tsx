@@ -103,6 +103,7 @@ import {
   type BacklinkDocument,
 } from "@/lib/note-links";
 import { classifyClipboardPaste } from "@/lib/paste-normalization";
+import { filterPickerOptions } from "@/lib/picker-filter";
 import {
   activeOutlineIndex,
   areOutlineItemsEqual,
@@ -133,6 +134,7 @@ import {
   COMMANDS,
   filterCommands,
   filterThemes,
+  isPickerMode,
   PALETTE_ID,
   rankCommandOptions,
   type Command,
@@ -307,7 +309,7 @@ function createDeferredMathRenderer(element: HTMLElement, render: () => void) {
 }
 
 const InlineMathMarkdown = InlineMath.extend({
-  renderMarkdown: (node) => `$$${String(node.attrs?.latex ?? "")}$$`,
+  renderMarkdown: (node) => `$$${escapeInlineMathLatex(String(node.attrs?.latex ?? ""))}$$`,
   markdownTokenizer: {
     name: "inlineMath",
     level: "inline",
@@ -459,8 +461,23 @@ const MARKDOWN_LINK_PATTERN = /\[([^\]]+)]\((https?:\/\/[^\s)]+)\)$/;
 const INLINE_MATH_PATTERN = /^\$\$((?:\\\$|[^$\n])+?)\$\$$/;
 const BLOCK_MATH_PATTERN = /^\$\$\n([\s\S]*?)\n\$\$(?:\n)?$/;
 
+function escapeInlineMathLatex(value: string) {
+  return value.replace(/(^|[^\\])\$/g, "$1\\$");
+}
+
 function isCodeBlock(parent: { type: { name: string } }) {
   return parent.type.name === "codeBlock";
+}
+
+function paletteInputOwnsNavigation(event: React.KeyboardEvent) {
+  return event.target instanceof HTMLElement
+    && Boolean(event.target.closest(`#${PALETTE_ID} input`))
+    && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter");
+}
+
+function pickerNavigationIsComposing(event: React.KeyboardEvent, composing: boolean) {
+  return (composing || event.nativeEvent.isComposing)
+    && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter" || event.key === "Tab");
 }
 
 function outlineFromEditor(instance: Editor): OutlineItem[] {
@@ -1684,6 +1701,7 @@ function LabEditorSession() {
   const searchIndexVersionRef = useRef(0);
   const searchComposingRef = useRef(false);
   const themeComposingRef = useRef(false);
+  const pickerComposingRef = useRef(false);
   const paletteVersionRef = useRef(0);
   const selectedRef = useRef(0);
   const confirmationButtonRef = useRef<HTMLButtonElement>(null);
@@ -1710,6 +1728,12 @@ function LabEditorSession() {
   const [searchResults, setSearchResults] = useState<LocalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [selected, setSelectedState] = useState(0);
+  const [pickerQuery, setPickerQueryState] = useState("");
+  const pickerQueryRef = useRef("");
+  const setPickerQuery = useCallback((value: string) => {
+    pickerQueryRef.current = value;
+    setPickerQueryState(value);
+  }, []);
   const [commandContext, setCommandContext] = useState<CommandContext>(EMPTY_COMMAND_CONTEXT);
   const [outlineOpen, setOutlineOpenState] = useState(false);
   const [outlineItems, setOutlineItemsState] = useState<OutlineItem[]>([]);
@@ -1824,6 +1848,13 @@ function LabEditorSession() {
     }
     if (previous?.mode === "theme" && value?.mode !== "theme") {
       themeComposingRef.current = false;
+    }
+    if (isPickerMode(previous?.mode) && previous?.mode !== value?.mode) {
+      pickerComposingRef.current = false;
+    }
+    if (previous?.mode !== value?.mode && isPickerMode(value?.mode)) {
+      pickerQueryRef.current = "";
+      setPickerQueryState("");
     }
     paletteVersionRef.current += 1;
     paletteRef.current = value;
@@ -2110,7 +2141,7 @@ function LabEditorSession() {
     StarterKit.configure({
       heading: { levels: [1, 2, 3] },
       link: {
-        openOnClick: true,
+        openOnClick: false,
         linkOnPaste: true,
         // The built-in autolinker runs before MarkdownLinkInput and consumes URLs
         // inside `[label](https://...)`. Plain URLs are handled by PlainUrlInput below.
@@ -2229,7 +2260,7 @@ function LabEditorSession() {
     const previousFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
-    const previousPalette = paletteRef.current;
+    const previousPalette = previous?.previousPalette ?? paletteRef.current;
     const promise = new Promise<boolean>((resolve) => {
       pendingConfirmationRef.current = { model, resolve, previousFocus, previousPalette };
       setConfirmation(model);
@@ -2369,17 +2400,30 @@ function LabEditorSession() {
         if (target?.closest("[data-image-resize-handle], .image-edit-toolbar")) return false;
 
         const link = target?.closest<HTMLAnchorElement>("a[href]");
-        const linkedDocumentId = documentIdFromLocalHref(link?.getAttribute("href"));
-        if (link && linkedDocumentId) {
-          event.preventDefault();
-          const session = listDocumentSessions({ archived: "all" })
-            .find((candidate) => candidate.id === linkedDocumentId);
-          if (!session) {
-            setNoticeRef.current("That session link is no longer available.");
+        const href = link?.getAttribute("href");
+        const linkedDocumentId = documentIdFromLocalHref(href);
+        if (link) {
+          // Frozen views must not follow session or outbound links under a modal.
+          if (!view.editable) {
+            event.preventDefault();
             return true;
           }
-          void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
-          return true;
+          if (linkedDocumentId) {
+            event.preventDefault();
+            const session = listDocumentSessions({ archived: "all" })
+              .find((candidate) => candidate.id === linkedDocumentId);
+            if (!session) {
+              setNoticeRef.current("That session link is no longer available.");
+              return true;
+            }
+            void resumeSessionRef.current(session, localSessionHref(linkedDocumentId));
+            return true;
+          }
+          if (href && /^(https?:|mailto:)/i.test(href)) {
+            event.preventDefault();
+            window.open(href, "_blank", "noopener,noreferrer");
+            return true;
+          }
         }
 
         const candidates = [pos, pos - 1, pos + 1, pos - 2, pos + 2];
@@ -2887,20 +2931,6 @@ function LabEditorSession() {
       }
       return;
     }
-    if (palette?.mode === "sessions" || palette?.mode === "archives" || palette?.mode === "link-session") {
-      const activeSession = sessions[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeSession) {
-        documentElement.setAttribute(
-          "aria-activedescendant",
-          `${PALETTE_ID}-session-${activeSession.id}`,
-        );
-      } else {
-        documentElement.removeAttribute("aria-activedescendant");
-      }
-      return;
-    }
     if (palette?.mode === "language") {
       const activeLanguage = CODE_LANGUAGES[selected];
       documentElement.setAttribute("aria-expanded", "true");
@@ -2909,23 +2939,15 @@ function LabEditorSession() {
       else documentElement.removeAttribute("aria-activedescendant");
       return;
     }
-    if (palette?.mode === "backlinks") {
-      const activeBacklink = backlinks[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeBacklink) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-backlink-${activeBacklink.documentId}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    if (palette?.mode === "history") {
-      const activeVersion = versions[selected];
-      documentElement.setAttribute("aria-expanded", "true");
-      documentElement.setAttribute("aria-controls", PALETTE_ID);
-      if (activeVersion) documentElement.setAttribute("aria-activedescendant", `${PALETTE_ID}-version-${activeVersion.id}`);
-      else documentElement.removeAttribute("aria-activedescendant");
-      return;
-    }
-    if (palette?.mode === "search" || palette?.mode === "theme") {
+    if (
+      palette?.mode === "sessions"
+      || palette?.mode === "archives"
+      || palette?.mode === "link-session"
+      || palette?.mode === "backlinks"
+      || palette?.mode === "history"
+      || palette?.mode === "search"
+      || palette?.mode === "theme"
+    ) {
       // The focused searchbox owns its result list. The editor is only the
       // command launcher and must not claim that list as its active descendant.
       documentElement.setAttribute("aria-expanded", "false");
@@ -3140,8 +3162,16 @@ function LabEditorSession() {
       setNotice("Place the caret inside a link to edit it.");
       return false;
     }
-    const mark = editor.state.doc.resolve(range.from + 1).marks().find((candidate) => candidate.type === linkType)
-      ?? editor.state.selection.$from.marks().find((candidate) => candidate.type === linkType);
+    let mark = editor.state.doc.nodeAt(range.from)?.marks.find((candidate) => candidate.type === linkType) ?? null;
+    if (!mark) {
+      editor.state.doc.nodesBetween(range.from, range.to, (node) => {
+        const found = node.marks.find((candidate) => candidate.type === linkType);
+        if (found) {
+          mark = found;
+          return false;
+        }
+      });
+    }
     if (!mark) {
       setNotice("That link could not be read.");
       return false;
@@ -3274,6 +3304,23 @@ function LabEditorSession() {
     editor?.commands.focus();
     setNotice(message);
   }, [editor, setPalette]);
+
+  useEffect(() => {
+    if (palette?.mode !== "confirm-import") return;
+    const instance = editorRef.current;
+    const wasEditable = instance?.isEditable ?? false;
+    instance?.setEditable(false, false);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      cancelMarkdownImport();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      if (instance && !instance.isDestroyed) instance.setEditable(wasEditable, false);
+    };
+  }, [cancelMarkdownImport, palette?.mode]);
 
   const confirmMarkdownImport = useCallback(async () => {
     const pending = pendingMarkdownImportRef.current;
@@ -4083,14 +4130,20 @@ function LabEditorSession() {
     }
 
     if (current.mode === "sessions" || current.mode === "archives" || current.mode === "link-session") {
+      if (pickerNavigationIsComposing(event, pickerComposingRef.current)) {
+        event.preventDefault();
+        return;
+      }
+      if (paletteInputOwnsNavigation(event)) return;
+      const visible = filterPickerOptions(sessions, pickerQueryRef.current, (session) => session.name);
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, sessions.length);
+        const count = Math.max(1, visible.length);
         setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && sessions.length > 0) {
+      } else if ((event.key === "Enter" || event.key === "Tab") && visible.length > 0) {
         event.preventDefault();
-        const session = sessions[selectedRef.current] ?? sessions[0];
+        const session = visible[selectedRef.current] ?? visible[0];
         if (current.mode === "link-session") {
           insertSessionLink(session);
         } else if (session.id === documentId) {
@@ -4099,6 +4152,44 @@ function LabEditorSession() {
         } else {
           void resumeSession(session);
         }
+      }
+      return;
+    }
+
+    if (current.mode === "backlinks") {
+      if (pickerNavigationIsComposing(event, pickerComposingRef.current)) {
+        event.preventDefault();
+        return;
+      }
+      if (paletteInputOwnsNavigation(event)) return;
+      const visible = filterPickerOptions(backlinks, pickerQueryRef.current, (backlink) => `${backlink.name} ${backlink.excerpt}`);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, visible.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && visible.length > 0) {
+        event.preventDefault();
+        openBacklink(visible[selectedRef.current] ?? visible[0]);
+      }
+      return;
+    }
+
+    if (current.mode === "history") {
+      if (pickerNavigationIsComposing(event, pickerComposingRef.current)) {
+        event.preventDefault();
+        return;
+      }
+      if (paletteInputOwnsNavigation(event)) return;
+      const visible = filterPickerOptions(versions, pickerQueryRef.current, (version) => version.markdown);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        const count = Math.max(1, visible.length);
+        setSelected((selectedRef.current + direction + count) % count);
+      } else if ((event.key === "Enter" || event.key === "Tab") && visible.length > 0) {
+        event.preventDefault();
+        restoreHistoryVersion(visible[selectedRef.current] ?? visible[0]);
       }
       return;
     }
@@ -4140,37 +4231,7 @@ function LabEditorSession() {
       return;
     }
 
-    if (current.mode === "backlinks") {
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, backlinks.length);
-        setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && backlinks.length > 0) {
-        event.preventDefault();
-        openBacklink(backlinks[selectedRef.current] ?? backlinks[0]);
-      }
-      return;
-    }
-
-    if (current.mode === "history") {
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        const direction = event.key === "ArrowDown" ? 1 : -1;
-        const count = Math.max(1, versions.length);
-        setSelected((selectedRef.current + direction + count) % count);
-      } else if ((event.key === "Enter" || event.key === "Tab") && versions.length > 0) {
-        event.preventDefault();
-        restoreHistoryVersion(versions[selectedRef.current] ?? versions[0]);
-      }
-      return;
-    }
-
     if (current.mode === "confirm-import") {
-      if (event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
-        event.preventDefault();
-        void confirmMarkdownImport();
-      }
       return;
     }
 
@@ -4599,6 +4660,8 @@ function LabEditorSession() {
         settleConfirmation={settleConfirmation}
         setPalette={setPalette}
         setSelected={setSelected}
+        pickerQuery={pickerQuery}
+        setPickerQuery={setPickerQuery}
         setSessionName={setSessionName}
         updateSearchQuery={updateSearchQuery}
         submitSessionName={submitSessionName}
@@ -4635,6 +4698,9 @@ function LabEditorSession() {
         onSearchCompositionEnd={() => { searchComposingRef.current = false; }}
         onThemeCompositionStart={() => { themeComposingRef.current = true; }}
         onThemeCompositionEnd={() => { themeComposingRef.current = false; }}
+        onPickerCompositionStart={() => { pickerComposingRef.current = true; }}
+        onPickerCompositionEnd={() => { pickerComposingRef.current = false; }}
+        isPickerComposing={() => pickerComposingRef.current}
       />
       {notice ? (
         <div

@@ -121,6 +121,8 @@ test("meaningful HTML structure is detected", () => {
 test("Markdown wrapped in structureless HTML is detected as a wrapper", () => {
   const cases: Array<[string, string, boolean]> = [
     ["<pre># Heading\n\nparagraph</pre>", "# Heading\n\nparagraph", true],
+    ["<html><body><pre># Heading\n\nparagraph</pre></body></html>", "# Heading\n\nparagraph", true],
+    ["<html><head><meta charset=\"utf-8\"></head><body><pre># Heading</pre></body></html>", "# Heading", true],
     ["<div># Heading</div>", "# Heading", true],
     ["<div># Heading &#128512;</div>", "# Heading 😀", true],
     ["<div># Heading &#1114112;</div>", "# Heading &#1114112;", true],
@@ -150,6 +152,13 @@ test("wrapped Markdown is parsed instead of inserted natively", () => {
     insideCodeBlock: false,
   });
   assert.equal(kind(intent), "markdown");
+
+  const browserChrome = classifyClipboardPaste({
+    plainText: "# Heading\n\nparagraph",
+    html: "<html><body><pre># Heading\n\nparagraph</pre></body></html>",
+    insideCodeBlock: false,
+  });
+  assert.equal(kind(browserChrome), "markdown");
 });
 
 test("empty anchors do not create visible text via the HTML path", () => {

@@ -26,9 +26,14 @@ export async function openEditor(page: Page) {
   return editor;
 }
 
+/** Accessible name comes from the confirmation title, which includes the filename. */
+export function markdownImportDialog(page: Page) {
+  return page.getByRole("alertdialog", { name: /Replace this note with/ });
+}
+
 /** Confirm a destructive Markdown replacement in happy-path import helpers. */
 export async function confirmMarkdownImport(page: Page) {
-  const dialog = page.getByRole("dialog", { name: "Confirm Markdown import" });
+  const dialog = markdownImportDialog(page);
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Import file" }).click();
   await expect(dialog).toBeHidden();

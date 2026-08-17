@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { openEditor, waitForAuthority } from "./helpers";
+import { markdownImportDialog, openEditor, waitForAuthority } from "./helpers";
 
 async function openImport(page: Page) {
   const editor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
@@ -41,10 +41,13 @@ test("nonempty Markdown import uses an accessible confirmation and cancel preser
   await expect.poll(() => historyMarkdown(page)).toContain("Original note\n\n");
   const before = await historyMarkdown(page);
   await selectMarkdown(page, "replacement.md", "Replacement note");
-  const dialog = page.getByRole("dialog", { name: "Confirm Markdown import" });
+  const dialog = markdownImportDialog(page);
   await expect(dialog).toBeVisible();
+  await expect(dialog).toHaveAccessibleName(/replacement\.md/);
+  await expect(dialog).toHaveAttribute("aria-modal", "true");
   await expect(dialog).toContainText("replacement.md");
   await expect(dialog.getByRole("button", { name: "Import file" })).toBeFocused();
+  await expect(editor).toHaveAttribute("contenteditable", "false");
 
   const cancelButton = dialog.getByRole("button", { name: "Cancel" });
   await page.keyboard.press("Tab");
@@ -58,9 +61,9 @@ test("nonempty Markdown import uses an accessible confirmation and cancel preser
   // The input value is reset immediately after each selection, so selecting
   // the same path again still opens the confirmation flow.
   await selectMarkdown(page, "replacement.md", "Replacement note");
-  await expect(page.getByRole("dialog", { name: "Confirm Markdown import" })).toBeVisible();
+  await expect(markdownImportDialog(page)).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog", { name: "Confirm Markdown import" })).toBeHidden();
+  await expect(markdownImportDialog(page)).toBeHidden();
   await expect(editor).toHaveText("Original note");
   await expect.poll(() => historyMarkdown(page)).toEqual(before);
 });
@@ -73,7 +76,7 @@ test("confirming import keeps the current note in history and focuses the editor
 
   await openImport(page);
   await selectMarkdown(page, "new-note.md", "Imported note");
-  const dialog = page.getByRole("dialog", { name: "Confirm Markdown import" });
+  const dialog = markdownImportDialog(page);
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Import file" }).click();
 
@@ -83,6 +86,34 @@ test("confirming import keeps the current note in history and focuses the editor
   await waitForAuthority(page, "Imported note");
   await expect.poll(async () => (await historyMarkdown(page))
     .some((markdown) => markdown.includes("Unsaved note before import"))).toBe(true);
+});
+
+test("import confirm ignores local session link clicks", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.press("ControlOrMeta+Shift+n");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const extraId = new URL(page.url()).hash.replace("#session=", "");
+
+  await page.goto("/");
+  const defaultEditor = await openEditor(page);
+  await page.locator('input[type="file"][accept*="markdown"]').setInputFiles({
+    name: "with-link.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(`See [extra](#session=${extraId})`),
+  });
+  const localLink = defaultEditor.locator(`a[href="#session=${extraId}"]`);
+  await expect(localLink).toBeVisible();
+  await waitForAuthority(page, new RegExp(`#session=${extraId}`));
+
+  await openImport(page);
+  await selectMarkdown(page, "replacement.md", "Imported instead");
+  const dialog = markdownImportDialog(page);
+  await expect(dialog).toBeVisible();
+  const urlBefore = page.url();
+  await localLink.click();
+  await expect(dialog).toBeVisible();
+  expect(page.url()).toBe(urlBefore);
+  await expect(defaultEditor).toHaveAttribute("contenteditable", "false");
 });
 
 test("Markdown import is cancelled when the note changes while the file loads", async ({ page }) => {
@@ -112,5 +143,5 @@ test("Markdown import is cancelled when the note changes while the file loads", 
 
   await expect(editor).toHaveText("Changed while loading");
   await expect(page.locator(".editor-notice-message")).toHaveText("The note changed while the file was loading. Import was cancelled.");
-  await expect(page.getByRole("dialog", { name: "Confirm Markdown import" })).toBeHidden();
+  await expect(markdownImportDialog(page)).toBeHidden();
 });

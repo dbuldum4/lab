@@ -125,6 +125,77 @@ test("automatic titles, pinning, and archive views stay in sync", async ({ page 
   await expect(archived).toHaveAttribute("data-current", "true");
 });
 
+test("session picker Enter ignores a leftover filter from the previous open", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.press("ControlOrMeta+Shift+n");
+  await expect(page).toHaveURL(/#session=[a-zA-Z0-9_-]+$/);
+  const otherId = new URL(page.url()).hash.replace("#session=", "");
+  const otherEditor = page.getByRole("textbox", { name: "lab local-only Markdown note" });
+  await expect(otherEditor).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+  await importMarkdown(page, "# UniqueZebraNote\n\nOther session.");
+  await waitForScopedAuthority(page, otherId, "# UniqueZebraNote\n\nOther session.");
+  await waitForSessionMetadata(page, otherId, { name: "UniqueZebraNote" });
+
+  await page.goto("/");
+  const home = await openEditor(page);
+  await runSlash(page, "sessions");
+  const filter = page.getByRole("combobox", { name: "Search sessions" });
+  await expect(filter).toBeFocused();
+  await filter.fill("UniqueZebraNote");
+  await expect(page.getByTestId("session-list").getByRole("option")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+
+  await runSlash(page, "sessions");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+  expect(page.url()).not.toMatch(new RegExp(`#session=${otherId}`));
+  await expect(home).toBeFocused();
+
+  await runSlash(page, "sessions");
+  await expect(page.getByRole("combobox", { name: "Search sessions" })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+  expect(page.url()).not.toMatch(new RegExp(`#session=${otherId}`));
+});
+
+test("session picker Tab during IME composition does not activate", async ({ page }) => {
+  const editor = await openEditor(page);
+  await runSlash(page, "sessions");
+  const filter = page.getByRole("combobox", { name: "Search sessions" });
+  await expect(filter).toBeFocused();
+  await filter.dispatchEvent("compositionstart");
+  await page.keyboard.press("Tab");
+  await expect(page.locator("#slash-command-palette")).toBeVisible();
+  await expect(filter).toBeFocused();
+  await expect(editor).not.toBeFocused();
+  await filter.dispatchEvent("compositionend");
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+});
+
+test("session picker keyboard works after a cancelled IME composition", async ({ page }) => {
+  const editor = await openEditor(page);
+  await editor.press("ControlOrMeta+End");
+  await editor.press("Enter");
+  await editor.type("/sessions");
+  await page.keyboard.press("Enter");
+  const filter = page.getByRole("combobox", { name: "Search sessions" });
+  await expect(filter).toBeFocused();
+  await filter.dispatchEvent("compositionstart");
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+
+  await editor.press("ControlOrMeta+End");
+  await editor.press("Enter");
+  await editor.type("/sessions");
+  await page.keyboard.press("Enter");
+  await expect(filter).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#slash-command-palette")).toBeHidden();
+  await expect(editor).toBeFocused();
+});
+
 test("hydration refreshes an existing automatic Untitled session title", async ({ page }) => {
   const markdown = "# Legacy hydration title\n\nText";
   await page.addInitScript(({ markdown: seededMarkdown, checksum }) => {
@@ -352,6 +423,31 @@ test("version history restores an earlier snapshot and keeps the displaced draft
 
   await editor.press("ControlOrMeta+Alt+h");
   await expect(page.getByTestId("version-history-panel").getByRole("option").filter({ hasText: "5 words" })).toBeVisible();
+});
+
+test("/edit-link can read a one-character link", async ({ page }) => {
+  const editor = await openEditor(page);
+  await importMarkdown(page, "See [x](https://example.com) here");
+  const link = editor.locator("a");
+  await expect(link).toHaveText("x");
+  await editor.evaluate((element) => {
+    const text = element.querySelector("a")?.firstChild;
+    if (!text || text.nodeType !== Node.TEXT_NODE) throw new Error("Expected link text.");
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.collapse(true);
+    const selection = getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    (element as HTMLElement).focus();
+    document.dispatchEvent(new Event("selectionchange"));
+  });
+
+  await editor.press("ControlOrMeta+Shift+k");
+  const dialog = page.getByRole("dialog", { name: "Edit link" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("Link text")).toHaveValue("x");
+  await expect(dialog.getByLabel("Destination")).toHaveValue("https://example.com");
 });
 
 test("the external link editor updates both label and destination", async ({ page }) => {
