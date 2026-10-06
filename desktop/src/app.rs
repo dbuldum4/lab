@@ -111,6 +111,7 @@ fn classify_notice(message: &str) -> NoticeKind {
         "restore cancelled",
         "import was cancelled",
         "another window",
+        "interrupted restore",
     ];
     let error = [
         "could not",
@@ -340,6 +341,17 @@ impl LabApp {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
+        let recovered = app.vault.take_recovered();
+        if recovered > 0 {
+            app.set_notice(
+                format!(
+                    "Found {recovered} {} missing from your sessions, probably from an interrupted restore. {} back in the list.",
+                    if recovered == 1 { "note" } else { "notes" },
+                    if recovered == 1 { "It is" } else { "They are" },
+                ),
+                cx,
+            );
+        }
         if let Some(error) = load_error {
             app.set_notice(error, cx);
         }

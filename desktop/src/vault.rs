@@ -194,6 +194,8 @@ pub struct Vault {
     /// app warns once instead of on every save.
     history_error: Option<String>,
     history_failing: bool,
+    /// Notes found on disk at open that the index did not list.
+    recovered: usize,
     /// Held for the vault's lifetime so two app instances cannot interleave writes.
     _lock: File,
 }
@@ -244,6 +246,7 @@ impl Vault {
             latest_version: Default::default(),
             history_error: None,
             history_failing: false,
+            recovered: 0,
             _lock: lock,
         };
         if vault.session(DEFAULT_DOCUMENT_ID).is_none() {
@@ -259,7 +262,65 @@ impl Vault {
             });
             vault.write_index()?;
         }
+        vault.recover_unlisted_notes();
         Ok(vault)
+    }
+
+    /// List notes that are on disk but not in the index, such as those a
+    /// restore wrote before the app quit. Deleted ids and empty notes stay
+    /// hidden; a deleted note's id is recorded before its file is removed.
+    fn recover_unlisted_notes(&mut self) {
+        let Ok(entries) = fs::read_dir(self.root.join("notes")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".md"))
+            else {
+                continue;
+            };
+            if !is_valid_document_id(id) || self.session(id).is_some() || self.is_deleted(id) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            let name = match std::str::from_utf8(&bytes) {
+                Ok(markdown) => normalize_name(&automatic_title(markdown)),
+                Err(_) => "Recovered note".into(),
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or_else(now_ms, |age| age.as_millis() as i64);
+            self.index.sessions.push(SessionMeta {
+                id: id.to_string(),
+                name,
+                title_source: TitleSource::Automatic,
+                pinned: false,
+                archived: false,
+                created_at: modified,
+                updated_at: modified,
+            });
+            self.recovered += 1;
+        }
+        // If this write fails, the next one saves the recovered sessions.
+        if self.recovered > 0 {
+            let _ = self.write_index();
+        }
+    }
+
+    /// How many unlisted notes [`Vault::open`] added back, once.
+    pub fn take_recovered(&mut self) -> usize {
+        std::mem::take(&mut self.recovered)
     }
 
     pub fn root(&self) -> &Path {
@@ -888,6 +949,34 @@ mod tests {
         drop(vault);
         let reopened = Vault::open(&root).unwrap();
         assert_eq!(reopened.session(&session.id).unwrap().name, "Kept again");
+    }
+
+    #[test]
+    fn unlisted_notes_are_recovered_but_deleted_ones_are_not() {
+        let (dir, mut vault) = vault();
+        let deleted = vault.create_session().unwrap();
+        vault.save(&deleted.id, "gone").unwrap();
+        vault.delete(&deleted.id).unwrap();
+        let root = vault.root().to_path_buf();
+        drop(vault);
+        let notes = root.join("notes");
+        fs::write(notes.join("orphan1.md"), "# From a restore\n\nbody").unwrap();
+        fs::write(notes.join("orphan2.md"), "").unwrap();
+        fs::write(notes.join(format!("{}.md", deleted.id)), "gone").unwrap();
+        fs::write(notes.join(".orphan3.md.1.tmp"), "partial").unwrap();
+
+        let mut vault = Vault::open(&root).unwrap();
+        assert_eq!(vault.take_recovered(), 1);
+        assert_eq!(vault.take_recovered(), 0);
+        assert_eq!(vault.session("orphan1").unwrap().name, "From a restore");
+        assert!(vault.session("orphan2").is_none());
+        assert!(vault.session(&deleted.id).is_none());
+        drop(vault);
+        // The recovered session is in the index now.
+        let mut vault = Vault::open(&root).unwrap();
+        assert_eq!(vault.take_recovered(), 0);
+        assert!(vault.session("orphan1").is_some());
+        drop(dir);
     }
 
     #[test]

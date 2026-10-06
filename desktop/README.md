@@ -62,6 +62,9 @@ Every write goes to a temporary file that is synced and then renamed into
 place. A crash leaves the old file or the new one, never half of each. The
 web app copies each note into three browser stores to survive storage
 eviction; a file system does not evict, so one atomic copy is enough.
+A note file that `vault.json` does not list, such as one from a restore
+interrupted by quitting, is added back to your sessions the next time the
+app starts.
 
 **One window owns the vault.** A second copy of the app refuses to start
 rather than risk two writers. That is why the web app's `/recover` command,
