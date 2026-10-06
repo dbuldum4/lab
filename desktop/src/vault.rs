@@ -190,6 +190,10 @@ pub struct Vault {
     index: Index,
     /// Newest snapshot time per session, so autosave does not re-read history.
     latest_version: std::collections::HashMap<String, i64>,
+    /// Set when an autosave snapshot fails after succeeding before, so the
+    /// app warns once instead of on every save.
+    history_error: Option<String>,
+    history_failing: bool,
     /// Held for the vault's lifetime so two app instances cannot interleave writes.
     _lock: File,
 }
@@ -238,6 +242,8 @@ impl Vault {
             root,
             index,
             latest_version: Default::default(),
+            history_error: None,
+            history_failing: false,
             _lock: lock,
         };
         if vault.session(DEFAULT_DOCUMENT_ID).is_none() {
@@ -375,23 +381,14 @@ impl Vault {
     }
 
     /// Persist a note, refresh its timestamp and automatic title, and take a
-    /// version snapshot when the last one is old enough.
+    /// version snapshot when the last one is old enough. A failed snapshot
+    /// does not fail the save; see [`Vault::take_history_error`].
     pub fn save(&mut self, id: &str, markdown: &str) -> Result<SessionMeta> {
         if self.session(id).is_none() {
             bail!("Session {id} no longer exists.");
         }
         write_atomic(&self.note_path(id), markdown.as_bytes())?;
         let now = now_ms();
-        let latest = match self.latest_version.get(id) {
-            Some(latest) => *latest,
-            None => self
-                .versions(id)
-                .first()
-                .map_or(0, |entry| entry.created_at),
-        };
-        if now - latest >= HISTORY_MIN_INTERVAL_MS {
-            self.record_version(id, markdown, now)?;
-        }
         let title = automatic_title(markdown);
         let session = self.session_mut(id)?;
         session.updated_at = now;
@@ -400,7 +397,33 @@ impl Vault {
         }
         let session = session.clone();
         self.write_index()?;
+
+        let latest = match self.latest_version.get(id) {
+            Some(latest) => *latest,
+            None => self
+                .versions(id)
+                .first()
+                .map_or(0, |entry| entry.created_at),
+        };
+        if now - latest >= HISTORY_MIN_INTERVAL_MS {
+            match self.record_version(id, markdown, now) {
+                Ok(_) => self.history_failing = false,
+                Err(err) => {
+                    // Wait the usual interval before trying again.
+                    self.latest_version.insert(id.to_string(), now);
+                    if !self.history_failing {
+                        self.history_failing = true;
+                        self.history_error = Some(err.to_string());
+                    }
+                }
+            }
+        }
         Ok(session)
+    }
+
+    /// The error from a snapshot that failed during [`Vault::save`], once.
+    pub fn take_history_error(&mut self) -> Option<String> {
+        self.history_error.take()
     }
 
     pub fn rename(&mut self, id: &str, name: &str) -> Result<SessionMeta> {
@@ -453,8 +476,10 @@ impl Vault {
         Ok(())
     }
 
-    /// Add or replace a session's metadata and content (used by restore).
-    pub(crate) fn put_session(&mut self, session: SessionMeta, markdown: &str) -> Result<()> {
+    /// Write a session's note and add or replace its metadata in memory
+    /// (used by restore). [`Vault::commit_index`] makes the change durable,
+    /// so a batch of sessions writes the index once.
+    pub(crate) fn stage_session(&mut self, session: SessionMeta, markdown: &str) -> Result<()> {
         write_atomic(&self.note_path(&session.id), markdown.as_bytes())?;
         match self
             .index
@@ -465,14 +490,17 @@ impl Vault {
             Some(existing) => *existing = session,
             None => self.index.sessions.push(session),
         }
-        self.write_index()
+        Ok(())
     }
 
-    pub(crate) fn remove_session_for_rollback(&mut self, id: &str) -> Result<()> {
+    /// Undo [`Vault::stage_session`] for a session that did not exist before.
+    pub(crate) fn unstage_session(&mut self, id: &str) {
         self.index.sessions.retain(|session| session.id != id);
-        self.write_index()?;
         let _ = fs::remove_file(self.note_path(id));
-        Ok(())
+    }
+
+    pub(crate) fn commit_index(&self) -> Result<()> {
+        self.write_index()
     }
 
     pub(crate) fn unused_session_id(&self) -> String {
@@ -792,6 +820,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_failed_snapshot_does_not_fail_the_save() {
+        let (_dir, mut vault) = vault();
+        let session = vault.create_session().unwrap();
+        // A directory where the history file belongs makes snapshots fail.
+        fs::create_dir_all(vault.history_path(&session.id).join("blocked")).unwrap();
+        let saved = vault.save(&session.id, "# Kept").unwrap();
+        assert_eq!(saved.name, "Kept");
+        assert_eq!(vault.load(&session.id).unwrap(), "# Kept");
+        assert!(vault.take_history_error().is_some());
+        // The warning is given once, not on every save.
+        vault.latest_version.clear();
+        vault.save(&session.id, "# Kept again").unwrap();
+        assert!(vault.take_history_error().is_none());
+        let root = vault.root().to_path_buf();
+        drop(vault);
+        let reopened = Vault::open(&root).unwrap();
+        assert_eq!(reopened.session(&session.id).unwrap().name, "Kept again");
     }
 
     #[test]

@@ -106,6 +106,30 @@ impl LayoutTable {
             .map(|line| line.hit(position))
     }
 
+    /// The start of a collapsed line (a table drawn as a grid, or an image)
+    /// right next to `from`'s line in the direction of `to`, when moving
+    /// there would jump over it. Vertical movement enters it instead, which
+    /// shows its source.
+    pub fn collapsed_between(&self, from: usize, to: usize) -> Option<usize> {
+        let current = self.lines.iter().position(|line| {
+            line.as_ref().is_some_and(|line| {
+                line.wrapped.is_some() && line.range.start <= from && from <= line.range.end
+            })
+        })?;
+        let neighbor = if to > from {
+            current + 1
+        } else {
+            current.checked_sub(1)?
+        };
+        let line = self.lines.get(neighbor)?.as_ref()?;
+        let skipped = if to > from {
+            to >= line.range.start
+        } else {
+            to <= line.range.end
+        };
+        (line.wrapped.is_none() && skipped).then_some(line.range.start)
+    }
+
     /// The index on the row below `position`, keeping its x.
     pub fn index_below(&self, position: Point<Pixels>) -> Option<usize> {
         self.visible()

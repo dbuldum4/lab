@@ -593,7 +593,7 @@ pub fn restore_backup(
                 });
             if fill_default {
                 filled_default = existing.clone().map(|meta| (meta, String::new()));
-                vault.put_session(session.meta.clone(), &markdown)?;
+                vault.stage_session(session.meta.clone(), &markdown)?;
                 result.imported += 1;
                 result.active_document_updated |= active_id == DEFAULT_DOCUMENT_ID;
                 continue;
@@ -603,24 +603,26 @@ pub fn restore_backup(
                 meta.id = vault.unused_session_id();
                 result.renamed += 1;
             }
-            vault.put_session(meta.clone(), &markdown)?;
             created.push(meta.id.clone());
+            vault.stage_session(meta.clone(), &markdown)?;
             result.imported += 1;
             result.active_document_updated |= meta.id == active_id;
         }
-        Ok(())
+        // One index write for the whole restore.
+        vault.commit_index()
     })();
 
     if let Err(error) = outcome {
         let mut cleanup = Vec::new();
         for id in created.iter().rev() {
-            if let Err(err) = vault.remove_session_for_rollback(id) {
-                cleanup.push(err.to_string());
-            }
+            vault.unstage_session(id);
         }
         if let Some((meta, markdown)) = filled_default
-            && let Err(err) = vault.put_session(meta, &markdown)
+            && let Err(err) = vault.stage_session(meta, &markdown)
         {
+            cleanup.push(err.to_string());
+        }
+        if let Err(err) = vault.commit_index() {
             cleanup.push(err.to_string());
         }
         let suffix = if cleanup.is_empty() {

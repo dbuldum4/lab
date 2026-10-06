@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use crate::markdown_info::{closes_fence, parse_fence};
 use crate::search::regex;
-use crate::text_ops::{BlockKind, block_prefix, line_ranges};
+use crate::text_ops::{BlockKind, block_prefix, is_delimiter_row, line_ranges};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalloutKind {
@@ -101,10 +101,6 @@ pub fn parse_image_line(line: &str) -> Option<ImageLine> {
     })
 }
 
-fn is_table_delimiter(line: &str) -> bool {
-    line.contains('-') && regex!(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$").is_match(line)
-}
-
 /// Classify every line in the document.
 pub fn classify(text: &str) -> Vec<LineInfo> {
     let ranges = line_ranges(text);
@@ -113,6 +109,9 @@ pub fn classify(text: &str) -> Vec<LineInfo> {
     let mut math = false;
     let mut details_depth = 0usize;
     let mut quote_group: Option<Group> = None;
+    // Lines that start with `|`, with the group they get if their run turns
+    // out not to be a table.
+    let mut table_lines: Vec<(usize, Group)> = Vec::new();
 
     for range in &ranges {
         let line = &text[range.clone()];
@@ -242,12 +241,9 @@ pub fn classify(text: &str) -> Vec<LineInfo> {
                     task,
                 }
             } else if trimmed.starts_with('|') {
+                table_lines.push((infos.len(), group));
                 group = Group::Table;
-                if is_table_delimiter(line) {
-                    LineKind::TableDelimiter
-                } else {
-                    LineKind::TableRow
-                }
+                LineKind::TableRow
             } else if let Some(image) = parse_image_line(line) {
                 LineKind::Image(image)
             } else {
@@ -260,7 +256,31 @@ pub fn classify(text: &str) -> Vec<LineInfo> {
             group,
         });
     }
+    mark_tables(text, &mut infos, &table_lines);
     infos
+}
+
+/// Like `text_ops::table_at`, a run of `|` lines is a table only when its
+/// second line is a delimiter row. Other runs are plain paragraphs.
+fn mark_tables(text: &str, infos: &mut [LineInfo], table_lines: &[(usize, Group)]) {
+    let mut start = 0;
+    while start < table_lines.len() {
+        let mut end = start + 1;
+        while end < table_lines.len() && table_lines[end].0 == table_lines[end - 1].0 + 1 {
+            end += 1;
+        }
+        let run = &table_lines[start..end];
+        let table = run.len() >= 2 && is_delimiter_row(&text[infos[run[1].0].range.clone()]);
+        if table {
+            infos[run[1].0].kind = LineKind::TableDelimiter;
+        } else {
+            for &(index, group) in run {
+                infos[index].kind = LineKind::Paragraph;
+                infos[index].group = group;
+            }
+        }
+        start = end;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +447,20 @@ mod tests {
             .into_iter()
             .map(|info| (info.kind, info.group))
             .collect()
+    }
+
+    #[test]
+    fn pipe_lines_without_a_delimiter_row_are_paragraphs() {
+        let result =
+            kinds("| just a thought\n\n| a | b |\n| x | y |\n\n| a |\n|---|\n| 1 |\n|---|");
+        assert_eq!(result[0], (LineKind::Paragraph, Group::None));
+        assert_eq!(result[2], (LineKind::Paragraph, Group::None));
+        assert_eq!(result[3], (LineKind::Paragraph, Group::None));
+        assert_eq!(result[5], (LineKind::TableRow, Group::Table));
+        assert_eq!(result[6], (LineKind::TableDelimiter, Group::Table));
+        assert_eq!(result[7], (LineKind::TableRow, Group::Table));
+        // Only the second line is the delimiter, as in `text_ops::table_at`.
+        assert_eq!(result[8], (LineKind::TableRow, Group::Table));
     }
 
     #[test]

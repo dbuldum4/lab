@@ -1064,8 +1064,9 @@ impl Render for LabApp {
                 cx.listener(|this, _: &OpenShortcuts, w, cx| this.shortcut("shortcuts", w, cx)),
             )
             .on_action(cx.listener(|this, _: &Quit, _, cx| {
-                this.save_now(cx);
-                cx.quit();
+                if this.ready_to_close(cx) {
+                    cx.quit();
+                }
             }))
             // A click outside an open panel dismisses it. The slash palette
             // closes on its own once the caret leaves the `/query`.

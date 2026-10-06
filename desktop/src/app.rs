@@ -14,6 +14,7 @@ use gpui::{
 
 use crate::backup;
 use crate::commands::{self, CODE_LANGUAGES, Command, CommandContext};
+use crate::editor::markdown::Group;
 use crate::editor::{Editor, EditorMode};
 use crate::markdown_info::{DocumentStats, local_session_href};
 use crate::search::{self, SearchResult, regex};
@@ -216,6 +217,12 @@ pub struct LabApp {
     notice_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
     saved_text: String,
+    /// A note that failed to load at startup and is shown empty; it is never
+    /// written, so its file stays as it was.
+    unreadable: Option<String>,
+    /// Set after closing was refused because saving failed; closing again
+    /// discards the unsaved changes.
+    discard_armed: bool,
     pending_anchor: Option<(Point<Pixels>, Pixels)>,
     pub(crate) focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -232,16 +239,36 @@ impl LabApp {
         let theme = theme_or_default(vault.theme().unwrap_or(crate::theme::DEFAULT_THEME));
         let colors = Colors::from_theme(theme);
         let document_id = vault.last_session().to_string();
-        let session = vault
+        let mut session = vault
             .session(&document_id)
             .cloned()
             .unwrap_or_else(|| vault.session(DEFAULT_DOCUMENT_ID).cloned().unwrap());
+        // A note that cannot be read must never be shown as empty, or the
+        // first autosave would replace it. Open a new note instead.
+        let mut unreadable = None;
         let (markdown, load_error) = match vault.load(&session.id) {
             Ok(markdown) => (markdown, None),
-            Err(err) => (
-                String::new(),
-                Some(format!("Could not read this note: {err}")),
-            ),
+            Err(err) => {
+                let message = format!("Could not read “{}”: {err}", session.name);
+                match vault.create_session() {
+                    Ok(fresh) => {
+                        session = fresh;
+                        (
+                            String::new(),
+                            Some(format!(
+                                "{message}. Opened a new note so it stays untouched."
+                            )),
+                        )
+                    }
+                    Err(_) => {
+                        unreadable = Some(session.id.clone());
+                        (
+                            String::new(),
+                            Some(format!("{message}. Changes here will not be saved.")),
+                        )
+                    }
+                }
+            }
         };
         let _ = vault.set_last_session(&session.id);
 
@@ -272,6 +299,7 @@ impl LabApp {
             cx.subscribe_in(&editor, window, Self::on_editor_event),
             cx.subscribe_in(&field, window, Self::on_field_event),
             cx.subscribe_in(&field_href, window, Self::on_field_event),
+            // Quitting can no longer be stopped here; save what we can.
             cx.on_app_quit(|this, cx| {
                 this.save_now(cx);
                 async {}
@@ -281,10 +309,8 @@ impl LabApp {
         // runs, so flush a pending autosave here too.
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |this, cx| this.save_now(cx));
-            }
-            true
+            this.upgrade()
+                .is_none_or(|this| this.update(cx, |this, cx| this.ready_to_close(cx)))
         });
         window.focus(&editor.focus_handle(cx), cx);
         window.set_window_title(&format!("{} — lab", session.name));
@@ -305,6 +331,8 @@ impl LabApp {
             notice_task: None,
             save_task: None,
             saved_text: markdown,
+            unreadable,
+            discard_armed: false,
             pending_anchor: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -360,10 +388,24 @@ impl LabApp {
         if text == self.saved_text {
             return true;
         }
+        if self.unreadable.as_deref() == Some(self.session.id.as_str()) {
+            self.set_notice(
+                "This note could not be read, so changes to it are not saved. Export a copy to keep them.",
+                cx,
+            );
+            return false;
+        }
         match self.vault.save(&self.session.id, &text) {
             Ok(session) => {
                 self.session = session;
                 self.saved_text = text;
+                self.discard_armed = false;
+                if let Some(err) = self.vault.take_history_error() {
+                    self.set_notice(
+                        format!("Saved, but version history could not be updated: {err}"),
+                        cx,
+                    );
+                }
                 true
             }
             Err(err) => {
@@ -374,6 +416,21 @@ impl LabApp {
                 false
             }
         }
+    }
+
+    /// Save before the window closes or the app quits. When saving fails,
+    /// the first attempt is refused with a warning and a second one goes
+    /// ahead, discarding the unsaved changes.
+    pub(crate) fn ready_to_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.save_now(cx) || self.discard_armed {
+            return true;
+        }
+        self.discard_armed = true;
+        self.set_notice(
+            "Your latest changes could not be saved. Export a copy to keep them, or close lab again to discard them.",
+            cx,
+        );
+        false
     }
 
     pub(crate) fn update_title(&self, window: &mut Window) {
@@ -511,8 +568,10 @@ impl LabApp {
         if self.palette.is_some() && !in_commands {
             return;
         }
-        let found =
-            if selection.is_empty() && text_ops::code_block_at(text, selection.start).is_none() {
+        // The line-local match is cheap; check for a code block only after it.
+        let found = selection
+            .is_empty()
+            .then(|| {
                 let start = text_ops::line_start(text, selection.start);
                 regex!(r"(?:^|\s)/([\p{L}\p{M}\p{N}_-]*)$")
                     .captures(&text[start..selection.start])
@@ -520,9 +579,9 @@ impl LabApp {
                         let query = captures[1].to_string();
                         (selection.start - query.len() - 1..selection.start, query)
                     })
-            } else {
-                None
-            };
+            })
+            .flatten()
+            .filter(|_| editor.group_at(selection.start) != Group::Code);
         match (found, in_commands) {
             (Some((slash, query)), true) => {
                 if let Some(Palette {
@@ -578,8 +637,8 @@ impl LabApp {
         let text = editor.text();
         let cursor = editor.cursor();
         CommandContext {
-            in_table: text_ops::table_at(text, cursor).is_some(),
-            in_code_block: text_ops::code_block_at(text, cursor).is_some(),
+            in_table: editor.group_at(cursor) == Group::Table,
+            in_code_block: editor.group_at(cursor) == Group::Code,
             in_link: text_ops::link_at(text, cursor).is_some(),
         }
     }

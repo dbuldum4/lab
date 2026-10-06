@@ -826,6 +826,8 @@ impl LabApp {
     ) {
         match event {
             EditorEvent::Edited => {
+                // New edits deserve a fresh warning before they are discarded.
+                self.discard_armed = false;
                 self.schedule_save(cx);
                 self.update_slash(window, cx);
                 cx.notify();

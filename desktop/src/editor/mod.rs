@@ -10,6 +10,7 @@ pub mod markdown;
 pub mod view;
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -175,10 +176,109 @@ pub enum EditorEvent {
     PasteImage(Vec<u8>, &'static str),
 }
 
-#[derive(Clone)]
 struct Snapshot {
     text: String,
     selection: Range<usize>,
+}
+
+/// How an entry in [`History`] stores its text.
+enum Stored {
+    /// The whole text. Only the newest entry holds this.
+    Full(String),
+    /// What differs from the text of the entry above: that text with
+    /// `prefix..len - suffix` replaced by `middle`.
+    Diff {
+        prefix: usize,
+        suffix: usize,
+        middle: String,
+    },
+}
+
+struct Entry {
+    text: Stored,
+    selection: Range<usize>,
+}
+
+/// An undo or redo stack. Only the newest entry keeps a full copy of the
+/// text; older ones keep the difference from their neighbour, so memory
+/// grows with the size of the edits rather than the size of the note.
+#[derive(Default)]
+struct History {
+    entries: VecDeque<Entry>,
+}
+
+impl History {
+    fn push(&mut self, text: &str, selection: Range<usize>) {
+        if let Some(top) = self.entries.back_mut()
+            && let Stored::Full(previous) = &top.text
+        {
+            top.text = diff(previous, text);
+        }
+        self.entries.push_back(Entry {
+            text: Stored::Full(text.to_string()),
+            selection,
+        });
+        if self.entries.len() > UNDO_LIMIT {
+            self.entries.pop_front();
+        }
+    }
+
+    fn pop(&mut self) -> Option<Snapshot> {
+        let Entry { text, selection } = self.entries.pop_back()?;
+        let Stored::Full(text) = text else {
+            unreachable!("the newest history entry holds the full text");
+        };
+        if let Some(next) = self.entries.back_mut()
+            && let Stored::Diff {
+                prefix,
+                suffix,
+                middle,
+            } = &next.text
+        {
+            let mut full = String::with_capacity(*prefix + middle.len() + *suffix);
+            full.push_str(&text[..*prefix]);
+            full.push_str(middle);
+            full.push_str(&text[text.len() - *suffix..]);
+            next.text = Stored::Full(full);
+        }
+        Some(Snapshot { text, selection })
+    }
+
+    fn last_text(&self) -> Option<&str> {
+        match &self.entries.back()?.text {
+            Stored::Full(text) => Some(text),
+            Stored::Diff { .. } => None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Store `old` as the change that turns `new` back into it.
+fn diff(old: &str, new: &str) -> Stored {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let mut prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let limit = a.len().min(b.len()) - prefix;
+    let mut suffix = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take(limit)
+        .take_while(|(x, y)| x == y)
+        .count();
+    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
+        suffix -= 1;
+    }
+    Stored::Diff {
+        prefix,
+        suffix,
+        middle: old[prefix..old.len() - suffix].to_string(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,8 +308,8 @@ pub struct Editor {
     selection: Range<usize>,
     reversed: bool,
     marked: Option<Range<usize>>,
-    undo_stack: Vec<Snapshot>,
-    redo_stack: Vec<Snapshot>,
+    undo_stack: History,
+    redo_stack: History,
     last_edit: Option<(Instant, EditKind, usize)>,
     placeholder: SharedString,
     layout: Rc<RefCell<LayoutTable>>,
@@ -227,7 +327,7 @@ pub struct Editor {
     palette_confirms: bool,
     pub(crate) asset_resolver: Option<AssetResolver>,
     version: u64,
-    classified: Option<(u64, Rc<Vec<markdown::LineInfo>>)>,
+    classified: RefCell<Option<(u64, Rc<Vec<markdown::LineInfo>>)>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -271,8 +371,8 @@ impl Editor {
             selection: 0..0,
             reversed: false,
             marked: None,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            undo_stack: History::default(),
+            redo_stack: History::default(),
             last_edit: None,
             placeholder: SharedString::default(),
             layout: Rc::default(),
@@ -287,7 +387,7 @@ impl Editor {
             palette_confirms: false,
             asset_resolver: None,
             version: 0,
-            classified: None,
+            classified: RefCell::new(None),
         }
     }
 
@@ -406,11 +506,10 @@ impl Editor {
         let token = self.text[range.clone()].to_string();
         self.splice(range.clone(), "");
         let (before, after) = self.text.split_at(range.start);
-        while let Some(top) = self.undo_stack.last() {
-            let partial = top.text.len() >= self.text.len()
-                && top.text.len() - self.text.len() <= token.len()
+        while let Some(top) = self.undo_stack.last_text() {
+            let partial = top.len() >= self.text.len()
+                && top.len() - self.text.len() <= token.len()
                 && top
-                    .text
                     .strip_prefix(before)
                     .and_then(|rest| rest.strip_suffix(after))
                     .is_some_and(|typed| token.starts_with(typed));
@@ -443,20 +542,14 @@ impl Editor {
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
         if let Some(snapshot) = self.undo_stack.pop() {
-            self.redo_stack.push(Snapshot {
-                text: self.text.clone(),
-                selection: self.selection.clone(),
-            });
+            self.redo_stack.push(&self.text, self.selection.clone());
             self.restore(snapshot, cx);
         }
     }
 
     pub fn redo(&mut self, cx: &mut Context<Self>) {
         if let Some(snapshot) = self.redo_stack.pop() {
-            self.undo_stack.push(Snapshot {
-                text: self.text.clone(),
-                selection: self.selection.clone(),
-            });
+            self.undo_stack.push(&self.text, self.selection.clone());
             self.restore(snapshot, cx);
         }
     }
@@ -484,15 +577,25 @@ impl Editor {
         self.version = self.version.wrapping_add(1);
     }
 
-    pub(crate) fn line_infos(&mut self) -> Rc<Vec<markdown::LineInfo>> {
-        if let Some((version, infos)) = &self.classified
+    pub(crate) fn line_infos(&self) -> Rc<Vec<markdown::LineInfo>> {
+        if let Some((version, infos)) = &*self.classified.borrow()
             && *version == self.version
         {
             return infos.clone();
         }
         let infos = Rc::new(markdown::classify(&self.text));
-        self.classified = Some((self.version, infos.clone()));
+        *self.classified.borrow_mut() = Some((self.version, infos.clone()));
         infos
+    }
+
+    /// The container of the line holding `offset`, from the cached
+    /// classification, so caret moves do not rescan the note.
+    pub fn group_at(&self, offset: usize) -> markdown::Group {
+        let infos = self.line_infos();
+        let index = infos.partition_point(|info| info.range.start <= offset);
+        index
+            .checked_sub(1)
+            .map_or(markdown::Group::None, |index| infos[index].group)
     }
 
     fn splice(&mut self, range: Range<usize>, text: &str) {
@@ -508,13 +611,7 @@ impl Editor {
                 if kind != EditKind::Other && last_kind == kind && now - time < UNDO_GROUP && last_at == at
         );
         if !grouped {
-            self.undo_stack.push(Snapshot {
-                text: self.text.clone(),
-                selection: self.selection.clone(),
-            });
-            if self.undo_stack.len() > UNDO_LIMIT {
-                self.undo_stack.remove(0);
-            }
+            self.undo_stack.push(&self.text, self.selection.clone());
         }
         self.redo_stack.clear();
     }
@@ -569,6 +666,8 @@ impl Editor {
         } else {
             normalize_newlines(text)
         };
+        // Committing a composition: its undo step was taken when it began.
+        let composing = self.marked.is_some();
         let range = range
             .or_else(|| self.marked.clone())
             .unwrap_or_else(|| self.selection.clone());
@@ -577,7 +676,9 @@ impl Editor {
         } else {
             EditKind::Typing
         };
-        self.push_undo(kind, range.start);
+        if !composing {
+            self.push_undo(kind, range.start);
+        }
         self.splice(range.clone(), &text);
         let caret = range.start + text.len();
         self.selection = caret..caret;
@@ -668,13 +769,21 @@ impl Editor {
             px(0.)
         };
         let target = if direction < 0. {
-            layout.index_above(point(goal_x, caret.origin.y - distance))
+            // Just above the caret's row; its own top would find the same row.
+            layout.index_above(point(goal_x, caret.origin.y - distance - px(1.)))
         } else {
             layout.index_below(point(goal_x, caret.bottom() + distance))
         };
+        let target = target.or(Some(if direction < 0. { 0 } else { self.text.len() }));
+        let target = match target {
+            Some(target) if !pages => layout
+                .collapsed_between(self.cursor(), target)
+                .or(Some(target)),
+            target => target,
+        };
         drop(layout);
         self.goal_x = Some(goal_x);
-        target.or(Some(if direction < 0. { 0 } else { self.text.len() }))
+        target
     }
 
     fn move_vertically(
@@ -968,7 +1077,8 @@ impl Editor {
             kind,
             BlockKind::Bullet | BlockKind::Number | BlockKind::Todo
         ) {
-            let selection = self.selection.start + 2..self.selection.end + 2;
+            let shift = |offset: usize| if offset < start { offset } else { offset + 2 };
+            let selection = shift(self.selection.start)..shift(self.selection.end);
             self.apply_edit(
                 TextEdit {
                     range: start..start,
@@ -998,8 +1108,16 @@ impl Editor {
             cx.propagate();
             return;
         }
-        let selection = self.selection.start.saturating_sub(remove).max(start)
-            ..self.selection.end.saturating_sub(remove).max(start);
+        // Only this line moves; offsets before it, such as the start of a
+        // selection that begins on an earlier line, stay put.
+        let shift = |offset: usize| {
+            if offset <= start {
+                offset
+            } else {
+                offset.saturating_sub(remove).max(start)
+            }
+        };
+        let selection = shift(self.selection.start)..shift(self.selection.end);
         self.apply_edit(
             TextEdit {
                 range: start..start + remove,
@@ -1324,9 +1442,22 @@ impl EntityInputHandler for Editor {
             .map(|r| self.range_from_utf16(r))
             .or_else(|| self.marked.clone())
             .unwrap_or_else(|| self.selection.clone());
-        self.push_undo(EditKind::Typing, range.start);
+        // One undo step per composition, taken before its first preedit, so
+        // undo never lands on half-composed text.
+        let composing = self.marked.is_some();
+        if !composing {
+            self.push_undo(EditKind::Typing, range.start);
+            self.last_edit = None;
+        }
         self.splice(range.clone(), new_text);
         self.marked = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        if composing
+            && self.marked.is_none()
+            && self.undo_stack.last_text() == Some(self.text.as_str())
+        {
+            // A cancelled composition left the note unchanged.
+            self.undo_stack.pop();
+        }
         // The new selection is relative to the inserted text, in UTF-16.
         let selection = new_selected_range_utf16
             .map(|relative| {
@@ -1373,5 +1504,56 @@ impl EntityInputHandler for Editor {
     ) -> Option<usize> {
         let index = self.layout.borrow().index_for_point(point)?;
         Some(self.offset_to_utf16(index))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_restores_every_state_from_diffs() {
+        let states = [
+            "",
+            "héllo",
+            "héllo wörld",
+            "héllo wörld wörld",
+            "wörld",
+            "日本語 wörld",
+            "日本語",
+            "aaaa",
+            "aa",
+        ];
+        let mut history = History::default();
+        for (index, state) in states.iter().enumerate() {
+            history.push(state, index..index);
+        }
+        // Only the newest entry keeps the whole text.
+        let full = history
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.text, Stored::Full(_)))
+            .count();
+        assert_eq!(full, 1);
+        for (index, expected) in states.iter().enumerate().rev() {
+            let snapshot = history.pop().unwrap();
+            assert_eq!(snapshot.text, *expected);
+            assert_eq!(snapshot.selection, index..index);
+        }
+        assert!(history.pop().is_none());
+    }
+
+    #[test]
+    fn history_drops_the_oldest_entries_past_the_limit() {
+        let mut history = History::default();
+        for index in 0..UNDO_LIMIT + 5 {
+            history.push(&format!("text {index}"), 0..0);
+        }
+        assert_eq!(history.entries.len(), UNDO_LIMIT);
+        let mut last = None;
+        while let Some(snapshot) = history.pop() {
+            last = Some(snapshot.text);
+        }
+        assert_eq!(last.as_deref(), Some("text 5"));
     }
 }
