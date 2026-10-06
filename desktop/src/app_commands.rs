@@ -108,7 +108,7 @@ impl LabApp {
                             text[selection.clone()].to_string()
                         };
                         let inserted =
-                            format!("[{}](https://", text_ops::escape_link_label(&label));
+                            format!("[{}](https://", text_ops::escape_link_source(&label));
                         let caret = selection.start + inserted.len();
                         Some(TextEdit {
                             range: selection,
@@ -237,7 +237,11 @@ impl LabApp {
                     .vault
                     .all_documents()
                     .into_iter()
-                    .map(|(session, markdown)| (session, search::searchable_markdown(&markdown)))
+                    .map(|(session, markdown)| {
+                        let text = search::searchable_markdown(&markdown);
+                        let normalized = search::normalize(&text);
+                        (session, text, normalized)
+                    })
                     .collect();
                 self.set_field("", false, "Search sessions and note text", cx);
                 self.open_mode(
@@ -300,7 +304,7 @@ impl LabApp {
                 self.confirm(
                     Confirmation {
                         title: "Clear the note?".into(),
-                        description: "The current note will be kept in version history.".into(),
+                        description: Self::history_promise(&text).into(),
                         confirm_label: "Clear note",
                         cancel_label: "Keep note",
                         danger: true,
@@ -399,7 +403,7 @@ impl LabApp {
             return;
         }
         self.close_palette(window, cx);
-        let link = text_ops::markdown_link(label.trim(), &href);
+        let link = text_ops::markdown_source_link(label.trim(), &href);
         let caret = range.start + link.len();
         self.editor.update(cx, |editor, cx| {
             editor.apply_edit(
@@ -665,10 +669,11 @@ impl LabApp {
             }) {
                 Ok(markdown) => {
                     let markdown = crate::editor::normalize_newlines(&markdown);
+                    let promise = Self::history_promise(this.editor.read(cx).text());
                     this.confirm(
                         Confirmation {
                             title: format!("Replace this note with “{name}”?"),
-                            description: "The current note will be kept in version history.".into(),
+                            description: promise.into(),
                             confirm_label: "Import file",
                             cancel_label: "Cancel",
                             danger: false,
@@ -855,10 +860,11 @@ impl LabApp {
                     if let Mode::Search { index, results } = &mut palette.mode {
                         let documents: Vec<SearchDocument<'_>> = index
                             .iter()
-                            .map(|(session, text)| SearchDocument {
+                            .map(|(session, text, normalized)| SearchDocument {
                                 id: &session.id,
                                 name: &session.name,
                                 searchable_text: text,
+                                normalized_text: normalized,
                                 updated_at: session.updated_at,
                             })
                             .collect();

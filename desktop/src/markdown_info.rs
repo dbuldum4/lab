@@ -3,6 +3,7 @@
 //!
 //! Each function mirrors a module in `lib/` so both apps agree on results.
 
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -343,58 +344,63 @@ fn is_escaped(bytes: &[u8], index: usize) -> bool {
     count % 2 == 1
 }
 
-/// Replace code (fenced and inline) with spaces, keeping byte offsets stable.
-pub fn mask_code(markdown: &str) -> String {
-    let bytes = markdown.as_bytes();
-    let mut masked = bytes.to_vec();
-    let mask = |masked: &mut Vec<u8>, start: usize, end: usize| {
-        for byte in &mut masked[start..end] {
-            if *byte != b'\n' && *byte != b'\r' {
-                *byte = b' ';
-            }
-        }
-    };
-    let has_inline_close = |start: usize, len: usize| {
-        let mut cursor = start;
-        while cursor < bytes.len() {
-            if bytes[cursor] != b'`' || is_escaped(bytes, cursor) {
+/// Whether a backtick run of `len` opening before `from` has a matching
+/// closer. Code spans never cross a blank line, so the search stops there.
+fn has_inline_close(bytes: &[u8], from: usize, len: usize) -> bool {
+    let mut cursor = from;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\n' => {
+                let next = &bytes[cursor + 1..];
+                let line = next.split(|byte| *byte == b'\n').next().unwrap_or_default();
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    return false;
+                }
                 cursor += 1;
-                continue;
             }
-            let mut end = cursor + 1;
-            while end < bytes.len() && bytes[end] == b'`' {
-                end += 1;
+            b'`' if !is_escaped(bytes, cursor) => {
+                let mut end = cursor + 1;
+                while end < bytes.len() && bytes[end] == b'`' {
+                    end += 1;
+                }
+                if end - cursor == len {
+                    return true;
+                }
+                cursor = end;
             }
-            if end - cursor == len {
-                return true;
-            }
-            cursor = end;
+            _ => cursor += 1,
         }
-        false
-    };
+    }
+    false
+}
 
+/// Byte ranges of code: fenced block lines and inline spans, delimiters
+/// included. Ranges are sorted and start and end on ASCII bytes.
+pub fn code_ranges(markdown: &str) -> Vec<Range<usize>> {
+    let bytes = markdown.as_bytes();
+    let mut ranges = Vec::new();
     let mut fence: Option<Fence> = None;
-    let mut inline: Option<usize> = None;
+    // Length and start of the open inline code span.
+    let mut inline: Option<(usize, usize)> = None;
     let mut offset = 0;
     for line in markdown.split('\n') {
         let line_end = offset + line.len();
         let content = line.strip_suffix('\r').unwrap_or(line);
         if let Some(open) = fence {
-            mask(&mut masked, offset, line_end);
+            ranges.push(offset..line_end);
             if closes_fence(content, open) {
                 fence = None;
             }
-        } else if inline.is_none() && parse_fence(content).is_some() {
-            mask(&mut masked, offset, line_end);
-            fence = parse_fence(content).map(|(fence, _)| fence);
+        } else if inline.is_none()
+            && let Some((open, _)) = parse_fence(content)
+        {
+            ranges.push(offset..line_end);
+            fence = Some(open);
         } else {
             let end = offset + content.len();
             let mut cursor = offset;
             while cursor < end {
                 if bytes[cursor] != b'`' || is_escaped(bytes, cursor) {
-                    if inline.is_some() {
-                        masked[cursor] = b' ';
-                    }
                     cursor += 1;
                     continue;
                 }
@@ -405,14 +411,13 @@ pub fn mask_code(markdown: &str) -> String {
                 let run = run_end - cursor;
                 match inline {
                     None => {
-                        if has_inline_close(run_end, run) {
-                            mask(&mut masked, cursor, run_end);
-                            inline = Some(run);
+                        if has_inline_close(bytes, run_end, run) {
+                            inline = Some((run, cursor));
                         }
                     }
-                    Some(open) => {
-                        mask(&mut masked, cursor, run_end);
+                    Some((open, start)) => {
                         if open == run {
+                            ranges.push(start..run_end);
                             inline = None;
                         }
                     }
@@ -421,6 +426,19 @@ pub fn mask_code(markdown: &str) -> String {
             }
         }
         offset = line_end + 1;
+    }
+    ranges
+}
+
+/// Replace code (fenced and inline) with spaces, keeping byte offsets stable.
+pub fn mask_code(markdown: &str) -> String {
+    let mut masked = markdown.as_bytes().to_vec();
+    for range in code_ranges(markdown) {
+        for byte in &mut masked[range] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
     }
     // Masking only replaces ASCII bytes or whole multi-byte sequences inside
     // code with spaces, but a code span can cut through nothing but complete

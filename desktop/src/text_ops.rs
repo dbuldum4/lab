@@ -406,12 +406,71 @@ pub fn link_at(text: &str, offset: usize) -> Option<LinkAt> {
             let whole = captures.get(0).unwrap();
             LinkAt {
                 range: line.start + whole.start()..line.start + whole.end(),
-                label: captures[1].replace("\\]", "]").replace("\\[", "["),
+                label: unescape_link_brackets(&captures[1]),
                 href: captures[2].to_string(),
             }
         })
 }
 
+/// Decode `\[` and `\]` in link text. Other escapes, `\\` included, stay as
+/// written, so `escape_link_source` gives back the original source.
+fn unescape_link_brackets(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some(next @ ('[' | ']')) => out.push(next),
+            Some(next) => {
+                out.push('\\');
+                out.push(next);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Escape Markdown source for use as link text. Brackets are escaped and
+/// backslash escapes already in the source are kept as written.
+pub fn escape_link_source(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut chars = label.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('\n') => out.push_str("\\ "),
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                // A lone trailing backslash would escape the closing `]`.
+                None => out.push_str("\\\\"),
+            },
+            '[' | ']' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// A link whose text is Markdown source, such as the link editor's label.
+pub fn markdown_source_link(label: &str, href: &str) -> String {
+    format!(
+        "[{}]({})",
+        escape_link_source(label),
+        escape_link_href(href)
+    )
+}
+
+/// Escape plain text, such as a file or session name, for use as link text.
 pub fn escape_link_label(label: &str) -> String {
     label
         .replace('\\', "\\\\")
@@ -856,6 +915,16 @@ mod tests {
         assert_eq!(link.label, "the ] docs");
         assert_eq!(link.href, "https://x.y");
         assert!(link_at(text, 40).is_none());
+        // Saving an unchanged label gives back the same Markdown.
+        for source in [
+            "[C:\\\\dir](https://x)",
+            "[a \\*b\\*](https://x)",
+            "[x \\[y\\] \\\\](https://x)",
+        ] {
+            let link = link_at(source, 1).unwrap();
+            assert_eq!(markdown_source_link(&link.label, &link.href), source);
+        }
+        assert_eq!(escape_link_source("ends with \\"), "ends with \\\\");
         assert_eq!(
             markdown_link("a [b]", "https://x y"),
             "[a \\[b\\]](https://x%20y)"

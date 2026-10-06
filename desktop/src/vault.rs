@@ -575,17 +575,7 @@ impl Vault {
     }
 
     pub fn asset_path(&self, id: &str) -> Option<PathBuf> {
-        if !id.starts_with("asset-")
-            || !id[6..]
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
-            return None;
-        }
-        MIME_EXTENSIONS
-            .iter()
-            .map(|(_, ext)| self.root.join("assets").join(format!("{id}.{ext}")))
-            .find(|path| path.exists())
+        asset_file(&self.root, id)
     }
 
     pub fn read_asset(&self, id: &str) -> Option<(Vec<u8>, &'static str)> {
@@ -685,6 +675,21 @@ pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
         (text.starts_with("<svg ") || text.starts_with("<svg>") || text.starts_with("<svg\n"))
             .then_some("image/svg+xml")
     }
+}
+
+/// The stored file for an asset id in the vault at `root`, if it exists.
+pub fn asset_file(root: &Path, id: &str) -> Option<PathBuf> {
+    let valid = id.strip_prefix("asset-").is_some_and(|rest| {
+        rest.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    if !valid {
+        return None;
+    }
+    MIME_EXTENSIONS
+        .iter()
+        .map(|(_, ext)| root.join("assets").join(format!("{id}.{ext}")))
+        .find(|path| path.exists())
 }
 
 #[cfg(test)]

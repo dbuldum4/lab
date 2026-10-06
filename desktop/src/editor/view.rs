@@ -311,6 +311,9 @@ impl Editor {
         if self.palette_open {
             context.add("palette");
         }
+        if self.palette_confirms {
+            context.add("palette_confirms");
+        }
         context
     }
 

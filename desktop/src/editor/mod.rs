@@ -102,14 +102,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-down", SelectDown, Some("Editor && !single_line")),
         KeyBinding::new("pageup", PageUp, Some("Editor && !single_line")),
         KeyBinding::new("pagedown", PageDown, Some("Editor && !single_line")),
-        KeyBinding::new("enter", Newline, Some("Editor && !palette")),
+        KeyBinding::new("enter", Newline, Some("Editor && !palette_confirms")),
         KeyBinding::new("enter", Newline, Some("Editor && single_line")),
         KeyBinding::new("shift-enter", NewlinePlain, Some("Editor && !single_line")),
-        KeyBinding::new("tab", Indent, Some("Editor && !single_line && !palette")),
+        KeyBinding::new(
+            "tab",
+            Indent,
+            Some("Editor && !single_line && !palette_confirms"),
+        ),
         KeyBinding::new(
             "shift-tab",
             Outdent,
-            Some("Editor && !single_line && !palette"),
+            Some("Editor && !single_line && !palette_confirms"),
         ),
     ];
     if cfg!(target_os = "macos") {
@@ -216,8 +220,11 @@ pub struct Editor {
     blink_on: bool,
     blink_task: Option<Task<()>>,
     pub(crate) colors: Colors,
-    /// True while the slash palette owns arrow keys and Enter.
+    /// True while the slash palette owns arrow keys.
     palette_open: bool,
+    /// True while the palette also owns Enter and Tab, which it gives back to
+    /// the document when no command matches the slash query.
+    palette_confirms: bool,
     pub(crate) asset_resolver: Option<AssetResolver>,
     version: u64,
     classified: Option<(u64, Rc<Vec<markdown::LineInfo>>)>,
@@ -277,6 +284,7 @@ impl Editor {
             blink_task: None,
             colors,
             palette_open: false,
+            palette_confirms: false,
             asset_resolver: None,
             version: 0,
             classified: None,
@@ -311,8 +319,17 @@ impl Editor {
     }
 
     pub fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.palette_open != open {
+        if self.palette_open != open || self.palette_confirms != open {
             self.palette_open = open;
+            self.palette_confirms = open;
+            cx.notify();
+        }
+    }
+
+    pub fn set_palette_confirms(&mut self, confirms: bool, cx: &mut Context<Self>) {
+        let confirms = confirms && self.palette_open;
+        if self.palette_confirms != confirms {
+            self.palette_confirms = confirms;
             cx.notify();
         }
     }
@@ -382,9 +399,28 @@ impl Editor {
 
     /// Delete a range without recording an undo step. Used to remove the
     /// slash command token, which is palette chrome rather than an edit.
+    /// Undo steps that only typed part of the token are dropped too, so undo
+    /// never brings the token back or lands on an unchanged note.
     pub fn remove_without_undo(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         let range = self.clip(range.start)..self.clip(range.end);
+        let token = self.text[range.clone()].to_string();
         self.splice(range.clone(), "");
+        let (before, after) = self.text.split_at(range.start);
+        while let Some(top) = self.undo_stack.last() {
+            let partial = top.text.len() >= self.text.len()
+                && top.text.len() - self.text.len() <= token.len()
+                && top
+                    .text
+                    .strip_prefix(before)
+                    .and_then(|rest| rest.strip_suffix(after))
+                    .is_some_and(|typed| token.starts_with(typed));
+            if !partial {
+                break;
+            }
+            self.undo_stack.pop();
+        }
+        self.redo_stack.clear();
+        self.last_edit = None;
         self.selection = range.start..range.start;
         self.reversed = false;
         self.bump_version();
@@ -840,6 +876,7 @@ impl Editor {
         }
         let cursor = self.selection.start;
         let line = line_range(&self.text, cursor);
+        let raw_block = self.in_raw_block(line.start);
         let current = &self.text[line.clone()];
         if text_ops::code_block_at(&self.text, cursor)
             .is_some_and(|(opening, _)| opening.start != line.start)
@@ -888,7 +925,7 @@ impl Editor {
             // line keeps the Markdown paragraphs separate. Shift-Enter inserts
             // a soft line break instead.
             BlockKind::Paragraph | BlockKind::Heading(_)
-                if !current.trim().is_empty() && !self.in_raw_block(line.start) =>
+                if !current.trim().is_empty() && !raw_block =>
             {
                 self.type_text(None, "\n\n", cx)
             }
@@ -897,12 +934,13 @@ impl Editor {
     }
 
     /// Tables, HTML blocks, and display math keep single newlines.
-    fn in_raw_block(&self, line_start: usize) -> bool {
-        let infos = markdown::classify(&self.text);
+    fn in_raw_block(&mut self, line_start: usize) -> bool {
+        let infos = self.line_infos();
         infos
-            .iter()
-            .find(|info| info.range.start == line_start)
-            .is_some_and(|info| {
+            .binary_search_by_key(&line_start, |info| info.range.start)
+            .ok()
+            .is_some_and(|index| {
+                let info = &infos[index];
                 matches!(
                     info.group,
                     markdown::Group::Table | markdown::Group::Math | markdown::Group::Code

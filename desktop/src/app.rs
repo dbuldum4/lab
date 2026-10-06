@@ -1,7 +1,9 @@
 //! The window's root view: the document editor, the slash palette, the
 //! outline, and notices. Commands mirror the web app's slash commands.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -17,7 +19,10 @@ use crate::markdown_info::{DocumentStats, local_session_href};
 use crate::search::{self, SearchResult, regex};
 use crate::text_ops::{self, TextEdit};
 use crate::theme::{Colors, THEMES, ThemeDef, theme_or_default};
-use crate::vault::{DEFAULT_DOCUMENT_ID, SessionMeta, Vault, VaultStatus, VersionEntry, now_ms};
+use crate::vault::{
+    DEFAULT_DOCUMENT_ID, HISTORY_MAX_MARKDOWN_BYTES, SessionMeta, Vault, VaultStatus, VersionEntry,
+    now_ms,
+};
 
 actions!(
     lab,
@@ -50,12 +55,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "enter",
             PaletteConfirm,
-            Some("Editor && palette && !single_line"),
+            Some("Editor && palette_confirms && !single_line"),
         ),
         KeyBinding::new(
             "tab",
             PaletteConfirm,
-            Some("Editor && palette && !single_line"),
+            Some("Editor && palette_confirms && !single_line"),
         ),
         KeyBinding::new("up", PaletteUp, Some("Editor && single_line")),
         KeyBinding::new("down", PaletteDown, Some("Editor && single_line")),
@@ -168,7 +173,8 @@ pub enum Mode {
         sessions: Vec<SessionMeta>,
     },
     Search {
-        index: Vec<(SessionMeta, String)>,
+        /// Each session with its searchable text, raw and normalized.
+        index: Vec<(SessionMeta, String, String)>,
         results: Vec<SearchResult>,
     },
     Stats(DocumentStats),
@@ -241,13 +247,16 @@ impl LabApp {
 
         let root = vault.root().to_path_buf();
         let resolver_root = root.clone();
+        // Rendering asks for every image on every frame, so found paths are
+        // cached. Assets are never removed, but a missing one may arrive later.
+        let found = std::cell::RefCell::new(HashMap::<String, PathBuf>::new());
         let resolver: crate::editor::AssetResolver = Rc::new(move |id: &str| {
-            crate::vault::MIME_EXTENSIONS
-                .iter()
-                .map(|(_, ext)| resolver_root.join("assets").join(format!("{id}.{ext}")))
-                .find(|path| {
-                    id.starts_with("asset-") && !id.contains(['/', '\\', '.']) && path.exists()
-                })
+            if let Some(path) = found.borrow().get(id) {
+                return Some(path.clone());
+            }
+            let path = crate::vault::asset_file(&resolver_root, id)?;
+            found.borrow_mut().insert(id.to_string(), path.clone());
+            Some(path)
         });
 
         let editor = cx.new(|cx| {
@@ -528,6 +537,7 @@ impl LabApp {
                     *s = slash;
                     *q = query;
                 }
+                self.sync_palette_confirms(cx);
                 cx.notify();
             }
             (Some((slash, query)), false) => {
@@ -540,11 +550,27 @@ impl LabApp {
                 });
                 self.editor
                     .update(cx, |editor, cx| editor.set_palette_open(true, cx));
+                self.sync_palette_confirms(cx);
                 cx.notify();
             }
             (None, true) => self.close_palette(window, cx),
             (None, false) => {}
         }
+    }
+
+    /// Like the web app, the slash palette takes Enter and Tab only while some
+    /// command matches the query; otherwise they edit the note.
+    fn sync_palette_confirms(&mut self, cx: &mut Context<Self>) {
+        let Some(Palette {
+            mode: Mode::Commands { query, .. },
+            ..
+        }) = &self.palette
+        else {
+            return;
+        };
+        let confirms = !self.ranked_commands(query, cx).is_empty();
+        self.editor
+            .update(cx, |editor, cx| editor.set_palette_confirms(confirms, cx));
     }
 
     pub(crate) fn command_context(&self, cx: &App) -> CommandContext {
@@ -733,10 +759,11 @@ impl LabApp {
                     return;
                 };
                 let when = format_time(version.created_at);
+                let promise = Self::history_promise(self.editor.read(cx).text());
                 self.confirm(
                     Confirmation {
                         title: "Restore this version?".into(),
-                        description: format!("Restore the version from {when}? The current note will be kept in version history."),
+                        description: format!("Restore the version from {when}? {promise}"),
                         confirm_label: "Restore version",
                         cancel_label: "Cancel",
                         danger: false,
@@ -800,13 +827,17 @@ impl LabApp {
                     );
                     return;
                 }
-                self.snapshot(&current, cx);
+                if !self.snapshot(&current, cx) {
+                    return;
+                }
                 self.editor
                     .update(cx, |editor, cx| editor.replace_all("", cx));
             }
             ConfirmAction::Delete => self.delete_session(window, cx),
             ConfirmAction::RestoreVersion(version) => {
-                self.snapshot(&current, cx);
+                if !self.snapshot(&current, cx) {
+                    return;
+                }
                 self.editor
                     .update(cx, |editor, cx| editor.replace_all(&version.markdown, cx));
                 self.set_notice(
@@ -818,7 +849,9 @@ impl LabApp {
                 );
             }
             ConfirmAction::Import { markdown } => {
-                self.snapshot(&current, cx);
+                if !self.snapshot(&current, cx) {
+                    return;
+                }
                 let markdown = backup::externalize_data_images(&markdown, &self.vault);
                 self.editor
                     .update(cx, |editor, cx| editor.replace_all(&markdown, cx));
@@ -827,13 +860,34 @@ impl LabApp {
         }
     }
 
-    pub(crate) fn snapshot(&mut self, markdown: &str, cx: &mut Context<Self>) {
-        if !markdown.is_empty()
-            && let Err(err) = self
-                .vault
-                .record_version(&self.session.id, markdown, now_ms())
+    /// Keep `markdown` in version history before it is replaced. Returns false,
+    /// with a notice, when the snapshot failed and the change must not go on.
+    /// A note too large for history is not kept; the confirmation said so.
+    pub(crate) fn snapshot(&mut self, markdown: &str, cx: &mut Context<Self>) -> bool {
+        if markdown.is_empty() || markdown.len() > HISTORY_MAX_MARKDOWN_BYTES {
+            return true;
+        }
+        match self
+            .vault
+            .record_version(&self.session.id, markdown, now_ms())
         {
-            self.set_notice(format!("Could not keep a version of this note: {err}"), cx);
+            Ok(_) => true,
+            Err(err) => {
+                self.set_notice(
+                    format!("Could not keep a version of this note, so nothing was changed: {err}"),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    /// What a confirmation tells the user happens to the current note.
+    pub(crate) fn history_promise(markdown: &str) -> &'static str {
+        if markdown.len() > HISTORY_MAX_MARKDOWN_BYTES {
+            "This note is too large for version history, so it cannot be recovered afterwards."
+        } else {
+            "The current note will be kept in version history."
         }
     }
 
@@ -848,6 +902,9 @@ impl LabApp {
             let slash = slash.clone();
             self.editor
                 .update(cx, |editor, cx| editor.remove_without_undo(slash, cx));
+            // The removal emits no edit event, so save it here; a command that
+            // changes nothing else would otherwise leave the token on disk.
+            self.schedule_save(cx);
         }
     }
 

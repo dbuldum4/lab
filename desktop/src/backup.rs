@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::markdown_info::{is_valid_document_id, parse_fence};
+use crate::markdown_info::{code_ranges, is_valid_document_id};
 use crate::search::regex;
 use crate::vault::{DEFAULT_DOCUMENT_ID, SessionMeta, TitleSource, Vault, sniff_image_mime};
 
@@ -35,90 +35,14 @@ const MAX_DATA_URL_CHARS: usize = 16 * 1024 * 1024;
 /// Apply `transform` to ordinary Markdown text only. Fenced code blocks and
 /// inline code spans stay literal.
 pub fn transform_outside_code(markdown: &str, mut transform: impl FnMut(&str) -> String) -> String {
-    fn find_run(line: &str, from: usize) -> Option<(usize, usize)> {
-        let bytes = line.as_bytes();
-        let start = from + line[from..].find('`')?;
-        let mut end = start + 1;
-        while end < bytes.len() && bytes[end] == b'`' {
-            end += 1;
-        }
-        Some((start, end))
-    }
-    fn find_close(line: &str, from: usize, len: usize) -> Option<(usize, usize)> {
-        let mut search = from;
-        while let Some((start, end)) = find_run(line, search) {
-            if end - start == len {
-                return Some((start, end));
-            }
-            search = end;
-        }
-        None
-    }
-
     let mut output = String::with_capacity(markdown.len());
-    let mut fence: Option<crate::markdown_info::Fence> = None;
-    let mut inline: Option<usize> = None;
-    for (index, part) in markdown.split('\n').enumerate() {
-        if index > 0 {
-            output.push('\n');
-        }
-        let (line, cr) = match part.strip_suffix('\r') {
-            Some(line) => (line, "\r"),
-            None => (part, ""),
-        };
-        if let Some(open) = fence {
-            output.push_str(part);
-            if crate::markdown_info::closes_fence(line, open) {
-                fence = None;
-            }
-            continue;
-        }
-        if inline.is_none()
-            && let Some((opening, _)) = parse_fence(line)
-        {
-            output.push_str(part);
-            fence = Some(opening);
-            continue;
-        }
-        let mut cursor = 0;
-        while cursor < line.len() {
-            if let Some(len) = inline {
-                match find_close(line, cursor, len) {
-                    Some((_, end)) => {
-                        output.push_str(&line[cursor..end]);
-                        cursor = end;
-                        inline = None;
-                    }
-                    None => {
-                        output.push_str(&line[cursor..]);
-                        cursor = line.len();
-                    }
-                }
-                continue;
-            }
-            match find_run(line, cursor) {
-                None => {
-                    output.push_str(&transform(&line[cursor..]));
-                    cursor = line.len();
-                }
-                Some((start, end)) => {
-                    output.push_str(&transform(&line[cursor..start]));
-                    match find_close(line, end, end - start) {
-                        Some((_, close_end)) => {
-                            output.push_str(&line[start..close_end]);
-                            cursor = close_end;
-                        }
-                        None => {
-                            inline = Some(end - start);
-                            output.push_str(&line[start..]);
-                            cursor = line.len();
-                        }
-                    }
-                }
-            }
-        }
-        output.push_str(cr);
+    let mut cursor = 0;
+    for range in code_ranges(markdown) {
+        output.push_str(&transform(&markdown[cursor..range.start]));
+        output.push_str(&markdown[range.clone()]);
+        cursor = range.end;
     }
+    output.push_str(&transform(&markdown[cursor..]));
     output
 }
 
@@ -390,8 +314,11 @@ pub fn build_backup(
                 None => {
                     // A missing file would make the backup unrestorable; keep
                     // the reference visible as plain text instead.
-                    converted = converted
-                        .replace(&format!("{ASSET_URI_PREFIX}{id}"), &format!("missing-{id}"));
+                    converted = transform_outside_code(&converted, |segment| {
+                        replace_images(segment, asset_image_pattern(), |uri| {
+                            (uri[ASSET_URI_PREFIX.len()..] == *id).then(|| format!("missing-{id}"))
+                        })
+                    });
                 }
             }
         }
@@ -647,9 +574,11 @@ pub fn restore_backup(
             });
             let existing = vault.session(&session.meta.id).cloned();
             let tombstoned = vault.is_deleted(&session.meta.id);
+            // A note that cannot be read is never treated as empty, so it is
+            // neither skipped nor overwritten; the backup copy gets a new id.
             let existing_markdown = existing
                 .as_ref()
-                .map(|_| vault.load(&session.meta.id).unwrap_or_default());
+                .and_then(|_| vault.load(&session.meta.id).ok());
             if !tombstoned
                 && existing.as_ref() == Some(&session.meta)
                 && existing_markdown.as_deref() == Some(markdown.as_str())
@@ -729,6 +658,21 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_backtick_does_not_hide_later_images() {
+        let markdown = "don`t forget\n\n![img](lab-asset://asset-1)\n\nsee `code`";
+        assert_eq!(referenced_assets(markdown), ["asset-1"]);
+        assert_eq!(
+            transform_outside_code(markdown, |s| s.to_uppercase()),
+            "DON`T FORGET\n\n![IMG](LAB-ASSET://ASSET-1)\n\nSEE `code`"
+        );
+        // A code span may still wrap a line within one paragraph.
+        assert_eq!(
+            transform_outside_code("a `b\nc` d", |s| s.to_uppercase()),
+            "A `b\nc` D"
+        );
+    }
+
+    #[test]
     fn data_urls_are_validated() {
         assert!(parse_data_image(PNG).is_some());
         assert!(parse_data_image("data:image/png;base64,AAAA").is_none());
@@ -787,6 +731,48 @@ mod tests {
         let result = restore_backup(&mut fresh, parsed, DEFAULT_DOCUMENT_ID).unwrap();
         assert_eq!((result.imported, result.renamed, result.skipped), (1, 1, 1));
         assert_eq!(fresh.sessions(ArchiveFilter::All).len(), 3);
+    }
+
+    #[test]
+    fn missing_assets_are_renamed_exactly_and_outside_code_only() {
+        let (_dir, mut vault) = vault();
+        let present = externalize_data_images(&format!("![b]({PNG})"), &vault);
+        let present_id = &referenced_assets(&present)[0];
+        let missing_id = &present_id[..present_id.len() - 2];
+        let markdown =
+            format!("![a](lab-asset://{missing_id})\n{present}\n`lab-asset://{missing_id}`");
+        vault.save(DEFAULT_DOCUMENT_ID, &markdown).unwrap();
+        let backup = build_backup(&vault, &vault.all_documents(), 1).unwrap();
+        assert_eq!(backup.assets, 1);
+        let value: Value = serde_json::from_str(&backup.json).unwrap();
+        assert_eq!(
+            value["sessions"][0]["markdown"],
+            format!("![a](missing-{missing_id})\n{present}\n`lab-asset://{missing_id}`")
+        );
+    }
+
+    #[test]
+    fn restore_never_overwrites_a_note_it_cannot_read() {
+        let (_dir, mut source) = vault();
+        source.save(DEFAULT_DOCUMENT_ID, "from backup").unwrap();
+        let json = build_backup(&source, &source.all_documents(), 1)
+            .unwrap()
+            .json;
+
+        let (_dir2, mut vault) = vault();
+        let path = vault
+            .root()
+            .join("notes")
+            .join(format!("{DEFAULT_DOCUMENT_ID}.md"));
+        std::fs::write(&path, b"\xff\xfe not utf-8").unwrap();
+        let result = restore_backup(
+            &mut vault,
+            parse_backup(&json).unwrap(),
+            DEFAULT_DOCUMENT_ID,
+        )
+        .unwrap();
+        assert_eq!((result.imported, result.renamed), (1, 1));
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfe not utf-8");
     }
 
     #[test]

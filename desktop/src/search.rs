@@ -192,6 +192,9 @@ pub struct SearchDocument<'a> {
     pub id: &'a str,
     pub name: &'a str,
     pub searchable_text: &'a str,
+    /// `normalize(searchable_text)`, computed once per search session rather
+    /// than on every keystroke.
+    pub normalized_text: &'a str,
     pub updated_at: i64,
 }
 
@@ -219,7 +222,7 @@ pub fn search_documents(documents: &[SearchDocument<'_>], query: &str) -> Vec<Se
                 trimmed => trimmed,
             };
             let normalized_name = normalize(name);
-            let normalized_content = normalize(document.searchable_text);
+            let normalized_content = document.normalized_text;
             let name_terms = terms
                 .iter()
                 .filter(|t| normalized_name.contains(t.as_str()))
@@ -340,18 +343,21 @@ mod tests {
                 id: "a",
                 name: "Groceries",
                 searchable_text: "apples",
+                normalized_text: &normalize("apples"),
                 updated_at: 5,
             },
             SearchDocument {
                 id: "b",
                 name: "Notes",
                 searchable_text: "groceries list",
+                normalized_text: &normalize("groceries list"),
                 updated_at: 9,
             },
             SearchDocument {
                 id: "c",
                 name: "Other",
                 searchable_text: "nothing",
+                normalized_text: &normalize("nothing"),
                 updated_at: 1,
             },
         ];
@@ -374,6 +380,7 @@ mod tests {
             id: "a",
             name: "Trip",
             searchable_text: "Paris museum",
+            normalized_text: &normalize("Paris museum"),
             updated_at: 0,
         }];
         assert_eq!(search_documents(&docs, "trip paris").len(), 1);
