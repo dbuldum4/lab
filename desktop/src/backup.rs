@@ -6,7 +6,8 @@
 //! asset table. Exported Markdown inlines images as `data:` URLs so a single
 //! `.md` file stays portable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use base64::Engine as _;
@@ -16,7 +17,10 @@ use serde_json::Value;
 
 use crate::markdown_info::{code_ranges, is_valid_document_id};
 use crate::search::regex;
-use crate::vault::{DEFAULT_DOCUMENT_ID, SessionMeta, TitleSource, Vault, sniff_image_mime};
+use crate::vault::{
+    DEFAULT_DOCUMENT_ID, SessionMeta, TitleSource, Vault, VaultSnapshot, load_note, note_file,
+    sniff_image_mime, store_asset, unused_session_id, write_atomic,
+};
 
 pub const BACKUP_FORMAT: &str = "lab-local-vault";
 pub const BACKUP_VERSION: u64 = 1;
@@ -530,7 +534,7 @@ pub fn parse_backup(text: &str) -> Result<ParsedBackup> {
     Ok(ParsedBackup { sessions, assets })
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestoreResult {
     pub imported: usize,
     pub skipped: usize,
@@ -542,83 +546,182 @@ pub struct RestoreResult {
 /// Merge a validated backup without replacing anything: exact copies are
 /// skipped, conflicting or tombstoned ids get fresh ids, and an empty
 /// original note may be filled. A failure rolls back this restore's writes.
+/// The app runs the two halves on different threads.
+#[cfg(test)]
 pub fn restore_backup(
     vault: &mut Vault,
     backup: ParsedBackup,
     active_id: &str,
 ) -> Result<RestoreResult> {
-    let mut result = RestoreResult {
-        assets: backup.assets.len(),
-        ..Default::default()
+    let prepared = prepare_restore(&vault.snapshot(), backup)?;
+    finish_restore(vault, prepared, active_id)
+}
+
+/// A restore whose slow part is done. Images are stored and the notes of new
+/// sessions are written, but the index does not list them yet. Dropping it
+/// without [`finish_restore`] removes those notes.
+pub struct PreparedRestore {
+    root: PathBuf,
+    created: Vec<SessionMeta>,
+    fill_default: Option<FillDefault>,
+    result: RestoreResult,
+}
+
+/// The backup's copy of the original note, which may fill it while it is
+/// still empty and untitled.
+struct FillDefault {
+    meta: SessionMeta,
+    markdown: String,
+    /// The original note's metadata when the restore started.
+    original: SessionMeta,
+}
+
+impl Drop for PreparedRestore {
+    fn drop(&mut self) {
+        for meta in &self.created {
+            let _ = std::fs::remove_file(note_file(&self.root, &meta.id));
+        }
+    }
+}
+
+/// The slow part of a restore, safe to run off the UI thread: store the
+/// images, compare with the existing notes, and write the new notes. Only
+/// files are written; [`finish_restore`] updates the index.
+pub fn prepare_restore(vault: &VaultSnapshot, backup: ParsedBackup) -> Result<PreparedRestore> {
+    let mut prepared = PreparedRestore {
+        root: vault.root.clone(),
+        created: Vec::new(),
+        fill_default: None,
+        result: RestoreResult {
+            assets: backup.assets.len(),
+            ..Default::default()
+        },
     };
     let mut local_ids: HashMap<String, String> = HashMap::new();
     for (backup_id, image) in &backup.assets {
         // Image types the asset store does not know stay inline as data URLs.
-        if let Ok(local) = vault.add_asset(&image.bytes, &image.mime) {
+        if let Ok(local) = store_asset(&vault.root, &image.bytes, &image.mime) {
             local_ids.insert(backup_id.clone(), local);
         }
     }
 
-    let mut created: Vec<String> = Vec::new();
-    let mut filled_default: Option<(SessionMeta, String)> = None;
-    let outcome = (|| -> Result<()> {
-        for session in &backup.sessions {
-            let markdown = transform_outside_code(&session.markdown, |segment| {
-                replace_images(segment, asset_image_pattern(), |uri| {
-                    let id = &uri[ASSET_URI_PREFIX.len()..];
-                    match local_ids.get(id) {
-                        Some(local) => Some(format!("{ASSET_URI_PREFIX}{local}")),
-                        None => backup.assets.get(id).map(|image| image.canonical.clone()),
-                    }
-                })
-            });
-            let existing = vault.session(&session.meta.id).cloned();
-            let tombstoned = vault.is_deleted(&session.meta.id);
-            // A note that cannot be read is never treated as empty, so it is
-            // neither skipped nor overwritten; the backup copy gets a new id.
-            let existing_markdown = existing
-                .as_ref()
-                .and_then(|_| vault.load(&session.meta.id).ok());
-            if !tombstoned
-                && existing.as_ref() == Some(&session.meta)
-                && existing_markdown.as_deref() == Some(markdown.as_str())
-            {
-                result.skipped += 1;
-                continue;
-            }
-            let fill_default = session.meta.id == DEFAULT_DOCUMENT_ID
-                && existing_markdown.as_deref() == Some("")
-                && existing.as_ref().is_some_and(|m| {
-                    m.name == "Untitled" && m.title_source == TitleSource::Automatic
-                });
-            if fill_default {
-                filled_default = existing.clone().map(|meta| (meta, String::new()));
-                vault.stage_session(session.meta.clone(), &markdown)?;
-                result.imported += 1;
-                result.active_document_updated |= active_id == DEFAULT_DOCUMENT_ID;
-                continue;
-            }
-            let mut meta = session.meta.clone();
-            if existing.is_some() || tombstoned {
-                meta.id = vault.unused_session_id();
-                result.renamed += 1;
-            }
-            created.push(meta.id.clone());
-            vault.stage_session(meta.clone(), &markdown)?;
-            result.imported += 1;
-            result.active_document_updated |= meta.id == active_id;
+    let mut taken: HashSet<String> = HashSet::new();
+    for session in &backup.sessions {
+        let markdown = transform_outside_code(&session.markdown, |segment| {
+            replace_images(segment, asset_image_pattern(), |uri| {
+                let id = &uri[ASSET_URI_PREFIX.len()..];
+                match local_ids.get(id) {
+                    Some(local) => Some(format!("{ASSET_URI_PREFIX}{local}")),
+                    None => backup.assets.get(id).map(|image| image.canonical.clone()),
+                }
+            })
+        });
+        let existing = vault.session(&session.meta.id).cloned();
+        let tombstoned = vault.is_deleted(&session.meta.id);
+        // A note that cannot be read is never treated as empty, so it is
+        // neither skipped nor overwritten; the backup copy gets a new id.
+        let existing_markdown = existing
+            .as_ref()
+            .and_then(|_| load_note(&vault.root, &session.meta.id).ok());
+        if !tombstoned
+            && existing.as_ref() == Some(&session.meta)
+            && existing_markdown.as_deref() == Some(markdown.as_str())
+        {
+            prepared.result.skipped += 1;
+            continue;
         }
-        // One index write for the whole restore.
+        if let Some(original) = existing.as_ref().filter(|meta| {
+            meta.id == DEFAULT_DOCUMENT_ID
+                && meta.name == "Untitled"
+                && meta.title_source == TitleSource::Automatic
+                && existing_markdown.as_deref() == Some("")
+                && prepared.fill_default.is_none()
+        }) {
+            prepared.fill_default = Some(FillDefault {
+                meta: session.meta.clone(),
+                markdown,
+                original: original.clone(),
+            });
+            prepared.result.imported += 1;
+            continue;
+        }
+        let mut meta = session.meta.clone();
+        if existing.is_some() || tombstoned || taken.contains(&meta.id) {
+            meta.id = unused_session_id(|id| {
+                vault.session(id).is_some() || vault.is_deleted(id) || taken.contains(id)
+            });
+            prepared.result.renamed += 1;
+        }
+        taken.insert(meta.id.clone());
+        let path = note_file(&vault.root, &meta.id);
+        prepared.created.push(meta);
+        if let Err(error) = write_atomic(&path, markdown.as_bytes()) {
+            // Dropping `prepared` removes the notes written so far.
+            bail!(
+                "Could not restore the backup: {error}. All changes from this restore were rolled back."
+            );
+        }
+        prepared.result.imported += 1;
+    }
+    Ok(prepared)
+}
+
+/// Add a prepared restore's sessions to the index with one write. The vault
+/// may have changed since [`prepare_restore`] ran: an original note that is
+/// no longer empty keeps its text, and the backup copy gets a new id.
+pub fn finish_restore(
+    vault: &mut Vault,
+    mut prepared: PreparedRestore,
+    active_id: &str,
+) -> Result<RestoreResult> {
+    if prepared
+        .created
+        .iter()
+        .any(|meta| vault.session(&meta.id).is_some() || vault.is_deleted(&meta.id))
+    {
+        // Another session took one of the new ids. Its note is no longer
+        // ours to remove.
+        prepared
+            .created
+            .retain(|meta| vault.session(&meta.id).is_none());
+        bail!(
+            "Could not restore the backup: the vault changed while it ran. Nothing was restored."
+        );
+    }
+    let mut created = std::mem::take(&mut prepared.created);
+    let mut result = std::mem::take(&mut prepared.result);
+    let mut filled: Option<SessionMeta> = None;
+
+    let outcome = (|| -> Result<()> {
+        if let Some(fill) = prepared.fill_default.take() {
+            let unchanged = vault.session(DEFAULT_DOCUMENT_ID) == Some(&fill.original)
+                && vault.load(DEFAULT_DOCUMENT_ID).ok().as_deref() == Some("");
+            if unchanged {
+                vault.stage_session(fill.meta, &fill.markdown)?;
+                filled = Some(fill.original);
+                result.active_document_updated = active_id == DEFAULT_DOCUMENT_ID;
+            } else {
+                let mut meta = fill.meta;
+                meta.id =
+                    unused_session_id(|id| vault.session(id).is_some() || vault.is_deleted(id));
+                result.renamed += 1;
+                created.push(meta.clone());
+                vault.stage_session(meta, &fill.markdown)?;
+            }
+        }
+        for meta in &created {
+            vault.index_session(meta.clone());
+        }
         vault.commit_index()
     })();
 
     if let Err(error) = outcome {
         let mut cleanup = Vec::new();
-        for id in created.iter().rev() {
-            vault.unstage_session(id);
+        for meta in created.iter().rev() {
+            vault.unstage_session(&meta.id);
         }
-        if let Some((meta, markdown)) = filled_default
-            && let Err(err) = vault.stage_session(meta, &markdown)
+        if let Some(original) = filled
+            && let Err(err) = vault.stage_session(original, "")
         {
             cleanup.push(err.to_string());
         }
@@ -775,6 +878,57 @@ mod tests {
         .unwrap();
         assert_eq!((result.imported, result.renamed), (1, 1));
         assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfe not utf-8");
+    }
+
+    #[test]
+    fn prepared_restores_touch_only_files_until_finished() {
+        let (_dir, mut source) = vault();
+        let session = source.create_session().unwrap();
+        source.save(&session.id, "from backup").unwrap();
+        let json = build_backup(&source, &source.all_documents(), 1)
+            .unwrap()
+            .json;
+
+        let (_dir2, mut vault) = vault();
+        let note = vault
+            .root()
+            .join("notes")
+            .join(format!("{}.md", session.id));
+        let prepared = prepare_restore(&vault.snapshot(), parse_backup(&json).unwrap()).unwrap();
+        assert!(note.exists());
+        assert!(vault.session(&session.id).is_none());
+        // Dropping an unfinished restore removes its notes.
+        drop(prepared);
+        assert!(!note.exists());
+
+        let prepared = prepare_restore(&vault.snapshot(), parse_backup(&json).unwrap()).unwrap();
+        let result = finish_restore(&mut vault, prepared, DEFAULT_DOCUMENT_ID).unwrap();
+        // The backup's empty original note fills this vault's empty one.
+        assert_eq!((result.imported, result.renamed), (2, 0));
+        assert_eq!(vault.load(&session.id).unwrap(), "from backup");
+    }
+
+    #[test]
+    fn an_original_note_edited_during_a_restore_keeps_its_text() {
+        let (_dir, mut source) = vault();
+        source.save(DEFAULT_DOCUMENT_ID, "from backup").unwrap();
+        let json = build_backup(&source, &source.all_documents(), 1)
+            .unwrap()
+            .json;
+
+        let (_dir2, mut vault) = vault();
+        let prepared = prepare_restore(&vault.snapshot(), parse_backup(&json).unwrap()).unwrap();
+        vault.save(DEFAULT_DOCUMENT_ID, "typed meanwhile").unwrap();
+        let result = finish_restore(&mut vault, prepared, DEFAULT_DOCUMENT_ID).unwrap();
+        assert_eq!((result.imported, result.renamed), (1, 1));
+        assert!(!result.active_document_updated);
+        assert_eq!(vault.load(DEFAULT_DOCUMENT_ID).unwrap(), "typed meanwhile");
+        let copy = vault
+            .sessions(ArchiveFilter::All)
+            .into_iter()
+            .find(|meta| meta.id != DEFAULT_DOCUMENT_ID)
+            .unwrap();
+        assert_eq!(vault.load(&copy.id).unwrap(), "from backup");
     }
 
     #[test]

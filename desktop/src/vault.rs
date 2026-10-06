@@ -272,7 +272,7 @@ impl Vault {
     }
 
     fn note_path(&self, id: &str) -> PathBuf {
-        self.root.join("notes").join(format!("{id}.md"))
+        note_file(&self.root, id)
     }
 
     fn history_path(&self, id: &str) -> PathBuf {
@@ -371,13 +371,7 @@ impl Vault {
     }
 
     pub fn load(&self, id: &str) -> Result<String> {
-        match fs::read(self.note_path(id)) {
-            Ok(bytes) => {
-                String::from_utf8(bytes).map_err(|_| anyhow!("Session {id} is not valid UTF-8."))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(err) => Err(err.into()),
-        }
+        load_note(&self.root, id)
     }
 
     /// Persist a note, refresh its timestamp and automatic title, and take a
@@ -481,15 +475,7 @@ impl Vault {
     /// so a batch of sessions writes the index once.
     pub(crate) fn stage_session(&mut self, session: SessionMeta, markdown: &str) -> Result<()> {
         write_atomic(&self.note_path(&session.id), markdown.as_bytes())?;
-        match self
-            .index
-            .sessions
-            .iter_mut()
-            .find(|existing| existing.id == session.id)
-        {
-            Some(existing) => *existing = session,
-            None => self.index.sessions.push(session),
-        }
+        self.index_session(session);
         Ok(())
     }
 
@@ -503,12 +489,26 @@ impl Vault {
         self.write_index()
     }
 
-    pub(crate) fn unused_session_id(&self) -> String {
-        loop {
-            let candidate = new_session_id();
-            if self.session(&candidate).is_none() && !self.is_deleted(&candidate) {
-                return candidate;
-            }
+    /// The ids a background restore must avoid and where to write notes.
+    pub fn snapshot(&self) -> VaultSnapshot {
+        VaultSnapshot {
+            root: self.root.clone(),
+            sessions: self.index.sessions.clone(),
+            deleted: self.index.deleted.clone(),
+        }
+    }
+
+    /// Add or replace a session's metadata in memory, for a note that is
+    /// already written. [`Vault::commit_index`] makes it durable.
+    pub(crate) fn index_session(&mut self, session: SessionMeta) {
+        match self
+            .index
+            .sessions
+            .iter_mut()
+            .find(|existing| existing.id == session.id)
+        {
+            Some(existing) => *existing = session,
+            None => self.index.sessions.push(session),
         }
     }
 
@@ -585,21 +585,7 @@ impl Vault {
 
     /// Store image bytes once, keyed by content hash. Returns the asset id.
     pub fn add_asset(&self, bytes: &[u8], mime: &str) -> Result<String> {
-        let ext =
-            extension_for_mime(mime).ok_or_else(|| anyhow!("Unsupported image type {mime}."))?;
-        let digest = Sha256::digest(bytes);
-        let id = format!(
-            "asset-{}",
-            digest[..16]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
-        let path = self.root.join("assets").join(format!("{id}.{ext}"));
-        if !path.exists() {
-            write_atomic(&path, bytes)?;
-        }
-        Ok(id)
+        store_asset(&self.root, bytes, mime)
     }
 
     pub fn asset_path(&self, id: &str) -> Option<PathBuf> {
@@ -663,6 +649,68 @@ pub const MIME_EXTENSIONS: &[(&str, &str)] = &[
     ("image/svg+xml", "svg"),
     ("image/x-icon", "ico"),
 ];
+
+/// Vault data a background thread can work with. Note and asset files are
+/// written atomically, so they can be written off the UI thread; the index
+/// stays with the [`Vault`].
+pub struct VaultSnapshot {
+    pub root: PathBuf,
+    pub sessions: Vec<SessionMeta>,
+    pub deleted: Vec<String>,
+}
+
+impl VaultSnapshot {
+    pub fn session(&self, id: &str) -> Option<&SessionMeta> {
+        self.sessions.iter().find(|session| session.id == id)
+    }
+
+    pub fn is_deleted(&self, id: &str) -> bool {
+        self.deleted.iter().any(|deleted| deleted == id)
+    }
+}
+
+/// A new session id for which `taken` is false.
+pub(crate) fn unused_session_id(taken: impl Fn(&str) -> bool) -> String {
+    loop {
+        let candidate = new_session_id();
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+pub(crate) fn note_file(root: &Path, id: &str) -> PathBuf {
+    root.join("notes").join(format!("{id}.md"))
+}
+
+/// Read a session's note. A missing file is an empty note.
+pub fn load_note(root: &Path, id: &str) -> Result<String> {
+    match fs::read(note_file(root, id)) {
+        Ok(bytes) => {
+            String::from_utf8(bytes).map_err(|_| anyhow!("Session {id} is not valid UTF-8."))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Store image bytes once, keyed by content hash. Returns the asset id.
+pub fn store_asset(root: &Path, bytes: &[u8], mime: &str) -> Result<String> {
+    let ext = extension_for_mime(mime).ok_or_else(|| anyhow!("Unsupported image type {mime}."))?;
+    let digest = Sha256::digest(bytes);
+    let id = format!(
+        "asset-{}",
+        digest[..16]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let path = root.join("assets").join(format!("{id}.{ext}"));
+    if !path.exists() {
+        write_atomic(&path, bytes)?;
+    }
+    Ok(id)
+}
 
 pub fn extension_for_mime(mime: &str) -> Option<&'static str> {
     let mime = if mime == "image/jpg" {

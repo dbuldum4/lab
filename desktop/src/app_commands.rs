@@ -758,6 +758,10 @@ impl LabApp {
     }
 
     fn pick_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.restoring {
+            self.set_notice("A restore is already running.", cx);
+            return;
+        }
         self.pick_file("Restore", false, window, cx, |this, paths, window, cx| {
             if !this.save_now(cx) {
                 this.set_notice(
@@ -766,53 +770,82 @@ impl LabApp {
                 );
                 return;
             }
-            let text = match Self::read_limited(&paths[0], backup::MAX_BACKUP_BYTES as u64)
-                .and_then(|bytes| {
-                    String::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".into())
-                }) {
-                Ok(text) => text,
-                Err(err) => {
-                    this.set_notice(format!("Could not read the backup: {err}."), cx);
-                    return;
-                }
-            };
-            let parsed = match backup::parse_backup(&text) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    this.set_notice(err.to_string(), cx);
-                    return;
-                }
-            };
-            let active = this.session.id.clone();
-            match backup::restore_backup(&mut this.vault, parsed, &active) {
-                Ok(result) => {
-                    if result.active_document_updated {
-                        let id = this.session.id.clone();
-                        // The editor still shows the pre-restore text; mark it
-                        // saved so reopening reloads instead of overwriting.
-                        this.saved_text = this.editor.read(cx).text().to_string();
-                        this.open_session(&id, window, cx);
-                    } else if let Some(session) = this.vault.session(&active).cloned() {
-                        this.session = session;
-                    }
-                    this.set_notice(
-                        format!(
-                            "Restored {} {} ({} skipped, {} imported under new ids).",
-                            result.imported,
-                            if result.imported == 1 {
-                                "session"
-                            } else {
-                                "sessions"
-                            },
-                            result.skipped,
-                            result.renamed
-                        ),
-                        cx,
-                    );
-                }
-                Err(err) => this.set_notice(err.to_string(), cx),
-            }
+            // Reading, validating, and writing a large backup takes a while,
+            // so it runs off the UI thread. Only the index update comes back.
+            this.restoring = true;
+            this.set_notice("Restoring the backup…", cx);
+            let snapshot = this.vault.snapshot();
+            let path = paths[0].clone();
+            let prepared = cx.background_executor().spawn(async move {
+                let text = Self::read_limited(&path, backup::MAX_BACKUP_BYTES as u64)
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".into())
+                    })
+                    .map_err(|err| format!("Could not read the backup: {err}."))?;
+                let parsed = backup::parse_backup(&text).map_err(|err| err.to_string())?;
+                backup::prepare_restore(&snapshot, parsed).map_err(|err| err.to_string())
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let prepared = prepared.await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.finish_restore(prepared, window, cx)
+                });
+            })
+            .detach();
         });
+    }
+
+    fn finish_restore(
+        &mut self,
+        prepared: Result<backup::PreparedRestore, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restoring = false;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.set_notice(err, cx);
+                return;
+            }
+        };
+        // Edits made while the restore ran must be on disk before it checks
+        // whether the original note is still empty.
+        if !self.save_now(cx) {
+            self.set_notice(
+                "Restore cancelled because this note was not fully saved.",
+                cx,
+            );
+            return;
+        }
+        let active = self.session.id.clone();
+        match backup::finish_restore(&mut self.vault, prepared, &active) {
+            Ok(result) => {
+                if result.active_document_updated {
+                    // The editor still shows the pre-restore text; mark it
+                    // saved so reopening reloads instead of overwriting.
+                    self.saved_text = self.editor.read(cx).text().to_string();
+                    self.open_session(&active, window, cx);
+                } else if let Some(session) = self.vault.session(&active).cloned() {
+                    self.session = session;
+                }
+                self.set_notice(
+                    format!(
+                        "Restored {} {} ({} skipped, {} imported under new ids).",
+                        result.imported,
+                        if result.imported == 1 {
+                            "session"
+                        } else {
+                            "sessions"
+                        },
+                        result.skipped,
+                        result.renamed
+                    ),
+                    cx,
+                );
+            }
+            Err(err) => self.set_notice(err.to_string(), cx),
+        }
     }
 
     // -- Events --------------------------------------------------------------

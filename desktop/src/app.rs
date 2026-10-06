@@ -223,6 +223,8 @@ pub struct LabApp {
     /// Set after closing was refused because saving failed; closing again
     /// discards the unsaved changes.
     discard_armed: bool,
+    /// True while a restore prepares in the background.
+    restoring: bool,
     pending_anchor: Option<(Point<Pixels>, Pixels)>,
     pub(crate) focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -333,6 +335,7 @@ impl LabApp {
             saved_text: markdown,
             unreadable,
             discard_armed: false,
+            restoring: false,
             pending_anchor: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
