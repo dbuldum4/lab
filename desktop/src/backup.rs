@@ -286,6 +286,12 @@ pub fn build_backup(
     sorted.sort_by(|a, b| a.0.id.cmp(&b.0.id));
     let mut sessions = Vec::new();
     for (session, markdown) in sorted {
+        if session.name.encode_utf16().count() > 80 {
+            bail!(
+                "Session {} has an oversized name. Rename it before backing up.",
+                session.id
+            );
+        }
         // Local asset ids already satisfy the backup's id pattern, so they are
         // kept; any stray inline data URL gets its own numbered asset.
         let mut converted = transform_outside_code(markdown, |segment| {
@@ -434,7 +440,7 @@ pub fn parse_backup(text: &str) -> Result<ParsedBackup> {
             .get("name")
             .and_then(Value::as_str)
             .filter(|name| {
-                name.chars().count() <= 80
+                name.encode_utf16().count() <= 80
                     && !name.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
             })
             .ok_or_else(|| invalid(format!("session {id} has an invalid name")))?;
@@ -805,7 +811,7 @@ mod tests {
         vault.save(&other.id, "other").unwrap();
         vault.set_pinned(&other.id, true).unwrap();
 
-        let documents = vault.all_documents();
+        let documents = vault.all_documents().unwrap();
         let backup = build_backup(&vault, &documents, 42).unwrap();
         assert_eq!((backup.sessions, backup.assets), (2, 1));
         let value: Value = serde_json::from_str(&backup.json).unwrap();
@@ -839,6 +845,40 @@ mod tests {
     }
 
     #[test]
+    fn backup_names_use_the_web_formats_utf16_limit() {
+        let (_dir, mut vault) = vault();
+        vault.rename(DEFAULT_DOCUMENT_ID, &"😀".repeat(41)).unwrap();
+        let mut documents = vault.all_documents().unwrap();
+        let backup = build_backup(&vault, &documents, 1).unwrap();
+        let parsed = parse_backup(&backup.json).unwrap();
+        assert_eq!(parsed.sessions[0].meta.name, "😀".repeat(40));
+        assert_eq!(parsed.sessions[0].meta.name.encode_utf16().count(), 80);
+
+        // Old desktop indexes may contain names that the web cannot read.
+        documents[0].0.name = "😀".repeat(41);
+        assert!(build_backup(&vault, &documents, 1).is_err());
+        let mut value: Value = serde_json::from_str(&backup.json).unwrap();
+        value["sessions"][0]["name"] = Value::String("😀".repeat(41));
+        assert!(parse_backup(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn backup_refuses_unreadable_notes_instead_of_exporting_empty_text() {
+        let (_dir, mut vault) = vault();
+        let inactive = vault.create_session().unwrap();
+        vault.save(&inactive.id, "important note").unwrap();
+        std::fs::write(note_file(vault.root(), &inactive.id), [0xff]).unwrap();
+        let result = vault
+            .all_documents()
+            .and_then(|documents| build_backup(&vault, &documents, 1));
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(note_file(vault.root(), &inactive.id)).unwrap(),
+            [0xff]
+        );
+    }
+
+    #[test]
     fn missing_assets_are_renamed_exactly_and_outside_code_only() {
         let (_dir, mut vault) = vault();
         let present = externalize_data_images(&format!("![b]({PNG})"), &vault);
@@ -847,7 +887,7 @@ mod tests {
         let markdown =
             format!("![a](lab-asset://{missing_id})\n{present}\n`lab-asset://{missing_id}`");
         vault.save(DEFAULT_DOCUMENT_ID, &markdown).unwrap();
-        let backup = build_backup(&vault, &vault.all_documents(), 1).unwrap();
+        let backup = build_backup(&vault, &vault.all_documents().unwrap(), 1).unwrap();
         assert_eq!(backup.assets, 1);
         let value: Value = serde_json::from_str(&backup.json).unwrap();
         assert_eq!(
@@ -860,7 +900,7 @@ mod tests {
     fn restore_never_overwrites_a_note_it_cannot_read() {
         let (_dir, mut source) = vault();
         source.save(DEFAULT_DOCUMENT_ID, "from backup").unwrap();
-        let json = build_backup(&source, &source.all_documents(), 1)
+        let json = build_backup(&source, &source.all_documents().unwrap(), 1)
             .unwrap()
             .json;
 
@@ -883,9 +923,13 @@ mod tests {
     #[test]
     fn prepared_restores_touch_only_files_until_finished() {
         let (_dir, mut source) = vault();
+        // Keep the originals distinct even if both vaults open in the same millisecond.
+        source
+            .rename(DEFAULT_DOCUMENT_ID, "Backup original")
+            .unwrap();
         let session = source.create_session().unwrap();
         source.save(&session.id, "from backup").unwrap();
-        let json = build_backup(&source, &source.all_documents(), 1)
+        let json = build_backup(&source, &source.all_documents().unwrap(), 1)
             .unwrap()
             .json;
 
@@ -912,7 +956,7 @@ mod tests {
     fn an_original_note_edited_during_a_restore_keeps_its_text() {
         let (_dir, mut source) = vault();
         source.save(DEFAULT_DOCUMENT_ID, "from backup").unwrap();
-        let json = build_backup(&source, &source.all_documents(), 1)
+        let json = build_backup(&source, &source.all_documents().unwrap(), 1)
             .unwrap()
             .json;
 
@@ -935,7 +979,7 @@ mod tests {
     fn deleted_ids_are_never_revived() {
         let (_dir, mut vault) = vault();
         let session = vault.create_session().unwrap();
-        let documents = vault.all_documents();
+        let documents = vault.all_documents().unwrap();
         let json = build_backup(&vault, &documents, 1).unwrap().json;
         vault.delete(&session.id).unwrap();
         let result = restore_backup(

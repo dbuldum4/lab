@@ -507,7 +507,8 @@ pub struct TableAt {
 pub fn split_cells(line: &str) -> Vec<String> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
-    let inner = if inner.ends_with('|') && !inner.ends_with("\\|") {
+    let inner = if inner.ends_with('|') && unescaped_pipes(inner).last() == Some(&(inner.len() - 1))
+    {
         &inner[..inner.len() - 1]
     } else {
         inner
@@ -590,14 +591,10 @@ pub fn table_at(text: &str, offset: usize) -> Option<TableAt> {
     let line_index = current - first;
     let row = line_index.saturating_sub(1);
     let line = &text[ranges[current].clone()];
-    let before = &line[..offset - ranges[current].start];
-    let pipes = before
-        .match_indices('|')
-        .filter(|(i, _)| *i == 0 || before.as_bytes()[i - 1] != b'\\')
-        .count();
-    let leading_pipe = line.trim_start().starts_with('|');
-    let column = pipes
-        .saturating_sub(usize::from(leading_pipe))
+    let column = cell_starts(line)
+        .iter()
+        .rposition(|start| *start <= offset - ranges[current].start)
+        .unwrap_or(0)
         .min(width - 1);
     Some(TableAt {
         range: ranges[first].start..ranges[last].end,
@@ -629,33 +626,35 @@ fn cell_offset(rendered: &str, row: usize, column: usize) -> usize {
     let mut offset = 0;
     for (index, line) in rendered.split('\n').enumerate() {
         if index == line_index {
-            let mut pipes = 0;
-            for (i, ch) in line.char_indices() {
-                if ch == '|' {
-                    if pipes == column {
-                        return offset + i + 2.min(line.len() - i);
-                    }
-                    pipes += 1;
-                }
-            }
-            return offset + line.len();
+            return offset + cell_starts(line).get(column).copied().unwrap_or(line.len());
         }
         offset += line.len() + 1;
     }
     offset
 }
 
+/// Pipes preceded by an even number of backslashes delimit cells.
+fn unescaped_pipes(line: &str) -> Vec<usize> {
+    let mut pipes = Vec::new();
+    let mut escaped = false;
+    for (index, byte) in line.bytes().enumerate() {
+        if byte == b'|' && !escaped {
+            pipes.push(index);
+        }
+        escaped = byte == b'\\' && !escaped;
+    }
+    pipes
+}
+
 /// Offsets (relative to the line) where each cell's content starts.
 pub fn cell_starts(line: &str) -> Vec<usize> {
     let bytes = line.as_bytes();
-    let mut pipes: Vec<usize> = Vec::new();
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'|' && (index == 0 || bytes[index - 1] != b'\\') {
-            pipes.push(index);
-        }
-    }
+    let pipes = unescaped_pipes(line);
     let leading = line.trim_start().starts_with('|');
-    let trailing = line.trim_end().ends_with('|') && pipes.len() > usize::from(leading);
+    let trimmed = line.trim_end();
+    let trailing = trimmed.ends_with('|')
+        && pipes.len() > usize::from(leading)
+        && pipes.last() == Some(&(trimmed.len() - 1));
     let mut starts: Vec<usize> = Vec::new();
     if !leading {
         starts.push(line.len() - line.trim_start().len());
@@ -993,5 +992,27 @@ mod tests {
         assert_eq!(marked, "x$$|$$");
         let (_, marked) = run("ab", insert_inline("ab", 0..2, "[", "](https://"));
         assert_eq!(marked, "[|ab|](https://");
+    }
+
+    #[test]
+    fn table_commands_keep_carets_on_cells_after_escaped_pipes() {
+        let text = "| a\\|é | b |\n| --- | --- |\n| c\\|é | d |";
+        let edit = table_op(text, 2, TableOp::ColumnAfter).unwrap();
+        let out = edit.apply(text);
+        assert_eq!(
+            out,
+            "| a\\|é |  | b |\n| --- | --- | --- |\n| c\\|é |  | d |"
+        );
+        assert!(out.is_char_boundary(edit.selection.start));
+        assert_eq!(&out[edit.selection.start..edit.selection.start + 3], " | ");
+        let (_, marked) = run(
+            text,
+            table_op(text, text.find('b').unwrap(), TableOp::ToggleHeader).unwrap(),
+        );
+        assert!(marked.contains("| a\\|é | |b |"));
+        assert_eq!(cell_starts(r"| a\|é | b |"), vec![2, 10]);
+        assert_eq!(cell_starts(r"| a\\| b |"), vec![2, 7]);
+        assert_eq!(split_cells(r"| a\\| b |"), vec![r"a\\", "b"]);
+        assert_eq!(split_cells(r"| a\|"), vec![r"a\|"]);
     }
 }

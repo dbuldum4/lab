@@ -106,10 +106,15 @@ pub struct VaultStatus {
 
 pub fn normalize_name(value: &str) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The portable backup format counts UTF-16 units, like JavaScript.
+    let mut units = 0;
     let truncated: String = collapsed
         .chars()
         .filter(|c| !c.is_control())
-        .take(80)
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= 80
+        })
         .collect();
     let trimmed = truncated.trim();
     if trimmed.is_empty() {
@@ -690,12 +695,14 @@ impl Vault {
     }
 
     /// Every live session with its Markdown (search, backlinks, backup).
-    pub fn all_documents(&self) -> Vec<(SessionMeta, String)> {
+    pub fn all_documents(&self) -> Result<Vec<(SessionMeta, String)>> {
         self.sessions(ArchiveFilter::All)
             .into_iter()
             .map(|session| {
-                let markdown = self.load(&session.id).unwrap_or_default();
-                (session, markdown)
+                let markdown = self.load(&session.id).with_context(|| {
+                    format!("Could not read session “{}” ({})", session.name, session.id)
+                })?;
+                Ok((session, markdown))
             })
             .collect()
     }
@@ -887,6 +894,35 @@ mod tests {
             .collect();
         assert_eq!(order[0], b.id);
         assert_eq!(order[1], a.id);
+    }
+
+    #[test]
+    fn names_fit_the_web_backups_utf16_limit() {
+        assert_eq!(normalize_name(&"😀".repeat(41)), "😀".repeat(40));
+        assert_eq!(
+            normalize_name(&format!("{}😀z", "a".repeat(79))),
+            "a".repeat(79)
+        );
+        let (_dir, mut vault) = vault();
+        let saved = vault
+            .save(DEFAULT_DOCUMENT_ID, &format!("# {}", "😀".repeat(41)))
+            .unwrap();
+        assert_eq!(saved.name.encode_utf16().count(), 80);
+        let renamed = vault.rename(DEFAULT_DOCUMENT_ID, &"😀".repeat(41)).unwrap();
+        assert_eq!(renamed.name.encode_utf16().count(), 80);
+    }
+
+    #[test]
+    fn collecting_documents_fails_for_an_unreadable_inactive_note() {
+        let (_dir, mut vault) = vault();
+        vault.save(DEFAULT_DOCUMENT_ID, "readable").unwrap();
+        let other = vault.create_session().unwrap();
+        fs::write(vault.note_path(&other.id), [0xff]).unwrap();
+        let error = vault.all_documents().unwrap_err();
+        assert!(error.to_string().contains(&other.id));
+        assert_eq!(fs::read(vault.note_path(&other.id)).unwrap(), [0xff]);
+        fs::write(vault.note_path(&other.id), "repaired").unwrap();
+        assert_eq!(vault.all_documents().unwrap().len(), 2);
     }
 
     #[test]

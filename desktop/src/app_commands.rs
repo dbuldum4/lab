@@ -233,9 +233,14 @@ impl LabApp {
             }
             "search" => {
                 self.save_now(cx);
-                let index = self
-                    .vault
-                    .all_documents()
+                let documents = match self.vault.all_documents() {
+                    Ok(documents) => documents,
+                    Err(err) => {
+                        self.set_notice(format!("Could not search the vault: {err:#}"), cx);
+                        return;
+                    }
+                };
+                let index = documents
                     .into_iter()
                     .map(|(session, markdown)| {
                         let text = search::searchable_markdown(&markdown);
@@ -444,9 +449,14 @@ impl LabApp {
     fn open_backlinks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_now(cx);
         let target = self.session.id.clone();
-        let mut links: Vec<(i64, Backlink)> = self
-            .vault
-            .all_documents()
+        let documents = match self.vault.all_documents() {
+            Ok(documents) => documents,
+            Err(err) => {
+                self.set_notice(format!("Could not read backlinks: {err:#}"), cx);
+                return;
+            }
+        };
+        let mut links: Vec<(i64, Backlink)> = documents
             .into_iter()
             .filter(|(session, markdown)| {
                 session.id != target && linked_document_ids(markdown).contains(&target)
@@ -557,7 +567,16 @@ impl LabApp {
             );
             return;
         }
-        let documents = self.vault.all_documents();
+        let documents = match self.vault.all_documents() {
+            Ok(documents) => documents,
+            Err(err) => {
+                self.set_notice(
+                    format!("The local vault backup could not be created: {err:#}"),
+                    cx,
+                );
+                return;
+            }
+        };
         match backup::build_backup(&self.vault, &documents, now_ms()) {
             Ok(summary) => {
                 let message = format!(
