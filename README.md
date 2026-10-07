@@ -44,6 +44,17 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+## Desktop app
+
+A native build for macOS and Linux lives in [`desktop/`](desktop/README.md).
+It is written in Rust with GPUI, keeps the same commands and themes, and
+stores notes as Markdown files. Backups move between the two apps.
+
+```bash
+cd desktop
+cargo run --release
+```
+
 ## Deploy
 
 Pushes to `main` deploy a static export to GitHub Pages at
