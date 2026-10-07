@@ -17,6 +17,7 @@ use crate::commands::{self, CODE_LANGUAGES, Command, CommandContext};
 use crate::editor::markdown::Group;
 use crate::editor::{Editor, EditorMode};
 use crate::markdown_info::{DocumentStats, local_session_href};
+use crate::menus::{self, MenuState};
 use crate::search::{self, SearchResult, regex};
 use crate::text_ops::{self, TextEdit};
 use crate::theme::{Colors, THEMES, ThemeDef, theme_or_default};
@@ -227,6 +228,8 @@ pub struct LabApp {
     /// True while a restore prepares in the background.
     restoring: bool,
     pending_anchor: Option<(Point<Pixels>, Pixels)>,
+    /// The state the menu bar was last built for.
+    pub(crate) menu_state: Option<MenuState>,
     pub(crate) focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -338,6 +341,7 @@ impl LabApp {
             discard_armed: false,
             restoring: false,
             pending_anchor: None,
+            menu_state: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
@@ -446,6 +450,20 @@ impl LabApp {
             cx,
         );
         false
+    }
+
+    /// Rebuild the menu bar when a label or check mark it shows has changed.
+    pub(crate) fn sync_menus(&mut self, cx: &mut Context<Self>) {
+        let state = MenuState {
+            pinned: self.session.pinned,
+            archived: self.session.archived,
+            outline_open: self.outline_open,
+        };
+        if self.menu_state != Some(state) {
+            self.menu_state = Some(state);
+            // Deferred so the native menu is not rebuilt in the middle of a frame.
+            cx.defer(move |cx| cx.set_menus(menus::app_menus(state)));
+        }
     }
 
     pub(crate) fn update_title(&self, window: &mut Window) {

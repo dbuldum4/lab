@@ -5,6 +5,7 @@ mod backup;
 mod commands;
 mod editor;
 mod markdown_info;
+mod menus;
 mod search;
 mod text_ops;
 mod theme;
@@ -14,11 +15,11 @@ mod vault;
 use std::borrow::Cow;
 
 use gpui::{
-    App, AppContext as _, Bounds, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions,
-    point, px, size,
+    App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
 
-use app::{LabApp, Quit};
+use app::LabApp;
+use menus::MenuState;
 use vault::Vault;
 
 fn load_fonts(cx: &mut App) {
@@ -53,12 +54,9 @@ fn main() {
         load_fonts(cx);
         editor::bind_keys(cx);
         app::bind_keys(cx);
-        cx.set_menus([Menu {
-            name: "lab".into(),
-            items: vec![MenuItem::action("Quit lab", Quit)],
-            disabled: false,
-        }]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        menus::bind_keys(cx);
+        menus::register_global_actions(cx);
+        cx.set_menus(menus::app_menus(MenuState::default()));
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

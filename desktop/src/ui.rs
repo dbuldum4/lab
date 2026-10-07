@@ -15,6 +15,7 @@ use crate::app::{
 use crate::commands::{CODE_LANGUAGES, SHORTCUTS, display_keys};
 use crate::editor::view::{MONO, SANS};
 use crate::markdown_info::{active_outline_index, document_stats, outline};
+use crate::menus::{CloseWindow, MinimizeWindow, RunCommand, ZoomWindow};
 use crate::search::match_ranges;
 use crate::theme::{Colors, THEMES};
 
@@ -1033,6 +1034,7 @@ impl Render for LabApp {
         let outline = self.outline_open.then(|| self.render_outline(window, cx));
         let palette = self.render_palette(window, cx);
         let notice = self.render_notice(cx);
+        self.sync_menus(cx);
         div()
             .id("lab")
             .key_context("LabApp")
@@ -1068,6 +1070,16 @@ impl Render for LabApp {
                     cx.quit();
                 }
             }))
+            .on_action(
+                cx.listener(|this, RunCommand(id): &RunCommand, w, cx| this.shortcut(id, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &CloseWindow, w, cx| {
+                if this.ready_to_close(cx) {
+                    w.remove_window();
+                }
+            }))
+            .on_action(|_: &MinimizeWindow, w, _| w.minimize_window())
+            .on_action(|_: &ZoomWindow, w, _| w.zoom_window())
             // A click outside an open panel dismisses it. The slash palette
             // closes on its own once the caret leaves the `/query`.
             .on_mouse_down(

@@ -31,7 +31,8 @@ the app starts, so the Xcode command line tools are enough on macOS.
 - Type `/` to open the command palette. Every web command is here except
   recovery drafts and the image metadata dialog (see below).
 - The keyboard shortcuts match: `Cmd+K` on macOS or `Ctrl+K` on Linux opens
-  sessions, `Cmd/Ctrl+/` lists the rest.
+  sessions, `Cmd/Ctrl+/` lists the rest. On macOS the menu bar also lists
+  the commands, with their shortcuts.
 - Sessions, pins, archives, search, backlinks, statistics, the outline, and
   version history behave as they do on the web.
 - `/backup` writes the same `lab-vault-backup.json` format, so a backup from
@@ -95,6 +96,7 @@ The code is in `src/`:
 | File | Purpose |
 | --- | --- |
 | `main.rs` | Starts GPUI, loads fonts, opens the window |
+| `menus.rs` | The menu bar and its window and app actions |
 | `app.rs`, `app_commands.rs` | Palette state and every slash command |
 | `ui.rs` | Palette panels, outline, and notices |
 | `editor/` | The Markdown editor: text, input, layout, and painting |
