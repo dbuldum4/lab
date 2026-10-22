@@ -875,6 +875,12 @@ test("Chromium quota override fails closed or degrades safely, then self-heals a
       await page.keyboard.press("Escape");
       await expect(dirtySwitch).toBeHidden();
       await expect(editor).toContainText(markdown);
+      // Opening the slash command added an empty paragraph. Restore the exact
+      // draft before checking byte-for-byte recovery across storage replicas.
+      await editor.fill(markdown);
+      await expect.poll(async () => (await pendingRecords(page)).some(
+        (record) => record.markdown === markdown,
+      )).toBe(true);
     }
 
     await cdp.send("Storage.overrideQuotaForOrigin", { origin });
