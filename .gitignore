@@ -9,3 +9,4 @@ out/
 implementation-*.png
 test-results/
 .perf-results/
+desktop/target/
